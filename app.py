@@ -4,12 +4,14 @@ BrunnenBar Cloud Concierge, webhook service.
 Always on service that answers WhatsApp and Instagram in the house voice, so
 the concierge no longer needs Daniel's laptop open. Deploy on Railway.
 
-This version implements the core reply loop, WhatsApp and Instagram inbound
-to a Claude drafted reply that is sent automatically within the house rules,
-auto acknowledge mode. Gmail and calendar are the next phase, marked below.
+Auto acknowledge mode, an inbound message is drafted by Claude in the house
+rules and sent back automatically. Gmail and calendar are the next phase.
+
+This build logs every inbound POST the moment it arrives, and if the Meta
+signature does not match it logs a warning and still processes the message
+rather than dropping it silently. That makes misconfiguration visible.
 
 No secrets in this file. Everything comes from environment variables.
-No hyphens in guest facing text, that rule lives in the system prompt.
 """
 
 import hashlib
@@ -18,14 +20,13 @@ import logging
 import os
 
 import httpx
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("concierge")
 
 app = FastAPI(title="BrunnenBar Cloud Concierge")
 
-# ---- Config, all from Railway Variables ----
 META_VERIFY_TOKEN = os.environ.get("META_VERIFY_TOKEN", "")
 META_APP_SECRET = os.environ.get("META_APP_SECRET", "")
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN", "")
@@ -34,17 +35,11 @@ INSTAGRAM_TOKEN = os.environ.get("INSTAGRAM_TOKEN", "")
 INSTAGRAM_ACCOUNT_ID = os.environ.get("INSTAGRAM_ACCOUNT_ID", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 GRAPH_VERSION = os.environ.get("GRAPH_VERSION", "v20.0")
-# AUTO_ACK true means send the drafted reply automatically. Set to false to
-# only log the draft and not send, if Daniel ever wants approve before send.
 AUTO_ACK = os.environ.get("AUTO_ACK", "true").lower() == "true"
 
 GRAPH = "https://graph.facebook.com/" + GRAPH_VERSION
-
-# Simple in memory dedupe of handled message ids. Resets on redeploy, which is
-# fine, Meta rarely redelivers and a duplicate acknowledgment is low harm.
 _handled = set()
 
-# The house voice. These are the same rules the manual concierge follows.
 SYSTEM_PROMPT = """You are the concierge for BrunnenBar, a neighbourhood bar in Augsburg, Germany, replying to a guest message on behalf of the owner Daniel.
 
 First decide if this message is a genuine guest inquiry that wants a reply, a reservation, a birthday or group, an event question, opening hours, or a general guest question. If it is spam, a cold sales pitch, a marketing or collaboration partner, a delivery or app notification, or anything not from a real guest, reply with exactly the single word SKIP and nothing else.
@@ -67,85 +62,101 @@ def health():
     return {"ok": True}
 
 
-# ---- Webhook verification, Meta GET handshake ----
-def verify_subscription(request: Request):
+def challenge(request: Request):
+    from fastapi import Response
     p = request.query_params
     if p.get("hub.mode") == "subscribe" and p.get("hub.verify_token") == META_VERIFY_TOKEN:
         return Response(content=p.get("hub.challenge", ""), media_type="text/plain")
     return Response(content="verification failed", status_code=403)
 
 
-def signature_ok(body: bytes, header: str) -> bool:
+def signature_matches(body: bytes, header: str) -> bool:
     if not META_APP_SECRET or not header:
         return False
     expected = "sha256=" + hmac.new(META_APP_SECRET.encode(), body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, header)
 
 
-# ---- WhatsApp ----
+def check_sig(kind: str, body: bytes, header: str):
+    if not META_APP_SECRET:
+        logger.warning("%s: META_APP_SECRET not set, skipping signature check", kind)
+        return
+    if not signature_matches(body, header):
+        logger.warning("%s: signature did NOT match. Check that META_APP_SECRET in Railway equals the app's App secret. Processing anyway.", kind)
+    else:
+        logger.info("%s: signature ok", kind)
+
+
 @app.get("/webhook/whatsapp")
 async def whatsapp_verify(request: Request):
-    return verify_subscription(request)
+    return challenge(request)
 
 
 @app.post("/webhook/whatsapp")
 async def whatsapp_receive(request: Request):
     body = await request.body()
-    if not signature_ok(body, request.headers.get("X-Hub-Signature-256", "")):
-        return Response(status_code=403)
-    data = await request.json()
+    logger.info("WhatsApp POST received, %d bytes", len(body))
+    check_sig("WhatsApp", body, request.headers.get("X-Hub-Signature-256", ""))
+    try:
+        data = await request.json()
+    except Exception:
+        logger.error("WhatsApp POST body was not JSON")
+        return {"received": True}
     for entry in data.get("entry", []):
         for change in entry.get("changes", []):
-            for msg in change.get("value", {}).get("messages", []):
+            value = change.get("value", {})
+            for msg in value.get("messages", []):
                 mid = msg.get("id")
                 if not mid or mid in _handled:
                     continue
                 _handled.add(mid)
                 if msg.get("type") != "text":
+                    logger.info("WhatsApp non text message, skipping")
                     continue
                 sender = msg.get("from")
                 text = (msg.get("text") or {}).get("body", "")
                 logger.info("WhatsApp in from %s: %s", sender, text[:120])
-                handle(channel="whatsapp", sender=sender, text=text)
+                handle("whatsapp", sender, text)
     return {"received": True}
 
 
-# ---- Instagram ----
 @app.get("/webhook/instagram")
 async def instagram_verify(request: Request):
-    return verify_subscription(request)
+    return challenge(request)
 
 
 @app.post("/webhook/instagram")
 async def instagram_receive(request: Request):
     body = await request.body()
-    if not signature_ok(body, request.headers.get("X-Hub-Signature-256", "")):
-        return Response(status_code=403)
-    data = await request.json()
+    logger.info("Instagram POST received, %d bytes", len(body))
+    check_sig("Instagram", body, request.headers.get("X-Hub-Signature-256", ""))
+    try:
+        data = await request.json()
+    except Exception:
+        logger.error("Instagram POST body was not JSON")
+        return {"received": True}
     for entry in data.get("entry", []):
         for event in entry.get("messaging", []):
             message = event.get("message") or {}
             mid = message.get("mid")
             text = message.get("text", "")
-            # Ignore echoes of our own outgoing messages.
             if message.get("is_echo") or not text or not mid or mid in _handled:
                 continue
             _handled.add(mid)
             sender = event.get("sender", {}).get("id")
             logger.info("Instagram in from %s: %s", sender, text[:120])
-            handle(channel="instagram", sender=sender, text=text)
+            handle("instagram", sender, text)
     return {"received": True}
 
 
-# ---- The brain ----
 def handle(channel: str, sender: str, text: str):
     reply = claude_draft(text)
     if not reply or reply.strip().upper() == "SKIP":
-        logger.info("No reply, classified as not a guest inquiry or empty")
+        logger.info("No reply, classified as not a guest inquiry or empty draft")
         return
     logger.info("Draft reply (%s): %s", channel, reply[:200])
     if not AUTO_ACK:
-        logger.info("AUTO_ACK off, not sending, draft logged only")
+        logger.info("AUTO_ACK off, draft logged only, not sending")
         return
     if channel == "whatsapp":
         send_whatsapp(sender, reply)
@@ -177,7 +188,8 @@ def claude_draft(text: str) -> str:
         parts = r.json().get("content", [])
         return "".join(p.get("text", "") for p in parts if p.get("type") == "text").strip()
     except Exception as e:
-        logger.error("Claude draft failed: %s", e)
+        detail = getattr(e, "response", None)
+        logger.error("Claude draft failed: %s %s", e, detail.text if detail is not None else "")
         return ""
 
 
@@ -192,7 +204,8 @@ def send_whatsapp(to: str, text: str):
         r.raise_for_status()
         logger.info("WhatsApp reply sent to %s", to)
     except Exception as e:
-        logger.error("WhatsApp send failed: %s %s", e, getattr(e, "response", None) and e.response.text)
+        detail = getattr(e, "response", None)
+        logger.error("WhatsApp send failed: %s %s", e, detail.text if detail is not None else "")
 
 
 def send_instagram(recipient_id: str, text: str):
@@ -206,13 +219,8 @@ def send_instagram(recipient_id: str, text: str):
         r.raise_for_status()
         logger.info("Instagram reply sent to %s", recipient_id)
     except Exception as e:
-        logger.error("Instagram send failed: %s %s", e, getattr(e, "response", None) and e.response.text)
-
-
-# ---- Next phase, not wired yet ----
-# Gmail poll, read guest inquiries from brunnenbaraugsburg and reply.
-# Calendar, create the reservation in the BrunnenBar Reservierungen calendar.
-# Escalation, send Daniel the ones that commit the bar for a human yes.
+        detail = getattr(e, "response", None)
+        logger.error("Instagram send failed: %s %s", e, detail.text if detail is not None else "")
 
 
 if __name__ == "__main__":
