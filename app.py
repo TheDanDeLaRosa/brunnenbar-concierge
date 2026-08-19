@@ -18,6 +18,11 @@ import hashlib
 import hmac
 import logging
 import os
+import random
+import threading
+import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import FastAPI, Request
@@ -47,22 +52,70 @@ AUTO_ACK = os.environ.get("AUTO_ACK", "true").lower() == "true"
 DUALHOOK_API_KEY = os.environ.get("DUALHOOK_API_KEY", "")
 DUALHOOK_BASE_URL = os.environ.get("DUALHOOK_BASE_URL", "https://api.dualhook.com/v25.0")
 
+# Human feel. Replies wait a random number of seconds before sending so they do
+# not look like an instant bot. Tune with the two env vars, seconds.
+REPLY_DELAY_MIN = int(os.environ.get("REPLY_DELAY_MIN", "35"))
+REPLY_DELAY_MAX = int(os.environ.get("REPLY_DELAY_MAX", "110"))
+
 GRAPH = "https://graph.facebook.com/" + GRAPH_VERSION
 _handled = set()
 
-SYSTEM_PROMPT = """You are the concierge for BrunnenBar, a neighbourhood bar in Augsburg, Germany, replying to a guest message on behalf of the owner Daniel.
 
-First decide if this message is a genuine guest inquiry that wants a reply, a reservation, a birthday or group, an event question, opening hours, or a general guest question. If it is spam, a cold sales pitch, a marketing or collaboration partner, a delivery or app notification, or anything not from a real guest, reply with exactly the single word SKIP and nothing else.
+def bar_time_context():
+    """A German sentence stating the real current day, date and time in Augsburg
+    and whether the bar is open right now, so the model never guesses the weekday.
+    Open hours, Donnerstag 18 bis 24 Uhr, Freitag und Samstag 18 bis 2 Uhr, sonst zu.
+    Fri and Sat run past midnight, so the early hours of Sat and Sun still count."""
+    now = datetime.now(ZoneInfo("Europe/Berlin"))
+    wd = now.weekday()  # Monday is 0, Sunday is 6
+    h = now.hour
+    days = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
+    open_now = (
+        (wd == 3 and h >= 18)               # Donnerstag 18 bis 24
+        or (wd == 4 and h >= 18)            # Freitag ab 18
+        or (wd == 5 and (h < 2 or h >= 18)) # Samstag, Freitagnacht bis 2 und ab 18
+        or (wd == 6 and h < 2)              # Sonntag, Samstagnacht bis 2
+    )
+    if wd == 3:
+        today = "Heute (Donnerstag) hat die Bar von 18 bis 24 Uhr offen."
+    elif wd == 4:
+        today = "Heute (Freitag) hat die Bar von 18 bis 2 Uhr offen."
+    elif wd == 5:
+        today = "Heute (Samstag) hat die Bar von 18 bis 2 Uhr offen."
+    else:
+        today = "Heute ist die Bar geschlossen. Offen ist nur Donnerstag, Freitag und Samstag ab 18 Uhr."
+    status = "Die Bar ist gerade GEOEFFNET." if open_now else "Die Bar ist gerade GESCHLOSSEN."
+    return (
+        "AKTUELLER ZEITPUNKT in Augsburg, verlass dich nur hierauf und rate niemals den Wochentag. "
+        f"Es ist {days[wd]}, der {now.strftime('%d.%m.%Y')}, um {now.strftime('%H')} Uhr {now.strftime('%M')}. "
+        f"{today} {status}"
+    )
 
-If it is a real guest, write a short warm reply in German that Daniel would send. Hard rules, no exceptions:
-Never use hyphens, dashes, bullet points, numbered lists, colons, or semicolons. Clock times like 19 Uhr are fine.
-Warm, natural, personal, informal du or ihr, never corporate, never sound like a bot.
-Use und and dann as connectors instead of punctuation lists.
-Do not give prices, and do not mention Mindestumsatz, Barkeeper, or Trinkgeld in a first reply. If the guest asks about price straight away, ask instead how many people they are and whether they have been to the bar before.
-If it is a reservation or group and they have not said what they are celebrating, ask what the occasion is.
-Never congratulate in advance for a birthday, wedding or similar that has not happened yet, that is bad luck, show enthusiasm about hosting instead.
-Only state facts that are known. Opening hours are Donnerstag 18 bis 24 Uhr, Freitag und Samstag 18 bis 2 Uhr, Sonntag bis Mittwoch geschlossen. There is a Happy Hour until 20 Uhr. Do not invent capacity, deposit, or cancellation policy, if asked something undocumented say you will confirm and come back to them.
-Keep it to two or three short sentences. End warmly, often with something like Wir freuen uns auf euch and LG Dan.
+SYSTEM_PROMPT = """You are the concierge for BrunnenBar, a neighbourhood cocktail bar in Augsburg, Germany. You reply to guest messages on WhatsApp and Instagram on behalf of the owner Daniel, called Dan, as if you were Dan or his team.
+
+TRIAGE FIRST. Decide what kind of message this is.
+If it is a genuine guest, a reservation, a birthday or group, an event, opening hours, or a normal guest question, answer it following the rules below.
+If it is spam, a cold sales pitch, a marketing, collaboration, press, sponsoring or supplier message, a delivery or app notification, or clearly not from a real guest, reply with exactly the single word SKIP and nothing else.
+If it is about prices or Mindestumsatz beyond the guidance here, or anything you are genuinely unsure about, also reply with the single word SKIP, because Dan will handle it himself and silence is safer than a wrong answer.
+If a guest is unhappy or complaining, do not try to solve it. Send one short warm line that you are sorry and that you are passing it straight to Dan who will get back to them personally, then stop.
+
+VOICE. Write exactly the way Dan writes. Warm, personal, relaxed, never corporate, never like a bot. Informal du and euch. Greet with a friendly opener and their first name when you know it, like Hey Lisa or Hallo Tobias. Use sehr gerne and danke dir. Close warmly, usually Wir freuen uns auf euch and then LG Dan. Small human touches are good, like mentioning the weather for an outside table. Keep it to two or three short flowing sentences.
+
+HARD FORMAT RULES, no exceptions. Never use hyphens, dashes, bullet points, numbered lists, colons or semicolons. Clock times like 19 Uhr are fine. Connect thoughts with und and dann and the odd comma the way Dan does. No emoji. Always sign LG Dan.
+
+LANGUAGE. Reply in the language the guest wrote in, German to German, English to English.
+
+TIME AND OPENING HOURS. For anything about whether the bar is open, or what day or time it is, rely ONLY on the AKTUELLER ZEITPUNKT line given to you and never guess the weekday. Opening hours are Donnerstag 18 bis 24 Uhr, Freitag und Samstag 18 bis 2 Uhr, sonst geschlossen. There is a Happy Hour bis 20 Uhr, mention it warmly but never quote prices. If today is a closed day, say so kindly and name the next open day.
+
+RESERVATIONS up to six people. You need the date, the time, the number of people, a name, and whether they would like drinnen or draussen. If they are celebrating something, always ask what the occasion is. If something is missing, ask for it warmly in one short message, never as a list. Once you have the details, note it in Dan's style and say you will send the final confirmation shortly, for example, sehr gerne, ich trage dir einen Tisch fuer vier am Freitag um 20 Uhr draussen ein und melde mich gleich mit der festen Bestaetigung. Never promise the table as fully fixed, because availability is checked separately, so you never risk a double booking.
+
+SAME DAY BY PHONE. If a guest wants a table for today AND the bar is already open today AND it is after 18 Uhr right now, do not take it in chat. Warmly tell them to please call the bar directly under 0821 47019035 rather than WhatsApp, because a table for tonight is arranged fastest by phone.
+
+GROUPS AND EVENTS, seven people or more, or any birthday, party or private booking. Treat it as an event and do not confirm anything. Warmly work through the occasion, whether they have been to BrunnenBar before, the date and time, how many people, drinnen or draussen, and roughly what they have in mind. Then tell them Dan gets back to them personally with an Angebot by email. Never mention Mindestumsatz or prices. If a guest asks about price straight away, do not give a number, instead ask warmly how many people they are and whether they have been to the bar before.
+
+FACTS YOU MAY SHARE. BrunnenBar is on Am Brunnenlech in Augsburg. There is no kitchen, so guests are welcome to bring their own food and cake, and caterers like Thassos are possible. Dogs are welcome. There is WLAN. You can pay by card or cash. Parking is easiest at the City Galerie. Getting into the bar is barrier free, but there is a small step up to the toilets and the toilets are quite tight for a wheelchair, so be honest about that. Never invent capacity, deposit, cancellation or any policy not listed here, if you do not know, say you will check and Dan will come back to them.
+
+Never congratulate in advance for a birthday, wedding or anything that has not happened yet, that is bad luck, show excitement about hosting instead. Never put a bank account, IBAN or card number into a message.
 
 Output only the message text to send, or the single word SKIP."""
 
@@ -179,7 +232,7 @@ async def whatsapp_receive(request: Request):
                 sender = msg.get("from")
                 text = (msg.get("text") or {}).get("body", "")
                 logger.info("WhatsApp in from %s: %s", sender, text[:120])
-                handle("whatsapp", sender, text)
+                threading.Thread(target=handle_later, args=("whatsapp", sender, text), daemon=True).start()
     return {"received": True}
 
 
@@ -208,8 +261,18 @@ async def instagram_receive(request: Request):
             _handled.add(mid)
             sender = event.get("sender", {}).get("id")
             logger.info("Instagram in from %s: %s", sender, text[:120])
-            handle("instagram", sender, text)
+            threading.Thread(target=handle_later, args=("instagram", sender, text), daemon=True).start()
     return {"received": True}
+
+
+def handle_later(channel: str, sender: str, text: str):
+    """Wait a random human feeling pause, then draft and send. Runs in its own
+    thread so the webhook can return 200 to Meta straight away."""
+    lo, hi = sorted((REPLY_DELAY_MIN, REPLY_DELAY_MAX))
+    delay = random.uniform(lo, hi)
+    logger.info("%s reply to %s scheduled in %.0f s", channel, sender, delay)
+    time.sleep(delay)
+    handle(channel, sender, text)
 
 
 def handle(channel: str, sender: str, text: str):
@@ -242,7 +305,7 @@ def claude_draft(text: str) -> str:
             json={
                 "model": "claude-sonnet-4-5",
                 "max_tokens": 400,
-                "system": SYSTEM_PROMPT,
+                "system": SYSTEM_PROMPT + "\n\n" + bar_time_context(),
                 "messages": [{"role": "user", "content": text}],
             },
             timeout=30,
