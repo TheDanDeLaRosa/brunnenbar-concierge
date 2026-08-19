@@ -28,6 +28,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("concierge")
@@ -83,6 +84,9 @@ BAR_TZ = ZoneInfo("Europe/Berlin")
 # deploy never blasts the existing backlog, and a handled label stops re-answering.
 GMAIL_REFRESH_TOKEN = os.environ.get("GMAIL_REFRESH_TOKEN", "")
 BAR_EMAIL = os.environ.get("BAR_EMAIL", "brunnenbaraugsburg@gmail.com")
+# Public https base of this service, used to build the Gmail OAuth redirect URI so
+# it matches exactly what is registered on the Google OAuth client.
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://brunnenbar-concierge-production.up.railway.app")
 EMAIL_ENABLED = os.environ.get("EMAIL_ENABLED", "true").lower() == "true"
 EMAIL_POLL_SECONDS = int(os.environ.get("EMAIL_POLL_SECONDS", "90"))
 EMAIL_HANDLED_LABEL = os.environ.get("EMAIL_HANDLED_LABEL", "Concierge-Beantwortet")
@@ -446,6 +450,153 @@ BOOK_TOOL = {
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+PRIVACY_HTML = """<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BrunnenBar Datenschutzerklaerung / Privacy Policy</title>
+<style>
+body{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;max-width:760px;margin:40px auto;padding:0 20px;line-height:1.55;color:#1a1a1a}
+h1{font-size:1.6rem}h2{font-size:1.15rem;margin-top:2rem}small{color:#666}
+</style>
+</head>
+<body>
+<h1>Datenschutzerklaerung BrunnenBar</h1>
+<p><small>Zuletzt aktualisiert am 19. August 2026. English version below.</small></p>
+
+<h2>Verantwortlicher</h2>
+<p>Daniel De la Rosa, BrunnenBar, Am Brunnenlech 31, 86150 Augsburg, Deutschland. E-Mail brunnenbaraugsburg@gmail.com, Telefon 0821 47019035.</p>
+
+<h2>Was wir verarbeiten</h2>
+<p>Wenn du uns ueber WhatsApp, Instagram, Facebook Messenger oder E-Mail schreibst, verarbeiten wir den Inhalt deiner Nachricht, deine Absenderkennung wie Telefonnummer, Instagram oder Facebook Nutzerkennung oder E-Mail Adresse, sowie die Angaben die du uns fuer eine Reservierung machst, etwa Name, Personenzahl, Datum, Uhrzeit und Anlass.</p>
+
+<h2>Zweck</h2>
+<p>Wir verarbeiten diese Daten ausschliesslich um deine Anfragen zu beantworten und Tischreservierungen zu verwalten.</p>
+
+<h2>Automatisierte Beantwortung</h2>
+<p>Nachrichten werden mit Hilfe eines KI Systems beantwortet, das den Nachrichtentext verarbeitet um eine passende Antwort im Namen der BrunnenBar zu formulieren. Reservierungen werden in unseren Kalender eingetragen.</p>
+
+<h2>Empfaenger und Auftragsverarbeiter</h2>
+<p>Zur Erbringung des Dienstes nutzen wir Anthropic zur Formulierung der Antworten, Google fuer Kalender und E-Mail, einen Hosting Anbieter fuer den Betrieb des Dienstes, sowie Meta und einen technischen Dienstleister fuer die Zustellung der Nachrichten auf WhatsApp, Instagram und Messenger. Diese verarbeiten Daten nur in unserem Auftrag.</p>
+
+<h2>Rechtsgrundlage</h2>
+<p>Die Verarbeitung erfolgt auf Grundlage von Artikel 6 Absatz 1 Buchstabe b DSGVO zur Anbahnung und Erfuellung einer Reservierung sowie Buchstabe f DSGVO aus unserem berechtigten Interesse an einer schnellen Beantwortung von Gastanfragen.</p>
+
+<h2>Speicherdauer</h2>
+<p>Der Gespraechsverlauf wird nur kurzzeitig zur Bearbeitung im Arbeitsspeicher gehalten. Reservierungen bleiben in unserem Kalender gespeichert, Nachrichten verbleiben im jeweiligen Postfach der Plattform.</p>
+
+<h2>Deine Rechte</h2>
+<p>Du hast das Recht auf Auskunft, Berichtigung, Loeschung, Einschraenkung und Widerspruch. Wende dich dazu an brunnenbaraugsburg@gmail.com. Ausserdem hast du das Recht auf Beschwerde bei einer Aufsichtsbehoerde, zustaendig ist das Bayerische Landesamt fuer Datenschutzaufsicht.</p>
+
+<h2>Drittlanduebermittlung</h2>
+<p>Einige Dienstleister koennen Daten ausserhalb der EU verarbeiten. In diesen Faellen ist die Uebermittlung durch Standardvertragsklauseln abgesichert.</p>
+
+<hr>
+
+<h1>Privacy Policy BrunnenBar</h1>
+<p><small>Last updated 19 August 2026.</small></p>
+<h2>Controller</h2>
+<p>Daniel De la Rosa, BrunnenBar, Am Brunnenlech 31, 86150 Augsburg, Germany. Email brunnenbaraugsburg@gmail.com, phone +49 821 47019035.</p>
+<h2>What we process</h2>
+<p>When you message us on WhatsApp, Instagram, Facebook Messenger or email, we process the content of your message, your sender identifier such as phone number, Instagram or Facebook user id or email address, and the details you give us for a reservation such as name, party size, date, time and occasion.</p>
+<h2>Purpose</h2>
+<p>We use this data only to answer your enquiries and to manage table reservations.</p>
+<h2>Automated replies</h2>
+<p>Messages are answered with the help of an AI system that processes the message text to draft a suitable reply on behalf of BrunnenBar. Reservations are written to our calendar.</p>
+<h2>Recipients and processors</h2>
+<p>To run the service we use Anthropic to draft replies, Google for calendar and email, a hosting provider to operate the service, and Meta together with a technical provider to deliver messages on WhatsApp, Instagram and Messenger. They process data only on our behalf.</p>
+<h2>Legal basis</h2>
+<p>Processing is based on Article 6(1)(b) GDPR to prepare and fulfil a reservation and Article 6(1)(f) GDPR for our legitimate interest in answering guest enquiries quickly.</p>
+<h2>Retention</h2>
+<p>The conversation context is held only briefly in memory for processing. Reservations remain stored in our calendar and messages remain in the respective platform inbox.</p>
+<h2>Your rights</h2>
+<p>You have the right to access, rectification, erasure, restriction and objection. Contact brunnenbaraugsburg@gmail.com. You also have the right to lodge a complaint with a supervisory authority.</p>
+<h2>International transfers</h2>
+<p>Some providers may process data outside the EU, safeguarded by Standard Contractual Clauses.</p>
+</body>
+</html>"""
+
+
+@app.get("/privacy", response_class=HTMLResponse)
+@app.get("/datenschutz", response_class=HTMLResponse)
+def privacy():
+    """Public privacy policy, the URL Meta App Review and Google both require."""
+    return HTMLResponse(content=PRIVACY_HTML)
+
+
+_GMAIL_OAUTH_SCOPES = "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.send"
+
+
+def _gmail_redirect_uri():
+    return PUBLIC_BASE_URL.rstrip("/") + "/oauth/gmail/callback"
+
+
+@app.get("/oauth/gmail/start")
+def oauth_gmail_start():
+    """One click Gmail authorization. Dan opens this, signs in as the bar account and
+    allows, and the callback hands back the refresh token to paste into Railway. Uses
+    the client id and secret already in the service, so no secret is ever pasted by
+    hand and no OAuth Playground is needed. The redirect URI here must be registered
+    on the Google OAuth client."""
+    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET):
+        return {"error": "GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET must be set in Railway first"}
+    import urllib.parse
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": _gmail_redirect_uri(),
+        "response_type": "code",
+        "scope": _GMAIL_OAUTH_SCOPES,
+        "access_type": "offline",
+        "prompt": "consent",
+        "login_hint": BAR_EMAIL,
+    }
+    return RedirectResponse("https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params))
+
+
+@app.get("/oauth/gmail/callback", response_class=HTMLResponse)
+def oauth_gmail_callback(code: str = "", error: str = ""):
+    if error:
+        return HTMLResponse(f"<p>OAuth error: {error}</p>", status_code=400)
+    if not code:
+        return HTMLResponse("<p>Missing code.</p>", status_code=400)
+    try:
+        r = httpx.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "code": code,
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "redirect_uri": _gmail_redirect_uri(),
+                "grant_type": "authorization_code",
+            },
+            timeout=30,
+        )
+        r.raise_for_status()
+        rt = r.json().get("refresh_token")
+    except Exception as e:
+        detail = getattr(e, "response", None)
+        return HTMLResponse(f"<p>Token exchange failed: {e} {detail.text if detail is not None else ''}</p>", status_code=500)
+    if not rt:
+        return HTMLResponse(
+            "<p>No refresh token was returned. This happens if you already granted "
+            "access before. Revoke it at myaccount.google.com under Data and privacy, "
+            "Third party access, then open /oauth/gmail/start again.</p>",
+            status_code=500,
+        )
+    html = (
+        "<!doctype html><html><body style='font-family:sans-serif;max-width:640px;margin:40px auto'>"
+        "<h2>Gmail refresh token ready</h2>"
+        "<p>Copy the value below and set it in Railway as <b>GMAIL_REFRESH_TOKEN</b>, then redeploy. "
+        "Keep it secret, treat it like a password. This page shows it only once.</p>"
+        f"<textarea readonly style='width:100%;height:120px'>{rt}</textarea>"
+        "<p>After redeploy, open <b>/debug</b> to confirm GMAIL_REFRESH_TOKEN reads true, then "
+        "<b>/poll_email</b> to run the first inbox check.</p>"
+        "</body></html>"
+    )
+    return HTMLResponse(html)
 
 
 @app.get("/debug")
