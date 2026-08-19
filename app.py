@@ -291,9 +291,10 @@ def create_reservation(name, contact, party, area, start_dt, occasion, table, no
     return svc.events().insert(calendarId=RESERVIERUNGEN_CALENDAR_ID, body=body).execute()
 
 
-def process_booking(sender: str, data: dict) -> str:
-    """Given the details the model extracted, check the table map, book if a
-    table is free, and return the German guest reply. Never overbooks."""
+def process_booking(sender: str, data: dict, lang: str = "de") -> str:
+    """Given the details the model gave the tool, check the table map, book if a
+    table is free, and return the guest reply in the guest's language. Never
+    overbooks."""
     try:
         party = int(data.get("party") or 0)
         area = "draussen" if str(data.get("area", "")).lower().startswith("drau") else "drinnen"
@@ -308,37 +309,52 @@ def process_booking(sender: str, data: dict) -> str:
         return ""
     if not (BOOKING_ENABLED and GOOGLE_REFRESH_TOKEN and RESERVIERUNGEN_CALENDAR_ID):
         logger.warning("booking not configured, handing off")
-        return _handoff_line(sie)
+        return _handoff_line(sie, lang)
     try:
         table = find_free_table(date_iso, start_dt, party, area)
     except Exception as e:
         logger.error("availability check failed: %s", e)
-        return _handoff_line(sie)
+        return _handoff_line(sie, lang)
     if not table:
         logger.info("no free table for %s %s party %s %s", date_iso, hhmm, party, area)
-        return _full_line(sie)
+        return _full_line(sie, lang)
     try:
         create_reservation(name, sender, party, area, start_dt, occasion, table)
     except Exception as e:
         logger.error("create_reservation failed: %s", e)
-        return _handoff_line(sie)
+        return _handoff_line(sie, lang)
     logger.info("booked table %s for %s party %s %s %s", table, name, party, date_iso, hhmm)
+    h = start_dt.strftime("%H")
+    if lang == "en":
+        days_en = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        where = "outside" if area == "draussen" else "inside"
+        h12 = start_dt.hour % 12 or 12
+        mins = f":{start_dt.strftime('%M')}" if start_dt.minute else ""
+        time_en = f"{h12}{mins} {'am' if start_dt.hour < 12 else 'pm'}"
+        return (f"Perfect, your table for {party} on {days_en[start_dt.weekday()]} at {time_en} {where} "
+                f"is confirmed, we look forward to having you and see you soon LG Dan")
+    days_de = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
     bereich = "draussen" if area == "draussen" else "drinnen"
-    wd = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"][start_dt.weekday()]
+    wd = days_de[start_dt.weekday()]
     if sie:
-        return (f"Sehr gerne, Ihr Tisch fuer {party} am {wd} um {start_dt.strftime('%H')} Uhr {bereich} "
+        return (f"Sehr gerne, Ihr Tisch fuer {party} am {wd} um {h} Uhr {bereich} "
                 f"ist fest reserviert. Wir freuen uns auf Sie und bis bald LG Dan")
-    return (f"Sehr gerne, dein Tisch fuer {party} am {wd} um {start_dt.strftime('%H')} Uhr {bereich} "
+    return (f"Sehr gerne, dein Tisch fuer {party} am {wd} um {h} Uhr {bereich} "
             f"ist fest reserviert, wir freuen uns auf euch und bis bald LG Dan")
 
 
-def _handoff_line(sie=False):
+def _handoff_line(sie=False, lang="de"):
+    if lang == "en":
+        return "I'll pass this straight to Dan and he'll get back to you personally very soon LG Dan"
     if sie:
         return "Ich gebe Ihre Anfrage direkt an Dan weiter, er meldet sich gleich persoenlich bei Ihnen LG Dan"
     return "Ich geb deine Anfrage direkt an Dan weiter, er meldet sich gleich persoenlich bei dir LG Dan"
 
 
-def _full_line(sie=False):
+def _full_line(sie=False, lang="de"):
+    if lang == "en":
+        return ("It is unfortunately already quite full at that time, I'll pass it straight to Dan "
+                "and he'll see if something can still be arranged LG Dan")
     if sie:
         return ("Fuer den Zeitpunkt ist es leider schon recht voll, ich gebe es direkt an Dan weiter "
                 "und er schaut ob sich doch noch etwas machen laesst LG Dan")
@@ -353,19 +369,19 @@ If it is spam, a cold sales pitch, a marketing, collaboration, press, sponsoring
 If it is about prices or Mindestumsatz beyond the guidance here, or anything you are genuinely unsure about, also reply with the single word SKIP, because Dan will handle it himself and silence is safer than a wrong answer.
 If a guest is unhappy or complaining, do not try to solve it. Send one short warm line that you are sorry and that you are passing it straight to Dan who will get back to them personally, then stop.
 
-VOICE. Write exactly the way Dan writes. Warm, personal, relaxed, never corporate, never like a bot. Use informal du and euch by default, but if the guest clearly writes formally with Sie, mirror that and answer in the Sie form throughout. Greet with a friendly opener and their first name when you know it, like Hey Lisa or Hallo Tobias. Use sehr gerne and danke dir. Close warmly, usually Wir freuen uns auf euch and then LG Dan. Small human touches are good, like mentioning the weather for an outside table. Keep it to two or three short flowing sentences.
+VOICE. Write exactly the way Dan writes. Warm, personal, relaxed, never corporate, never like a bot. Use informal du and euch by default, but if the guest clearly writes formally with Sie, mirror that and answer in the Sie form throughout. Greet with a friendly opener and their first name when you know it, like Hey Lisa or Hallo Tobias. In a German reply use warm touches like sehr gerne and danke dir, in an English reply use the natural English equivalent and never those German words. Close warmly, in German usually Wir freuen uns auf euch and then LG Dan, in English the natural equivalent and then LG Dan. Small human touches are good, like mentioning the weather for an outside table. Keep it to two or three short flowing sentences.
 
 HARD FORMAT RULES, no exceptions. Never use hyphens, dashes, bullet points, numbered lists, colons or semicolons. Clock times like 19 Uhr are fine. Connect thoughts with und and dann and the odd comma the way Dan does. No emoji. Always sign LG Dan.
 
-LANGUAGE. Reply completely in the language the guest wrote in, and never mix two languages in one message. If the guest writes English, the whole reply must be natural English, so write inside or outside, not drinnen or draussen, and do not drop in German phrases like sehr gerne. The only German you keep in an English reply is the sign off LG Dan. If the guest writes German, reply fully in German. The words drinnen and draussen only ever appear inside the BOOK JSON, never in an English guest message.
+LANGUAGE. Reply completely in the language the guest wrote in, and never mix two languages in one message. If the guest writes English, the whole reply must be natural English, so write inside or outside, not drinnen or draussen, and do not drop in German phrases like sehr gerne. The only German you keep in an English reply is the sign off LG Dan. If the guest writes German, reply fully in German. The words drinnen and draussen only ever appear inside the book_table tool call, never in an English guest message.
 
 CONTEXT AND OWNING MISTAKES. You can see the whole conversation, so read it before you reply and fit where the chat already is. Do not greet a returning guest as if this is the first message, do not ask something that was already answered, and pick up naturally from what was said. Very important, if YOU said something wrong earlier, for example the wrong day or wrong hours, and the guest corrects you, own it warmly and apologise, something like sorry, da hab ich mich vertan, and then give the right answer. Never act as if the guest made the mistake and never pretend it did not happen.
 
 TIME AND OPENING HOURS. For anything about whether the bar is open, or what day or time it is, rely ONLY on the AKTUELLER ZEITPUNKT line given to you and never guess the weekday. Opening hours are Donnerstag 18 bis 24 Uhr, Freitag und Samstag 18 bis 2 Uhr, sonst geschlossen. There is a Happy Hour bis 20 Uhr, mention it warmly but never quote prices. If today is a closed day, say so kindly and name the next open day.
 
-RESERVATIONS up to six people. You need six things, the date, the time, the number of people, a name, whether they would like inside or outside, and whether it is for a special occasion. Always ask about the occasion, warmly, even if they have not mentioned one, because we like to note it, and if there is none that is completely fine. If any of these is missing, ask for what is missing warmly in one short flowing message, never as a list, and do not book yet. Once you have all five, do NOT write a confirmation yourself. Instead reply with a single line that starts with the word BOOK followed by one JSON object and nothing else at all, for example BOOK {"name":"Lisa","party":4,"area":"draussen","date":"2026-08-22","time":"20:00","occasion":"Geburtstag","sie":false}. Resolve the date to YYYY-MM-DD using the AKTUELLER ZEITPUNKT line, use 24 hour time as HH:MM, area is exactly drinnen or draussen, occasion is the Anlass or an empty string, and sie is true only if you are speaking to the guest in the formal Sie form. The system then checks the real table availability, books an actual table and sends the guest the confirmation for you, so whenever you output BOOK you write nothing else in that message. Only ever use BOOK for parties of up to six people, never for seven or more.
+RESERVATIONS up to six people. You need six things, the date, the time, the number of people, a name, whether they would like inside or outside, and whether it is for a special occasion. Always ask about the occasion, warmly, even if they have not mentioned one, because we like to note it, and if there is none that is completely fine. If any of these is missing, ask for what is missing warmly in one short flowing message, never as a list, and do not book yet. Once you have all six, do NOT write a confirmation yourself. Instead call the book_table tool with the details. Resolve the date to YYYY-MM-DD using the AKTUELLER ZEITPUNKT line, use 24 hour time as HH:MM, area is exactly drinnen or draussen, occasion is the Anlass or an empty string, and sie is true only if you are speaking to the guest in the formal Sie form. The system then checks the real table availability, books an actual table and sends the guest the confirmation for you, so when you call book_table you do not also write any message. Only ever call book_table for parties of up to six people, never for seven or more.
 
-SAME DAY BY PHONE. This rule comes before the booking rule. If a guest wants a table for today AND the bar is open today AND it is after 18 Uhr right now, never output BOOK. Instead warmly tell them to please call the bar directly under 0821 47019035 rather than WhatsApp, because a table for tonight is arranged fastest by phone.
+SAME DAY BY PHONE. This rule comes before the booking rule. If a guest wants a table for today AND the bar is open today AND it is after 18 Uhr right now, never call book_table. Instead warmly tell them to please call the bar directly under 0821 47019035 rather than WhatsApp, because a table for tonight is arranged fastest by phone.
 
 GROUPS AND EVENTS, seven people or more, or any birthday, party or private booking. Treat it as an event and do not confirm anything. Warmly work through the occasion, whether they have been to BrunnenBar before, the date and time, how many people, drinnen or draussen, and roughly what they have in mind. Then tell them Dan gets back to them personally with an Angebot by email. Never mention Mindestumsatz or prices. If a guest asks about price straight away, do not give a number, instead ask warmly how many people they are and whether they have been to the bar before.
 
@@ -373,7 +389,32 @@ FACTS YOU MAY SHARE. BrunnenBar is on Am Brunnenlech in Augsburg. There is no ki
 
 Never congratulate in advance for a birthday, wedding or anything that has not happened yet, that is bad luck, show excitement about hosting instead. Never put a bank account, IBAN or card number into a message.
 
-Output only the message text to send, or the single word SKIP."""
+When you are not calling the book_table tool, output only the message text to send, or the single word SKIP. Never mention the tool or JSON to the guest."""
+
+
+BOOK_TOOL = {
+    "name": "book_table",
+    "description": (
+        "Reserve a table. Only call this once you have ALL of these from the guest, the date, "
+        "the time, the number of people which must be six or fewer, the area drinnen or draussen, "
+        "the guest's name, and whether it is for a special occasion. Do NOT call it for seven or "
+        "more people, for an event, or for a same day request after 18 Uhr. Calling it books a real "
+        "table and sends the guest the confirmation, so when you call it you write no message yourself."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "The guest's name"},
+            "party": {"type": "integer", "description": "Number of people, 1 to 6"},
+            "area": {"type": "string", "enum": ["drinnen", "draussen"]},
+            "date": {"type": "string", "description": "YYYY-MM-DD, resolved from the AKTUELLER ZEITPUNKT line"},
+            "time": {"type": "string", "description": "HH:MM in 24 hour time"},
+            "occasion": {"type": "string", "description": "The Anlass, or an empty string if none"},
+            "sie": {"type": "boolean", "description": "true only if addressing the guest formally with Sie"},
+        },
+        "required": ["name", "party", "area", "date", "time", "occasion", "sie"],
+    },
+}
 
 
 @app.get("/health")
@@ -598,16 +639,12 @@ def handle_later(channel: str, sender: str, text: str, mid: str = None):
 
 
 def handle(channel: str, sender: str, text: str):
-    reply = claude_draft(sender, text)
-    if reply and reply.strip().startswith("BOOK"):
-        m = re.search(r"\{.*\}", reply, re.S)
-        booked = ""
-        if m:
-            try:
-                booked = process_booking(sender, json.loads(m.group(0)))
-            except Exception as e:
-                logger.error("BOOK json parse failed: %s reply=%s", e, reply[:200])
-        reply = booked or _handoff_line()
+    action, value, lang = claude_decide(sender, text)
+    if action == "book":
+        logger.info("book_table called by model: %s", value)
+        reply = process_booking(sender, value, lang) or _handoff_line(bool(value.get("sie")), lang)
+    else:
+        reply = value
     if not reply or reply.strip().upper() == "SKIP":
         logger.info("No reply, classified as not a guest inquiry or empty draft")
         return
@@ -640,13 +677,17 @@ def _clean_messages(history):
     return msgs
 
 
-def claude_draft(sender: str, text: str) -> str:
+def claude_decide(sender: str, text: str):
+    """Ask the model what to do. Returns (action, value, lang), where action is
+    'book' with value a details dict, 'text' with value the reply string, or
+    'none'. Booking goes through the book_table tool, which is far more reliable
+    than asking the model to emit a special line."""
+    lang = detect_lang(text)
     if not ANTHROPIC_API_KEY:
         logger.warning("No ANTHROPIC_API_KEY, cannot draft")
-        return ""
+        return ("none", "", lang)
     messages = _clean_messages(conv_history(sender)) or [{"role": "user", "content": text}]
     system = SYSTEM_PROMPT + "\n\n" + bar_time_context()
-    lang = detect_lang(text)
     if lang == "en":
         system += (
             "\n\nLANGUAGE OVERRIDE for this reply. The guest is writing in ENGLISH. "
@@ -666,19 +707,24 @@ def claude_draft(sender: str, text: str) -> str:
             },
             json={
                 "model": "claude-sonnet-4-5",
-                "max_tokens": 400,
+                "max_tokens": 500,
                 "system": system,
+                "tools": [BOOK_TOOL],
                 "messages": messages,
             },
             timeout=30,
         )
         r.raise_for_status()
         parts = r.json().get("content", [])
-        return "".join(p.get("text", "") for p in parts if p.get("type") == "text").strip()
+        for p in parts:
+            if p.get("type") == "tool_use" and p.get("name") == "book_table":
+                return ("book", p.get("input", {}) or {}, lang)
+        text_out = "".join(p.get("text", "") for p in parts if p.get("type") == "text").strip()
+        return ("text", text_out, lang)
     except Exception as e:
         detail = getattr(e, "response", None)
-        logger.error("Claude draft failed: %s %s", e, detail.text if detail is not None else "")
-        return ""
+        logger.error("Claude decide failed: %s %s", e, detail.text if detail is not None else "")
+        return ("none", "", lang)
 
 
 def send_whatsapp(to: str, text: str):
