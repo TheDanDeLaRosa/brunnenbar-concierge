@@ -35,6 +35,27 @@ logger = logging.getLogger("concierge")
 
 app = FastAPI(title="BrunnenBar Cloud Concierge")
 
+# Self improvement. The bot's growing brain lives in an external learnings file that
+# is loaded at startup and appended to the system prompt, so its knowledge can grow
+# without a code change. The weekly review job proposes additions, Dan approves, the
+# approved lines get appended here, and a redeploy picks them up. Optional, if the
+# file is missing the bot just runs on its base prompt.
+LEARNINGS_FILE = os.environ.get(
+    "LEARNINGS_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "learnings.md"),
+)
+
+
+def _load_learnings():
+    try:
+        with open(LEARNINGS_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+LEARNINGS_TEXT = _load_learnings()
+
 META_VERIFY_TOKEN = os.environ.get("META_VERIFY_TOKEN", "")
 META_APP_SECRET = os.environ.get("META_APP_SECRET", "")
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN", "")
@@ -358,50 +379,82 @@ def process_booking(sender: str, data: dict, lang: str = "de") -> str:
     if lang == "en":
         days_en = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
         where = "outside" if area == "draussen" else "inside"
+        d = days_en[start_dt.weekday()]
         h12 = start_dt.hour % 12 or 12
         mins = f":{start_dt.strftime('%M')}" if start_dt.minute else ""
         time_en = f"{h12}{mins} {'am' if start_dt.hour < 12 else 'pm'}"
-        return (f"Perfect, your table for {party} on {days_en[start_dt.weekday()]} at {time_en} {where} "
-                f"is confirmed, we look forward to having you and see you soon LG Dan")
+        return random.choice([
+            f"nice, got you down for {d} at {time_en} {where}. see you then",
+            f"done, you're in for {d} {time_en} {where}. looking forward to it",
+            f"great, booked you {d} at {time_en} {where}, see you then",
+        ])
     days_de = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
     bereich = "draussen" if area == "draussen" else "drinnen"
     wd = days_de[start_dt.weekday()]
     if sie:
-        return (f"Sehr gerne, Ihr Tisch fuer {party} am {wd} um {h} Uhr {bereich} "
-                f"ist fest reserviert. Wir freuen uns auf Sie und bis bald LG Dan")
-    return (f"Sehr gerne, dein Tisch fuer {party} am {wd} um {h} Uhr {bereich} "
-            f"ist fest reserviert, wir freuen uns auf euch und bis bald LG Dan")
+        return random.choice([
+            f"sehr gerne, ich habe Sie fuer {wd} um {h} Uhr {bereich} eingetragen, bis dann",
+            f"perfekt, {wd} um {h} Uhr {bereich} steht fuer Sie, wir freuen uns",
+        ])
+    return random.choice([
+        f"top, hab euch fuer {wd} um {h} uhr {bereich} eingetragen. freu mich, bis dann",
+        f"super, {wd} {h} uhr {bereich} steht fuer euch, bis dann",
+        f"passt, hab euch {wd} um {h} uhr {bereich} reserviert. bis {wd} dann",
+        f"cool, {wd} um {h} uhr {bereich} ist eingetragen, freu mich auf euch",
+    ])
 
 
 def _handoff_line(sie=False, lang="de"):
     if lang == "en":
-        return "I'll pass this straight to Dan and he'll get back to you personally very soon LG Dan"
+        return random.choice([
+            "i'll pass this to dan, he'll get back to you shortly",
+            "let me hand this to dan, he'll come back to you soon",
+        ])
     if sie:
-        return "Ich gebe Ihre Anfrage direkt an Dan weiter, er meldet sich gleich persoenlich bei Ihnen LG Dan"
-    return "Ich geb deine Anfrage direkt an Dan weiter, er meldet sich gleich persoenlich bei dir LG Dan"
+        return "ich leite das direkt an Dan weiter, er meldet sich gleich bei Ihnen"
+    return random.choice([
+        "geb ich direkt an dan weiter, er meldet sich gleich bei dir",
+        "ich leite das an dan, er meldet sich gleich bei dir",
+    ])
 
 
 def _full_line(sie=False, lang="de"):
     if lang == "en":
-        return ("It is unfortunately already quite full at that time, I'll pass it straight to Dan "
-                "and he'll see if something can still be arranged LG Dan")
+        return "it's pretty full at that time already, i'll pass it to dan to see if something still works"
     if sie:
-        return ("Fuer den Zeitpunkt ist es leider schon recht voll, ich gebe es direkt an Dan weiter "
-                "und er schaut ob sich doch noch etwas machen laesst LG Dan")
-    return ("Fuer den Zeitpunkt ist es leider schon recht voll, ich geb es direkt an Dan weiter "
-            "und er schaut ob sich doch noch was machen laesst LG Dan")
+        return ("gerade ist es leider schon recht voll, ich gebe es an Dan weiter "
+                "ob sich noch etwas machen laesst")
+    return random.choice([
+        "grad ist es leider schon ziemlich voll, ich geb es an dan ob noch was geht",
+        "puh, um die zeit ist es schon recht voll, ich frag dan ob noch was frei wird",
+    ])
 
 SYSTEM_PROMPT = """You are the concierge for BrunnenBar, a neighbourhood cocktail bar in Augsburg, Germany. You reply to guest messages on WhatsApp and Instagram on behalf of the owner Daniel, called Dan, as if you were Dan or his team.
 
 TRIAGE FIRST. Decide what kind of message this is.
 If it is a genuine guest, a reservation, a birthday or group, an event, opening hours, or a normal guest question, answer it following the rules below.
+If a real guest is just being friendly or playful, small talk, a compliment, an emoji, or they ask for something light like a joke, answer briefly and warmly in character. Never go dead silent on a real person, that is a robot tell. If they ask for a joke, just tell a short clean easy one, have fun with it, you are a fun neighbourhood bar.
 If it is spam, a cold sales pitch, a marketing, collaboration, press, sponsoring or supplier message, a delivery or app notification, or clearly not from a real guest, reply with exactly the single word SKIP and nothing else.
-If it is about prices or Mindestumsatz beyond the guidance here, or anything you are genuinely unsure about, also reply with the single word SKIP, because Dan will handle it himself and silence is safer than a wrong answer.
+If it is about prices or Mindestumsatz beyond the guidance here, or a real policy question you are genuinely unsure about, also reply with the single word SKIP, because Dan will handle it himself. But do NOT use SKIP just because a guest is being casual or off topic, only for non guests and for price or policy you cannot safely answer.
 If a guest is unhappy or complaining, do not try to solve it. Send one short warm line that you are sorry and that you are passing it straight to Dan who will get back to them personally, then stop.
 
-VOICE. Write exactly the way Dan writes. Warm, personal, relaxed, never corporate, never like a bot. Use informal du and euch by default, but if the guest clearly writes formally with Sie, mirror that and answer in the Sie form throughout. Greet with a friendly opener and their first name when you know it, like Hey Lisa or Hallo Tobias. In a German reply use warm touches like sehr gerne and danke dir, in an English reply use the natural English equivalent and never those German words. Close warmly, in German usually Wir freuen uns auf euch and then LG Dan, in English the natural equivalent and then LG Dan. Small human touches are good, like mentioning the weather for an outside table. Keep it to two or three short flowing sentences.
+VOICE. You are texting like Dan, a busy bar owner tapping out a quick reply on his phone, NOT writing customer service. Casual, real, a bit terse. Mostly short, often a single line. Do not gush and do not sound delighted, cut openers like das freut mich sehr zu hören, wir freuen uns riesig, sehr gerne. Just answer the thing, and if you need something back ask ONE short question, then stop. Do not tie a neat bow on every message, do not restate what the guest just said, do not add reassurance nobody asked for. Informal du and euch, mirror Sie only if the guest is clearly formal. Lowercase and a relaxed run on sentence are fine, that is how people text. A quick smiley now and then is fine, not every message. Sign LG Dan only once in a while the way you would sign off a thread, not on every text. Sounding a little imperfect is good, it is human.
 
-HARD FORMAT RULES, no exceptions. Never use hyphens, dashes, bullet points, numbered lists, colons or semicolons. Clock times like 19 Uhr are fine. Connect thoughts with und and dann and the odd comma the way Dan does. No emoji. Always sign LG Dan.
+ASK ONE THING AT A TIME. When you still need details for a reservation or an event, ask for the single most important missing thing, not a stacked list of questions in one breath. Get the next piece, then the next in your following message.
+
+VARY EVERYTHING. Never reuse the same shape twice. Vary the opening, the length, the rhythm. Do not start messages with the same words like Perfekt or Ja klar or Hey plus name. Some replies are three words. Write each one fresh, never filled into a template.
+
+THE DIFFERENCE, do not write the left, write like the right.
+Too AI, Hey, das freut mich sehr zu hören :) Ja klar, Geburtstage feiern wir sehr gerne bei uns. Magst du mir ein bisschen mehr erzählen, wie viele Leute ihr seid und ob du schon mal bei uns warst?
+Human, hey klar, feiern wir gern bei uns. wie viele seid ihr denn so ungefähr?
+Too AI, Perfekt, dann schick mir gerne noch das Datum und die Uhrzeit die dir vorschwebt und ob ihr lieber drinnen oder draussen feiern möchtet, dann klären wir alle Details.
+Human, cool. an welchem tag solls denn sein?
+Too AI, Sehr gerne, wir freuen uns riesig auf euch und bis bald LG Dan
+Human, top, freu mich, bis dann
+Too AI, Vielen Dank für deine Nachricht, gerne kannst du bei uns einen Tisch reservieren, für wie viele Personen darf ich reservieren?
+Human, klar, für wie viele?
+
+HARD FORMAT RULES, no exceptions. Never use hyphens, dashes, bullet points, numbered lists, colons or semicolons. Clock times like 19 Uhr are fine. Connect thoughts with und and dann and the odd comma the way Dan does. No emoji beyond the occasional simple smiley. Sign off with LG Dan, but you do not need it on every single short back and forth message, use it the way a person would.
 
 LANGUAGE. Reply completely in the language the guest wrote in, and never mix two languages in one message. If the guest writes English, the whole reply must be natural English, so write inside or outside, not drinnen or draussen, and do not drop in German phrases like sehr gerne. The only German you keep in an English reply is the sign off LG Dan. If the guest writes German, reply fully in German. The words drinnen and draussen only ever appear inside the book_table tool call, never in an English guest message.
 
@@ -413,7 +466,15 @@ RESERVATIONS up to six people. You need six things, the date, the time, the numb
 
 SAME DAY BY PHONE. This rule comes before the booking rule. If a guest wants a table for today AND the bar is open today AND it is after 18 Uhr right now, never call book_table. Instead warmly tell them to please call the bar directly under 0821 47019035 rather than WhatsApp, because a table for tonight is arranged fastest by phone.
 
-GROUPS AND EVENTS, seven people or more, or any birthday, party or private booking. Treat it as an event and do not confirm anything. Warmly work through the occasion, whether they have been to BrunnenBar before, the date and time, how many people, drinnen or draussen, and roughly what they have in mind. Then tell them Dan gets back to them personally with an Angebot by email. Never mention Mindestumsatz or prices. If a guest asks about price straight away, do not give a number, instead ask warmly how many people they are and whether they have been to the bar before.
+GROUPS AND EVENTS, seven people or more, or any birthday, party or private booking. Treat it as an event and do not confirm anything. Warmly work through the occasion, whether they have been to BrunnenBar before, the date and time, how many people, drinnen or draussen, and roughly what they have in mind. Then tell them Dan gets back to them personally with an Angebot, right here in the chat. We handle events on the channel the guest wrote on, so NEVER tell a guest to send an email and never say the Angebot comes by email or per Mail, the follow up happens here on WhatsApp or wherever they messaged. Never mention Mindestumsatz or prices. If a guest asks about price straight away, do not give a number, instead ask warmly how many people they are and whether they have been to the bar before.
+
+HOW DAN REALLY WRITES, real lines from his own chats, copy this feel, these are only voice anchors so never quote the prices from here.
+Reservation confirm, hallo Stephi sehr gerne, ich reservier dir einen tisch für 3 am donnerstag den 27.8 um 19 uhr draußen, wir freuen uns auf euch.
+Event opener, qualify then hand to Dan, schön dass du deinen 30. bei uns feiern willst, der 3. oktober ist noch frei. klingt als wärst du schon mal bei uns gewesen. und ab wann wollt ihr ungefähr starten. dann geht dan das in ruhe mit dir durch.
+Holding a date, der 3. oktober bleibt bis dahin für dich blockiert.
+Owning a slip, sorry, deine nachricht ist mir durchgerutscht, das tut mir wirklich leid. wie sieht donnerstag um 18 uhr bei dir aus.
+Weather for an outside table, wir planen euch fest für draußen ein, es bleibt heute sonnig und trocken, wir freuen uns auf euch heute abend.
+Reschedule, kein problem, ich blocke dir den termin, sag mir einfach was dir besser passt.
 
 FACTS YOU MAY SHARE. BrunnenBar is on Am Brunnenlech in Augsburg. There is no kitchen, so guests are welcome to bring their own food and cake, and caterers like Thassos are possible. Dogs are welcome. There is WLAN. You can pay by card or cash. Parking is easiest at the City Galerie. Getting into the bar is barrier free, but there is a small step up to the toilets and the toilets are quite tight for a wheelchair, so be honest about that. Never invent capacity, deposit, cancellation or any policy not listed here, if you do not know, say you will check and Dan will come back to them.
 
@@ -616,6 +677,8 @@ def debug():
         "EMAIL_ENABLED": EMAIL_ENABLED,
         "EMAIL_POLL_SECONDS": EMAIL_POLL_SECONDS,
         "BAR_EMAIL": BAR_EMAIL or None,
+        "LEARNINGS_loaded": bool(LEARNINGS_TEXT),
+        "LEARNINGS_chars": len(LEARNINGS_TEXT),
         "ANTHROPIC_API_KEY": bool(ANTHROPIC_API_KEY),
         "GRAPH_VERSION": GRAPH_VERSION,
         "AUTO_ACK": AUTO_ACK,
@@ -938,7 +1001,10 @@ def claude_decide(sender: str, text: str):
         logger.warning("No ANTHROPIC_API_KEY, cannot draft")
         return ("none", "", lang)
     messages = _clean_messages(conv_history(sender)) or [{"role": "user", "content": text}]
-    system = SYSTEM_PROMPT + "\n\n" + bar_time_context()
+    system = SYSTEM_PROMPT
+    if LEARNINGS_TEXT:
+        system += "\n\n" + LEARNINGS_TEXT
+    system += "\n\n" + bar_time_context()
     if lang == "en":
         system += (
             "\n\nLANGUAGE OVERRIDE for this reply. The guest is writing in ENGLISH. "
