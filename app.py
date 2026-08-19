@@ -31,11 +31,21 @@ META_VERIFY_TOKEN = os.environ.get("META_VERIFY_TOKEN", "")
 META_APP_SECRET = os.environ.get("META_APP_SECRET", "")
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN", "")
 WHATSAPP_PHONE_NUMBER_ID = os.environ.get("WHATSAPP_PHONE_NUMBER_ID", "")
+WHATSAPP_BUSINESS_ACCOUNT_ID = os.environ.get("WHATSAPP_BUSINESS_ACCOUNT_ID", "")
 INSTAGRAM_TOKEN = os.environ.get("INSTAGRAM_TOKEN", "")
 INSTAGRAM_ACCOUNT_ID = os.environ.get("INSTAGRAM_ACCOUNT_ID", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 GRAPH_VERSION = os.environ.get("GRAPH_VERSION", "v20.0")
 AUTO_ACK = os.environ.get("AUTO_ACK", "true").lower() == "true"
+
+# Dualhook coexistence layer. When DUALHOOK_API_KEY is set, WhatsApp sends go
+# through Dualhook's Graph compatible runtime (same payloads, different host and
+# a dh_live_ key, no Meta token or appsecret_proof). Inbound is unaffected,
+# Meta routes it straight to our webhook via Dualhook's Webhook Override. If the
+# key is not set we fall back to sending directly through Meta, so nothing breaks
+# before the coexistence connection exists.
+DUALHOOK_API_KEY = os.environ.get("DUALHOOK_API_KEY", "")
+DUALHOOK_BASE_URL = os.environ.get("DUALHOOK_BASE_URL", "https://api.dualhook.com/v25.0")
 
 GRAPH = "https://graph.facebook.com/" + GRAPH_VERSION
 _handled = set()
@@ -60,6 +70,59 @@ Output only the message text to send, or the single word SKIP."""
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+@app.get("/debug")
+def debug():
+    """Which config is present, booleans only, never the values. Safe to open in a browser."""
+    return {
+        "META_VERIFY_TOKEN": bool(META_VERIFY_TOKEN),
+        "META_APP_SECRET": bool(META_APP_SECRET),
+        "WHATSAPP_TOKEN": bool(WHATSAPP_TOKEN),
+        "WHATSAPP_PHONE_NUMBER_ID": WHATSAPP_PHONE_NUMBER_ID or None,
+        "WHATSAPP_BUSINESS_ACCOUNT_ID": WHATSAPP_BUSINESS_ACCOUNT_ID or None,
+        "INSTAGRAM_TOKEN": bool(INSTAGRAM_TOKEN),
+        "INSTAGRAM_ACCOUNT_ID": INSTAGRAM_ACCOUNT_ID or None,
+        "ANTHROPIC_API_KEY": bool(ANTHROPIC_API_KEY),
+        "GRAPH_VERSION": GRAPH_VERSION,
+        "AUTO_ACK": AUTO_ACK,
+        "DUALHOOK_API_KEY": bool(DUALHOOK_API_KEY),
+        "DUALHOOK_BASE_URL": DUALHOOK_BASE_URL,
+        "whatsapp_send_path": (DUALHOOK_BASE_URL if DUALHOOK_API_KEY else GRAPH) + "/" + (WHATSAPP_PHONE_NUMBER_ID or "<PHONE_NUMBER_ID>") + "/messages",
+    }
+
+
+def subscribe_waba():
+    """Subscribe this app to the WhatsApp Business Account so inbound message
+    webhooks are actually delivered. Without this, the messages field can be
+    subscribed at app level yet no messages arrive. Idempotent, safe to repeat."""
+    if not (WHATSAPP_BUSINESS_ACCOUNT_ID and WHATSAPP_TOKEN):
+        logger.warning("subscribe_waba: missing WHATSAPP_BUSINESS_ACCOUNT_ID or WHATSAPP_TOKEN")
+        return {"error": "missing WHATSAPP_BUSINESS_ACCOUNT_ID or WHATSAPP_TOKEN"}
+    try:
+        r = httpx.post(
+            GRAPH + "/" + WHATSAPP_BUSINESS_ACCOUNT_ID + "/subscribed_apps",
+            headers={"Authorization": "Bearer " + WHATSAPP_TOKEN},
+            timeout=30,
+        )
+        logger.info("subscribe_waba response %s %s", r.status_code, r.text)
+        return {"status": r.status_code, "body": r.text}
+    except Exception as e:
+        detail = getattr(e, "response", None)
+        logger.error("subscribe_waba failed: %s %s", e, detail.text if detail is not None else "")
+        return {"error": str(e)}
+
+
+@app.get("/subscribe")
+def subscribe_route():
+    """Open in a browser to force the subscription and see the result."""
+    return subscribe_waba()
+
+
+@app.on_event("startup")
+def _startup_subscribe():
+    logger.info("Startup: subscribing app to WhatsApp Business Account %s", WHATSAPP_BUSINESS_ACCOUNT_ID or "(not set)")
+    subscribe_waba()
 
 
 def challenge(request: Request):
@@ -194,18 +257,26 @@ def claude_draft(text: str) -> str:
 
 
 def send_whatsapp(to: str, text: str):
+    if DUALHOOK_API_KEY:
+        url = DUALHOOK_BASE_URL + "/" + WHATSAPP_PHONE_NUMBER_ID + "/messages"
+        headers = {"Authorization": "Bearer " + DUALHOOK_API_KEY}
+        via = "Dualhook"
+    else:
+        url = GRAPH + "/" + WHATSAPP_PHONE_NUMBER_ID + "/messages"
+        headers = {"Authorization": "Bearer " + WHATSAPP_TOKEN}
+        via = "Meta direct"
     try:
         r = httpx.post(
-            GRAPH + "/" + WHATSAPP_PHONE_NUMBER_ID + "/messages",
-            headers={"Authorization": "Bearer " + WHATSAPP_TOKEN},
+            url,
+            headers=headers,
             json={"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text}},
             timeout=30,
         )
         r.raise_for_status()
-        logger.info("WhatsApp reply sent to %s", to)
+        logger.info("WhatsApp reply sent to %s via %s", to, via)
     except Exception as e:
         detail = getattr(e, "response", None)
-        logger.error("WhatsApp send failed: %s %s", e, detail.text if detail is not None else "")
+        logger.error("WhatsApp send failed via %s: %s %s", via, e, detail.text if detail is not None else "")
 
 
 def send_instagram(recipient_id: str, text: str):
