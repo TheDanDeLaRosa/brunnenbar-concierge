@@ -186,7 +186,8 @@ def parse_event(ev):
         return None
     summary = ev.get("summary", "") or ""
     desc = ev.get("description", "") or ""
-    m = _PARTY_RE.search(summary + " " + desc)
+    low_all = (summary + " " + desc).lower()
+    m = re.search(r"anzahl personen\s*:?\s*(\d+)", low_all) or re.search(r"(\d+)\s*person", low_all)
     party = int(m.group(1)) if m else None
     segs = re.split(r"\s[–-]\s", summary)
     last = segs[-1].strip().lower() if segs else ""
@@ -267,8 +268,12 @@ def find_free_table(date_iso: str, start_dt: datetime, party: int, area: str):
 def create_reservation(name, contact, party, area, start_dt, occasion, table, note=""):
     svc = _calendar_service()
     end_dt = start_dt + timedelta(hours=TURN_HOURS)
-    anlass = occasion or "keiner"
-    summary = f"{name} - {party} - {anlass} - {table}"
+    anlass = occasion or "Schöner Abend"
+    # Title matches your convention, name, people, Anlass, and the assigned table,
+    # like "Dan - 4 Personen - Schoener Abend - Tisch 302". The area is no longer in
+    # the title, so the availability parser reads it from the Reservierter Bereich
+    # line in the description below, which is always present.
+    summary = f"{name} - {party} Personen - {anlass} - Tisch {table}"
     desc = (
         f"Name: {name}\n"
         f"Telefon/Contact: WhatsApp {contact}\n"
@@ -302,7 +307,7 @@ def process_booking(sender: str, data: dict, lang: str = "de") -> str:
         hhmm = str(data["time"])
         start_dt = datetime.fromisoformat(date_iso + "T" + hhmm).replace(tzinfo=BAR_TZ)
         name = (data.get("name") or "").strip() or "Gast"
-        occasion = (data.get("occasion") or "").strip() or "keiner"
+        occasion = (data.get("occasion") or "").strip() or "Schöner Abend"
         sie = bool(data.get("sie"))
     except Exception as e:
         logger.error("booking parse failed: %s data=%s", e, data)
