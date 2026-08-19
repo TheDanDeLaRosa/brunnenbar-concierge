@@ -130,6 +130,34 @@ def bar_time_context():
     )
 
 
+_DE_WORDS = set(
+    "ich und wir für fuer möchte moechte tisch reservieren reservierung morgen heute "
+    "personen leute danke bitte hallo hey servus seid ihr gerne uhr wäre waere hätte "
+    "haette kann könnt koennt drinnen draussen draußen abend geöffnet offen euch dich "
+    "einen zwei drei vier fünf fuenf sechs".split()
+)
+_EN_WORDS = set(
+    "the a an can could i we you book booking table for tomorrow today please hi hello "
+    "would like thanks thank name outside inside evening tonight people person do have "
+    "is are how what when your our reserve reservation want get".split()
+)
+
+
+def detect_lang(text: str):
+    """Rough English vs German detection for the guest's message, so we can pin
+    the reply language in code rather than hope the prompt holds."""
+    toks = re.findall(r"[a-zäöüß']+", (text or "").lower())
+    de = sum(1 for t in toks if t in _DE_WORDS)
+    en = sum(1 for t in toks if t in _EN_WORDS)
+    if any(c in (text or "") for c in "äöüß"):
+        de += 1
+    if de > en:
+        return "de"
+    if en > de:
+        return "en"
+    return None
+
+
 def _calendar_service():
     from google.oauth2.credentials import Credentials
     from googleapiclient.discovery import build
@@ -617,6 +645,17 @@ def claude_draft(sender: str, text: str) -> str:
         logger.warning("No ANTHROPIC_API_KEY, cannot draft")
         return ""
     messages = _clean_messages(conv_history(sender)) or [{"role": "user", "content": text}]
+    system = SYSTEM_PROMPT + "\n\n" + bar_time_context()
+    lang = detect_lang(text)
+    if lang == "en":
+        system += (
+            "\n\nLANGUAGE OVERRIDE for this reply. The guest is writing in ENGLISH. "
+            "Write your entire reply in natural English. Do not use any German words such as "
+            "sehr gerne, drinnen or draussen, write inside and outside instead. The only German "
+            "allowed anywhere in the reply is the sign off LG Dan."
+        )
+    elif lang == "de":
+        system += "\n\nLANGUAGE OVERRIDE for this reply. The guest is writing in German, so reply fully in German."
     try:
         r = httpx.post(
             "https://api.anthropic.com/v1/messages",
@@ -628,7 +667,7 @@ def claude_draft(sender: str, text: str) -> str:
             json={
                 "model": "claude-sonnet-4-5",
                 "max_tokens": 400,
-                "system": SYSTEM_PROMPT + "\n\n" + bar_time_context(),
+                "system": system,
                 "messages": messages,
             },
             timeout=30,
