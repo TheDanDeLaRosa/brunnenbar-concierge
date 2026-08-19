@@ -41,6 +41,12 @@ WHATSAPP_PHONE_NUMBER_ID = os.environ.get("WHATSAPP_PHONE_NUMBER_ID", "")
 WHATSAPP_BUSINESS_ACCOUNT_ID = os.environ.get("WHATSAPP_BUSINESS_ACCOUNT_ID", "")
 INSTAGRAM_TOKEN = os.environ.get("INSTAGRAM_TOKEN", "")
 INSTAGRAM_ACCOUNT_ID = os.environ.get("INSTAGRAM_ACCOUNT_ID", "")
+# Facebook Messenger, the BrunnenBar Page inbox. Same Meta app and webhook shape
+# as Instagram, just a Page access token and the Page id. Inbound arrives as
+# object page with entry[].messaging[], the same structure the Instagram lane
+# already reads, so it flows through the same handle() brain.
+MESSENGER_PAGE_ID = os.environ.get("MESSENGER_PAGE_ID", "")
+MESSENGER_TOKEN = os.environ.get("MESSENGER_TOKEN", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 GRAPH_VERSION = os.environ.get("GRAPH_VERSION", "v20.0")
 AUTO_ACK = os.environ.get("AUTO_ACK", "true").lower() == "true"
@@ -67,6 +73,21 @@ GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
 BOOKING_ENABLED = os.environ.get("BOOKING_ENABLED", "true").lower() == "true"
 TURN_HOURS = int(os.environ.get("TURN_HOURS", "3"))
 BAR_TZ = ZoneInfo("Europe/Berlin")
+
+# Email, Gmail lane. Auto replies to genuine guest email in the house voice using
+# the same brain and booking tool as chat. Runs as one background poll loop, which
+# is safe because the service runs a single process. It uses its own refresh token
+# for the bar inbox with gmail.modify and gmail.send scopes, kept separate from the
+# calendar token so the working calendar auth is never touched. A start time gate
+# means only mail that arrives after the service boots is answered, so the first
+# deploy never blasts the existing backlog, and a handled label stops re-answering.
+GMAIL_REFRESH_TOKEN = os.environ.get("GMAIL_REFRESH_TOKEN", "")
+BAR_EMAIL = os.environ.get("BAR_EMAIL", "brunnenbaraugsburg@gmail.com")
+EMAIL_ENABLED = os.environ.get("EMAIL_ENABLED", "true").lower() == "true"
+EMAIL_POLL_SECONDS = int(os.environ.get("EMAIL_POLL_SECONDS", "90"))
+EMAIL_HANDLED_LABEL = os.environ.get("EMAIL_HANDLED_LABEL", "Concierge-Beantwortet")
+_EMAIL_START_MS = int(time.time() * 1000)
+_gmail_label_cache = {}
 
 # The bookable tables from the floor plan, name maps to seats and area. Outside
 # is the 3XX tables, inside is the real tables. Bar stools and single seats are
@@ -438,6 +459,12 @@ def debug():
         "WHATSAPP_BUSINESS_ACCOUNT_ID": WHATSAPP_BUSINESS_ACCOUNT_ID or None,
         "INSTAGRAM_TOKEN": bool(INSTAGRAM_TOKEN),
         "INSTAGRAM_ACCOUNT_ID": INSTAGRAM_ACCOUNT_ID or None,
+        "MESSENGER_TOKEN": bool(MESSENGER_TOKEN),
+        "MESSENGER_PAGE_ID": MESSENGER_PAGE_ID or None,
+        "GMAIL_REFRESH_TOKEN": bool(GMAIL_REFRESH_TOKEN),
+        "EMAIL_ENABLED": EMAIL_ENABLED,
+        "EMAIL_POLL_SECONDS": EMAIL_POLL_SECONDS,
+        "BAR_EMAIL": BAR_EMAIL or None,
         "ANTHROPIC_API_KEY": bool(ANTHROPIC_API_KEY),
         "GRAPH_VERSION": GRAPH_VERSION,
         "AUTO_ACK": AUTO_ACK,
@@ -531,10 +558,45 @@ def subscribe_route():
     return subscribe_waba()
 
 
+def subscribe_page():
+    """Subscribe the app to the Facebook Page so Messenger message webhooks are
+    delivered. Needs the Page access token and Page id. Idempotent."""
+    if not (MESSENGER_PAGE_ID and MESSENGER_TOKEN):
+        logger.warning("subscribe_page: missing MESSENGER_PAGE_ID or MESSENGER_TOKEN")
+        return {"error": "missing MESSENGER_PAGE_ID or MESSENGER_TOKEN"}
+    try:
+        r = httpx.post(
+            GRAPH + "/" + MESSENGER_PAGE_ID + "/subscribed_apps",
+            headers={"Authorization": "Bearer " + MESSENGER_TOKEN},
+            params={"subscribed_fields": "messages,messaging_postbacks"},
+            timeout=30,
+        )
+        logger.info("subscribe_page response %s %s", r.status_code, r.text)
+        return {"status": r.status_code, "body": r.text}
+    except Exception as e:
+        detail = getattr(e, "response", None)
+        logger.error("subscribe_page failed: %s %s", e, detail.text if detail is not None else "")
+        return {"error": str(e)}
+
+
+@app.get("/subscribe_messenger")
+def subscribe_messenger_route():
+    """Open in a browser to force the Page subscription and see the result."""
+    return subscribe_page()
+
+
 @app.on_event("startup")
 def _startup_subscribe():
     logger.info("Startup: subscribing app to WhatsApp Business Account %s", WHATSAPP_BUSINESS_ACCOUNT_ID or "(not set)")
     subscribe_waba()
+    if MESSENGER_PAGE_ID and MESSENGER_TOKEN:
+        logger.info("Startup: subscribing app to Facebook Page %s", MESSENGER_PAGE_ID)
+        subscribe_page()
+    if EMAIL_ENABLED and GMAIL_REFRESH_TOKEN:
+        logger.info("Startup: starting Gmail poll loop every %s s for %s", EMAIL_POLL_SECONDS, BAR_EMAIL)
+        threading.Thread(target=poll_gmail_loop, daemon=True).start()
+    else:
+        logger.info("Startup: Gmail lane off (no GMAIL_REFRESH_TOKEN or EMAIL_ENABLED false)")
 
 
 def challenge(request: Request):
@@ -628,6 +690,37 @@ async def instagram_receive(request: Request):
     return {"received": True}
 
 
+@app.get("/webhook/messenger")
+async def messenger_verify(request: Request):
+    return challenge(request)
+
+
+@app.post("/webhook/messenger")
+async def messenger_receive(request: Request):
+    body = await request.body()
+    logger.info("Messenger POST received, %d bytes", len(body))
+    check_sig("Messenger", body, request.headers.get("X-Hub-Signature-256", ""))
+    try:
+        data = await request.json()
+    except Exception:
+        logger.error("Messenger POST body was not JSON")
+        return {"received": True}
+    for entry in data.get("entry", []):
+        for event in entry.get("messaging", []):
+            message = event.get("message") or {}
+            mid = message.get("mid")
+            text = message.get("text", "")
+            if message.get("is_echo") or not text or not mid or mid in _handled:
+                continue
+            _handled.add(mid)
+            sender = event.get("sender", {}).get("id")
+            logger.info("Messenger in from %s: %s", sender, text[:120])
+            conv_append(sender, "user", text)
+            _last_msg[sender] = mid
+            threading.Thread(target=handle_later, args=("messenger", sender, text, mid), daemon=True).start()
+    return {"received": True}
+
+
 def handle_later(channel: str, sender: str, text: str, mid: str = None):
     """Wait a random human feeling pause, then draft and send. Runs in its own
     thread so the webhook can return 200 to Meta straight away. If a newer
@@ -662,6 +755,8 @@ def handle(channel: str, sender: str, text: str):
         send_whatsapp(sender, reply)
     elif channel == "instagram":
         send_instagram(sender, reply)
+    elif channel == "messenger":
+        send_messenger(sender, reply)
 
 
 def _clean_messages(history):
@@ -768,6 +863,240 @@ def send_instagram(recipient_id: str, text: str):
     except Exception as e:
         detail = getattr(e, "response", None)
         logger.error("Instagram send failed: %s %s", e, detail.text if detail is not None else "")
+
+
+def send_messenger(recipient_id: str, text: str):
+    """Send a Facebook Messenger reply from the Page. messaging_type RESPONSE marks
+    it as a direct reply to the guest, which is what Messenger expects inside the
+    standard messaging window."""
+    try:
+        r = httpx.post(
+            GRAPH + "/" + (MESSENGER_PAGE_ID or "me") + "/messages",
+            headers={"Authorization": "Bearer " + MESSENGER_TOKEN},
+            json={
+                "recipient": {"id": recipient_id},
+                "messaging_type": "RESPONSE",
+                "message": {"text": text},
+            },
+            timeout=30,
+        )
+        r.raise_for_status()
+        logger.info("Messenger reply sent to %s", recipient_id)
+    except Exception as e:
+        detail = getattr(e, "response", None)
+        logger.error("Messenger send failed: %s %s", e, detail.text if detail is not None else "")
+
+
+# ---------------------------------------------------------------------------
+# Email, Gmail lane
+# ---------------------------------------------------------------------------
+
+def _gmail_service():
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.discovery import build
+    creds = Credentials(
+        None,
+        refresh_token=GMAIL_REFRESH_TOKEN,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+        scopes=[
+            "https://www.googleapis.com/auth/gmail.modify",
+            "https://www.googleapis.com/auth/gmail.send",
+        ],
+    )
+    return build("gmail", "v1", credentials=creds, cache_discovery=False)
+
+
+def _gmail_label_id(svc):
+    """Id of the handled label, created once if missing, cached for the process."""
+    if "id" in _gmail_label_cache:
+        return _gmail_label_cache["id"]
+    labels = svc.users().labels().list(userId="me").execute().get("labels", [])
+    for l in labels:
+        if l.get("name") == EMAIL_HANDLED_LABEL:
+            _gmail_label_cache["id"] = l["id"]
+            return l["id"]
+    created = svc.users().labels().create(
+        userId="me",
+        body={"name": EMAIL_HANDLED_LABEL, "labelListVisibility": "labelShow", "messageListVisibility": "show"},
+    ).execute()
+    _gmail_label_cache["id"] = created["id"]
+    return created["id"]
+
+
+def _hdr(headers, name):
+    for h in headers:
+        if h.get("name", "").lower() == name.lower():
+            return h.get("value", "")
+    return ""
+
+
+def _addr(value):
+    m = re.search(r"<([^>]+)>", value or "")
+    return (m.group(1) if m else (value or "")).strip()
+
+
+def _extract_plain(payload):
+    """Best effort plain text from a Gmail payload, preferring text/plain, falling
+    back to stripped html."""
+    import base64
+
+    def decode(data):
+        if not data:
+            return ""
+        return base64.urlsafe_b64decode(data.encode()).decode("utf-8", "replace")
+
+    mt = payload.get("mimeType", "")
+    body = payload.get("body", {})
+    if mt == "text/plain" and body.get("data"):
+        return decode(body["data"])
+    if mt.startswith("multipart"):
+        for p in payload.get("parts", []):
+            if p.get("mimeType") == "text/plain" and p.get("body", {}).get("data"):
+                return decode(p["body"]["data"])
+        for p in payload.get("parts", []):
+            r = _extract_plain(p)
+            if r:
+                return r
+    if mt == "text/html" and body.get("data"):
+        return re.sub(r"<[^>]+>", " ", decode(body["data"]))
+    return ""
+
+
+def _is_automated_or_self(headers, from_addr):
+    """True for our own address, no reply senders, bounces, newsletters and any
+    machine mail, so we never auto answer things a real guest did not send."""
+    fa = (from_addr or "").lower()
+    if BAR_EMAIL.lower() and BAR_EMAIL.lower() in fa:
+        return True
+    for bad in ("no-reply", "noreply", "no_reply", "donotreply", "do-not-reply",
+                "mailer-daemon", "postmaster", "notification", "notifications", "bounce"):
+        if bad in fa:
+            return True
+    if _hdr(headers, "List-Unsubscribe") or _hdr(headers, "List-Id"):
+        return True
+    if _hdr(headers, "Precedence").lower() in ("bulk", "list", "junk"):
+        return True
+    auto = _hdr(headers, "Auto-Submitted").lower()
+    if auto and auto != "no":
+        return True
+    return False
+
+
+def send_email(svc, to, subject, body, headers, thread_id):
+    import base64
+    from email.mime.text import MIMEText
+    msg_id_hdr = _hdr(headers, "Message-ID")
+    refs = _hdr(headers, "References")
+    if subject and subject.lower().startswith("re:"):
+        subj = subject
+    elif subject:
+        subj = "Re: " + subject
+    else:
+        subj = "Deine Nachricht an BrunnenBar"
+    mime = MIMEText(body, "plain", "utf-8")
+    mime["To"] = to
+    mime["From"] = BAR_EMAIL
+    mime["Subject"] = subj
+    if msg_id_hdr:
+        mime["In-Reply-To"] = msg_id_hdr
+        mime["References"] = (refs + " " + msg_id_hdr).strip() if refs else msg_id_hdr
+    raw = base64.urlsafe_b64encode(mime.as_bytes()).decode()
+    send_body = {"raw": raw}
+    if thread_id:
+        send_body["threadId"] = thread_id
+    svc.users().messages().send(userId="me", body=send_body).execute()
+    logger.info("Email reply sent to %s", to)
+
+
+def handle_email(svc, msg_id):
+    full = svc.users().messages().get(userId="me", id=msg_id, format="full").execute()
+    payload = full.get("payload", {})
+    headers = payload.get("headers", [])
+    label_id = _gmail_label_id(svc)
+
+    def mark_handled():
+        try:
+            svc.users().messages().modify(userId="me", id=msg_id, body={"addLabelIds": [label_id]}).execute()
+        except Exception as e:
+            logger.error("email label failed %s: %s", msg_id, e)
+
+    if int(full.get("internalDate", "0")) < _EMAIL_START_MS:
+        mark_handled()  # pre existing mail, never answer the backlog
+        return
+    from_addr = _addr(_hdr(headers, "From"))
+    if _is_automated_or_self(headers, from_addr):
+        logger.info("email skip automated/self from %s", from_addr)
+        mark_handled()
+        return
+    subject = _hdr(headers, "Subject")
+    body = _extract_plain(payload).strip()
+    if not body:
+        mark_handled()
+        return
+    text = (subject + "\n\n" + body) if subject else body
+    text = text[:4000]
+    sender_key = "email:" + from_addr
+    logger.info("Email in from %s: %s", from_addr, (subject or body)[:120])
+    conv_append(sender_key, "user", text)
+    _last_msg[sender_key] = msg_id
+    action, value, lang = claude_decide(sender_key, text)
+    if action == "book":
+        logger.info("book_table called by model from email: %s", value)
+        reply = process_booking(sender_key, value, lang) or _handoff_line(bool(value.get("sie")), lang)
+    else:
+        reply = value
+    if not reply or reply.strip().upper() == "SKIP":
+        logger.info("email classified SKIP or empty from %s", from_addr)
+        mark_handled()
+        return
+    conv_append(sender_key, "assistant", reply)
+    if AUTO_ACK:
+        try:
+            send_email(svc, to=from_addr, subject=subject, body=reply, headers=headers, thread_id=full.get("threadId"))
+        except Exception as e:
+            detail = getattr(e, "response", None)
+            logger.error("email send failed to %s: %s %s", from_addr, e, detail.text if detail is not None else "")
+    else:
+        logger.info("AUTO_ACK off, email draft logged only, not sending")
+    mark_handled()
+
+
+def poll_gmail_once():
+    svc = _gmail_service()
+    q = f"in:inbox -label:{EMAIL_HANDLED_LABEL} newer_than:2d"
+    res = svc.users().messages().list(userId="me", q=q, maxResults=15).execute()
+    ids = [m["id"] for m in res.get("messages", [])]
+    for mid in ids:
+        try:
+            handle_email(svc, mid)
+        except Exception as e:
+            logger.error("handle_email failed for %s: %s", mid, e)
+    return len(ids)
+
+
+def poll_gmail_loop():
+    while True:
+        try:
+            if EMAIL_ENABLED and GMAIL_REFRESH_TOKEN:
+                poll_gmail_once()
+        except Exception as e:
+            logger.error("gmail poll loop error: %s", e)
+        time.sleep(EMAIL_POLL_SECONDS)
+
+
+@app.get("/poll_email")
+def poll_email_route():
+    """Force one Gmail poll and see how many new messages it looked at. Safe to open
+    in a browser once email is configured, for testing."""
+    if not (EMAIL_ENABLED and GMAIL_REFRESH_TOKEN):
+        return {"error": "email not configured, set GMAIL_REFRESH_TOKEN and EMAIL_ENABLED"}
+    try:
+        n = poll_gmail_once()
+        return {"ok": True, "looked_at": n}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 if __name__ == "__main__":
