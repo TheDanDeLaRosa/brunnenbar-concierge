@@ -144,23 +144,34 @@ def _calendar_service():
     return build("calendar", "v3", credentials=creds, cache_discovery=False)
 
 
-def _table_of_event(ev) -> str:
-    """Find which known table an existing reservation uses. Prefer the last
-    segment of the title, fall back to scanning title and description."""
-    summary = ev.get("summary", "") or ""
-    if " - " in summary:
-        last = summary.rsplit(" - ", 1)[-1].strip()
-        if last in TABLES:
-            return last
-    hay = (summary + " " + (ev.get("description", "") or "")).lower()
-    for name in sorted(TABLES, key=len, reverse=True):
-        if re.search(r"(?<![a-z0-9])" + re.escape(name.lower()) + r"(?![a-z0-9])", hay):
-            return name
-    return ""
+_PARTY_RE = re.compile(r"(\d+)\s*Person", re.I)
+
+
+def parse_event(ev):
+    """Read (area, party, start) from a reservation, from the title and the
+    structured description. Your entries record the area, drinnen or draussen,
+    rather than a specific table, so we read the party size and the area. area is
+    None for a Bar or walk in style entry we do not count against the tables."""
+    start = ev.get("start", {}).get("dateTime")
+    if not start:
+        return None
+    text = (ev.get("summary", "") or "") + " \n " + (ev.get("description", "") or "")
+    m = _PARTY_RE.search(text)
+    party = int(m.group(1)) if m else None
+    low = text.lower()
+    if "drau" in low:
+        area = "draussen"
+    elif "drinn" in low:
+        area = "drinnen"
+    else:
+        area = None
+    if not party or area is None:
+        return None
+    return (area, party, datetime.fromisoformat(start))
 
 
 def reservations_on(date_iso: str):
-    """Existing reservations for a date as a list of (table, start, end)."""
+    """Existing reservations for a date as a list of (area, party, start)."""
     svc = _calendar_service()
     day = datetime.fromisoformat(date_iso).replace(tzinfo=BAR_TZ)
     lo = day.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -172,36 +183,46 @@ def reservations_on(date_iso: str):
     ).execute().get("items", [])
     out = []
     for ev in items:
-        table = _table_of_event(ev)
-        start = ev.get("start", {}).get("dateTime")
-        if not table or not start:
-            continue
-        s = datetime.fromisoformat(start)
-        # The three hour turn is measured from the actual start time, so a 19:30
-        # booking holds the table until 22:30. The end stored on the calendar is
-        # only a display assumption, so we ignore it and always use start plus
-        # the turn length.
-        e = s + timedelta(hours=TURN_HOURS)
-        out.append((table, s, e))
+        r = parse_event(ev)
+        if r:
+            out.append(r)
     return out
 
 
+def _area_tables(area):
+    """Tables in an area, smallest first, as (name, seats)."""
+    return sorted(((n, s) for n, (s, a) in TABLES.items() if a == area), key=lambda x: x[1])
+
+
+def _seat_new_party(existing_parties, new_party, tables):
+    """Fit every existing party plus the new one into the tables, largest first,
+    each into the smallest table that still fits. Return the table the new party
+    lands on, or None if they cannot all be seated. This is what stops overbooking."""
+    entries = [("existing", p) for p in existing_parties] + [("new", new_party)]
+    entries.sort(key=lambda x: -x[1])
+    free = [[n, s] for n, s in tables]
+    new_table = None
+    for tag, p in entries:
+        pick = next((i for i, (n, s) in enumerate(free) if s >= p), None)
+        if pick is None:
+            return None
+        name = free.pop(pick)[0]
+        if tag == "new":
+            new_table = name
+    return new_table
+
+
 def find_free_table(date_iso: str, start_dt: datetime, party: int, area: str):
-    """Smallest free table in the area that seats the party for the 3 hour turn,
-    or None if the night is full for that party. Never returns a busy table."""
-    req_end = start_dt + timedelta(hours=TURN_HOURS)
-    busy = set()
-    for table, s, e in reservations_on(date_iso):
-        if table in TABLES and s < req_end and start_dt < e:
-            busy.add(table)
-    candidates = sorted(
-        (t for t, (seats, a) in TABLES.items() if a == area and seats >= party),
-        key=lambda t: TABLES[t][0],
-    )
-    for t in candidates:
-        if t not in busy:
-            return t
-    return None
+    """The table the new party would get in the requested area and 3 hour turn,
+    or None if the area cannot seat everyone, so it never overbooks. The turn is
+    measured from the actual start time, a 19:30 booking holds until 22:30."""
+    turn = timedelta(hours=TURN_HOURS)
+    req_end = start_dt + turn
+    overlapping = [
+        p for (a, p, s) in reservations_on(date_iso)
+        if a == area and s < req_end and start_dt < s + turn
+    ]
+    return _seat_new_party(overlapping, party, _area_tables(area))
 
 
 def create_reservation(name, contact, party, area, start_dt, occasion, table, note=""):
@@ -299,6 +320,8 @@ HARD FORMAT RULES, no exceptions. Never use hyphens, dashes, bullet points, numb
 
 LANGUAGE. Reply in the language the guest wrote in, German to German, English to English.
 
+CONTEXT AND OWNING MISTAKES. You can see the whole conversation, so read it before you reply and fit where the chat already is. Do not greet a returning guest as if this is the first message, do not ask something that was already answered, and pick up naturally from what was said. Very important, if YOU said something wrong earlier, for example the wrong day or wrong hours, and the guest corrects you, own it warmly and apologise, something like sorry, da hab ich mich vertan, and then give the right answer. Never act as if the guest made the mistake and never pretend it did not happen.
+
 TIME AND OPENING HOURS. For anything about whether the bar is open, or what day or time it is, rely ONLY on the AKTUELLER ZEITPUNKT line given to you and never guess the weekday. Opening hours are Donnerstag 18 bis 24 Uhr, Freitag und Samstag 18 bis 2 Uhr, sonst geschlossen. There is a Happy Hour bis 20 Uhr, mention it warmly but never quote prices. If today is a closed day, say so kindly and name the next open day.
 
 RESERVATIONS up to six people. You need five things, the date, the time, the number of people, a name, and whether they would like drinnen or draussen. If they are celebrating something always ask what the occasion is. If any of the five is missing, ask for it warmly in one short message, never as a list, and do not book yet. Once you have all five, do NOT write a confirmation yourself. Instead reply with a single line that starts with the word BOOK followed by one JSON object and nothing else at all, for example BOOK {"name":"Lisa","party":4,"area":"draussen","date":"2026-08-22","time":"20:00","occasion":"Geburtstag","sie":false}. Resolve the date to YYYY-MM-DD using the AKTUELLER ZEITPUNKT line, use 24 hour time as HH:MM, area is exactly drinnen or draussen, occasion is the Anlass or an empty string, and sie is true only if you are speaking to the guest in the formal Sie form. The system then checks the real table availability, books an actual table and sends the guest the confirmation for you, so whenever you output BOOK you write nothing else in that message. Only ever use BOOK for parties of up to six people, never for seven or more.
@@ -376,21 +399,21 @@ def reservations_debug(date: str = ""):
             timeMin=lo.isoformat(), timeMax=hi.isoformat(),
             singleEvents=True, orderBy="startTime",
         ).execute().get("items", [])
-        raw = [
-            {
+        raw = []
+        for e in items:
+            p = parse_event(e)
+            raw.append({
                 "summary": e.get("summary", ""),
                 "start": e.get("start", {}).get("dateTime") or e.get("start", {}).get("date"),
-                "parsed_table": _table_of_event(e),
-            }
-            for e in items
-        ]
+                "read_as": ({"area": p[0], "party": p[1]} if p else "not counted, bar or unspecified"),
+            })
         parsed = reservations_on(date)
         return {
             "date": date,
             "raw_event_count": len(items),
             "raw": raw,
-            "parsed_count": len(parsed),
-            "parsed": [{"table": t, "start": s.isoformat(), "end": e.isoformat()} for t, s, e in parsed],
+            "counted_count": len(parsed),
+            "counted": [{"area": a, "party": pp, "start": s.isoformat()} for a, pp, s in parsed],
         }
     except Exception as e:
         return {"error": str(e)}
