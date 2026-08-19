@@ -174,11 +174,14 @@ def reservations_on(date_iso: str):
     for ev in items:
         table = _table_of_event(ev)
         start = ev.get("start", {}).get("dateTime")
-        end = ev.get("end", {}).get("dateTime")
         if not table or not start:
             continue
         s = datetime.fromisoformat(start)
-        e = datetime.fromisoformat(end) if end else s + timedelta(hours=TURN_HOURS)
+        # The three hour turn is measured from the actual start time, so a 19:30
+        # booking holds the table until 22:30. The end stored on the calendar is
+        # only a display assumption, so we ignore it and always use start plus
+        # the turn length.
+        e = s + timedelta(hours=TURN_HOURS)
         out.append((table, s, e))
     return out
 
@@ -300,7 +303,7 @@ TIME AND OPENING HOURS. For anything about whether the bar is open, or what day 
 
 RESERVATIONS up to six people. You need five things, the date, the time, the number of people, a name, and whether they would like drinnen or draussen. If they are celebrating something always ask what the occasion is. If any of the five is missing, ask for it warmly in one short message, never as a list, and do not book yet. Once you have all five, do NOT write a confirmation yourself. Instead reply with a single line that starts with the word BOOK followed by one JSON object and nothing else at all, for example BOOK {"name":"Lisa","party":4,"area":"draussen","date":"2026-08-22","time":"20:00","occasion":"Geburtstag","sie":false}. Resolve the date to YYYY-MM-DD using the AKTUELLER ZEITPUNKT line, use 24 hour time as HH:MM, area is exactly drinnen or draussen, occasion is the Anlass or an empty string, and sie is true only if you are speaking to the guest in the formal Sie form. The system then checks the real table availability, books an actual table and sends the guest the confirmation for you, so whenever you output BOOK you write nothing else in that message. Only ever use BOOK for parties of up to six people, never for seven or more.
 
-SAME DAY BY PHONE. If a guest wants a table for today AND the bar is already open today AND it is after 18 Uhr right now, do not take it in chat. Warmly tell them to please call the bar directly under 0821 47019035 rather than WhatsApp, because a table for tonight is arranged fastest by phone.
+SAME DAY BY PHONE. This rule comes before the booking rule. If a guest wants a table for today AND the bar is open today AND it is after 18 Uhr right now, never output BOOK. Instead warmly tell them to please call the bar directly under 0821 47019035 rather than WhatsApp, because a table for tonight is arranged fastest by phone.
 
 GROUPS AND EVENTS, seven people or more, or any birthday, party or private booking. Treat it as an event and do not confirm anything. Warmly work through the occasion, whether they have been to BrunnenBar before, the date and time, how many people, drinnen or draussen, and roughly what they have in mind. Then tell them Dan gets back to them personally with an Angebot by email. Never mention Mindestumsatz or prices. If a guest asks about price straight away, do not give a number, instead ask warmly how many people they are and whether they have been to the bar before.
 
@@ -341,20 +344,53 @@ def debug():
     }
 
 
+@app.get("/calendars")
+def calendars_debug():
+    """List the calendars this connection can see, so we can confirm the
+    RESERVIERUNGEN_CALENDAR_ID points at the real reservations calendar."""
+    try:
+        svc = _calendar_service()
+        items = svc.calendarList().list().execute().get("items", [])
+        return {
+            "configured_id": RESERVIERUNGEN_CALENDAR_ID,
+            "calendars": [{"id": c.get("id"), "summary": c.get("summary")} for c in items],
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.get("/reservations")
 def reservations_debug(date: str = ""):
     """Read the Reservierungen calendar for a date, YYYY-MM-DD, default today.
-    Open in a browser to confirm the calendar connection and table parsing."""
+    Shows both the raw events and how the parser reads their tables, so we can
+    confirm the calendar connection and the table parsing before trusting it."""
     if not date:
         date = datetime.now(BAR_TZ).strftime("%Y-%m-%d")
     try:
-        res = reservations_on(date)
+        svc = _calendar_service()
+        day = datetime.fromisoformat(date).replace(tzinfo=BAR_TZ)
+        lo = day.replace(hour=0, minute=0, second=0, microsecond=0)
+        hi = lo + timedelta(days=1)
+        items = svc.events().list(
+            calendarId=RESERVIERUNGEN_CALENDAR_ID,
+            timeMin=lo.isoformat(), timeMax=hi.isoformat(),
+            singleEvents=True, orderBy="startTime",
+        ).execute().get("items", [])
+        raw = [
+            {
+                "summary": e.get("summary", ""),
+                "start": e.get("start", {}).get("dateTime") or e.get("start", {}).get("date"),
+                "parsed_table": _table_of_event(e),
+            }
+            for e in items
+        ]
+        parsed = reservations_on(date)
         return {
             "date": date,
-            "count": len(res),
-            "reservations": [
-                {"table": t, "start": s.isoformat(), "end": e.isoformat()} for t, s, e in res
-            ],
+            "raw_event_count": len(items),
+            "raw": raw,
+            "parsed_count": len(parsed),
+            "parsed": [{"table": t, "start": s.isoformat(), "end": e.isoformat()} for t, s, e in parsed],
         }
     except Exception as e:
         return {"error": str(e)}
