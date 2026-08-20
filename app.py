@@ -556,7 +556,8 @@ SYSTEM_PROMPT = """You are the concierge for BrunnenBar, a neighbourhood cocktai
 TRIAGE FIRST. Decide what kind of message this is.
 If it is a genuine guest, a reservation, a birthday or group, an event, opening hours, or a normal guest question, answer it following the rules below.
 If a real guest is just being friendly or playful, small talk, a compliment, an emoji, or they ask for something light like a joke, answer briefly and warmly in character. Never go dead silent on a real person, that is a robot tell. If they ask for a joke, just tell a short clean easy one, have fun with it, you are a fun neighbourhood bar.
-If it is spam, a cold sales pitch, a marketing, collaboration, press, sponsoring or supplier message, a delivery or app notification, or clearly not from a real guest, reply with exactly the single word SKIP and nothing else. This is just noise, Dan does not need to be paged for it.
+If it is spam, a cold sales pitch, a marketing, collaboration, press, sponsoring or supplier message, or an automated delivery or app notification, reply with exactly the single word SKIP and nothing else. This is just noise, Dan does not need to be paged for it.
+If a message is clearly not about the bar at all but is still written by a real person with a real need, for example a staff member asking about their pay, hours, or a schedule, or anything that reads like an internal or business matter rather than a guest one, this is NOT spam and must never be SKIP, a real person is waiting on an answer. Treat it exactly like a policy question, reply with exactly HANDOFF: followed by a short reason, for example HANDOFF: staff member asking about May pay, so Dan actually sees it and can follow up, most likely outside this channel.
 If it is a real guest asking about prices or Mindestumsatz beyond the guidance here, or a real policy question you are genuinely unsure about, do not guess and do not go silent. Instead reply with exactly HANDOFF: followed by a short few word reason for Dan in English, for example HANDOFF: asking exact Mindestumsatz for a 40 person event. Nothing else in that reply, no other text. But do NOT use HANDOFF just because a guest is being casual or off topic, only for a real question you cannot safely answer yourself.
 If a guest wants to cancel, move, or change an existing reservation or event, this is also a HANDOFF, exactly like a policy question, reply with HANDOFF: cancel or reschedule request and nothing else. You have no way to actually change or remove anything from the calendar yourself, there is no tool for it, so never tell a guest a change is done or a date is freed up, only Dan can actually do that.
 If a guest directly asks to speak to a real person, to Dan, or says something like this is not helping, that is also a HANDOFF, reply with HANDOFF: guest wants to speak to a person.
@@ -841,6 +842,7 @@ def debug():
         "bookable_tables": len(TABLES),
         "DAN_ALERT_WHATSAPP": bool(DAN_ALERT_WHATSAPP),
         "DAN_ALERT_EMAIL": bool(DAN_ALERT_EMAIL),
+        "SKIP_NOTIFY_DAN": SKIP_NOTIFY_DAN,
         "API_FAILURE_ALERT_COOLDOWN": API_FAILURE_ALERT_COOLDOWN,
         "HANDLED_MAX": HANDLED_MAX,
         "handled_set_size": len(_handled),
@@ -1151,7 +1153,8 @@ def handle(channel: str, sender: str, text: str):
         logger.info("No reply, empty draft")
         return
     if reply.upper() == "SKIP":
-        logger.info("Classified as spam/non guest, no reply, no alert")
+        logger.info("Classified as spam/non guest, no reply to sender, FYI to Dan")
+        notify_dan_skip(channel, sender, text)
         return
     if reply.upper().startswith("HANDOFF:"):
         reason = reply.split(":", 1)[1].strip() if ":" in reply else "no reason given"
@@ -1169,6 +1172,11 @@ def handle(channel: str, sender: str, text: str):
         reply = lines[1].strip() if len(lines) > 1 and lines[1].strip() else _handoff_line(False, lang)
         logger.info("Complaint escalation (%s, %s)", channel, sender)
         alert_dan("unhappy or hostile guest, complaint", channel, sender, text)
+    if _looks_like_leaked_internal_text(reply):
+        logger.error("Blocked a reply that looks like leaked internal reasoning (%s, %s): %s", channel, sender, reply[:300])
+        alert_dan("bot's draft looked like leaked internal reasoning, blocked before sending, needs your own reply",
+                  channel, sender, text, reply[:200])
+        return
     logger.info("Draft reply (%s): %s", channel, reply[:200])
     conv_append(sender, "assistant", reply)
     if not AUTO_ACK:
@@ -1306,14 +1314,28 @@ def _email_alert_fallback(subject: str, body: str) -> bool:
         return False
 
 
+def _deliver_to_dan(text: str, subject: str) -> bool:
+    """Shared delivery for anything meant to reach Dan, tries WhatsApp first
+    and falls back to email if that specific send fails, so a Dualhook outage
+    cannot take out both the guest reply AND the one message that was supposed
+    to tell Dan something needs him. Returns whether it reached him on either
+    channel, callers log their own success/failure with their own category."""
+    if not DAN_ALERT_WHATSAPP and not (GMAIL_REFRESH_TOKEN and DAN_ALERT_EMAIL):
+        return False
+    sent = send_whatsapp(DAN_ALERT_WHATSAPP, text) if DAN_ALERT_WHATSAPP else False
+    if sent:
+        return True
+    return _email_alert_fallback(subject, text)
+
+
 def alert_dan(category: str, channel: str, sender: str, guest_text: str, reason: str = ""):
     """Ping Dan the moment the concierge cannot safely answer a real guest
-    itself, so a handoff is never silent. Only fires for a genuine guest
-    handoff (price/policy), an unhappy guest, a booking that failed somewhere,
-    or another real reason a human is needed, never for plain spam SKIP. Tries
-    WhatsApp first, and if that specific send fails falls back to email so a
-    Dualhook outage cannot take out both the guest reply AND the one alert that
-    was supposed to tell Dan something is wrong."""
+    itself, so a handoff is never silent. Fires for a genuine guest handoff
+    (price/policy), an unhappy guest, a booking that failed somewhere, or
+    another real reason a human is needed now. For the lower urgency FYI sent
+    on every plain spam SKIP, see notify_dan_skip below, kept as a separate,
+    differently worded function on purpose so an "I need you now" alert never
+    reads the same as a "just so you know" one."""
     if not DAN_ALERT_WHATSAPP and not (GMAIL_REFRESH_TOKEN and DAN_ALERT_EMAIL):
         logger.warning("No Dan alert channel configured (DAN_ALERT_WHATSAPP or DAN_ALERT_EMAIL), cannot alert Dan")
         return
@@ -1325,18 +1347,66 @@ def alert_dan(category: str, channel: str, sender: str, guest_text: str, reason:
         lines.append(f"Why: {reason}")
     lines.append(f'Message: "{snippet}"')
     text = "\n".join(lines)
-    sent = send_whatsapp(DAN_ALERT_WHATSAPP, text) if DAN_ALERT_WHATSAPP else False
-    if sent:
-        logger.info("Dan alerted via WhatsApp (%s) for %s on %s", category, sender, channel)
-        return
-    if _email_alert_fallback("BrunnenBar concierge needs you: " + category, text):
-        logger.info("Dan alerted via email fallback (%s) for %s on %s", category, sender, channel)
+    if _deliver_to_dan(text, "BrunnenBar concierge needs you: " + category):
+        logger.info("Dan alerted (%s) for %s on %s", category, sender, channel)
     else:
         logger.error(
             "Dan alert FAILED on every configured channel (%s) for %s on %s, "
             "check DAN_ALERT_WHATSAPP and DAN_ALERT_EMAIL/GMAIL_REFRESH_TOKEN in Railway",
             category, sender, channel,
         )
+
+
+# Dan asked, after the leaked-reasoning incident above, whether the bot should
+# also tell him whenever it skips a message as spam, so he can catch a real
+# guest getting misclassified. Deliberately a SEPARATE, lower key notification
+# from alert_dan, same delivery (WhatsApp then email fallback) but worded as
+# an FYI rather than "needs you", since a real spam/marketing message needs no
+# action from him at all, this is purely for his own spot checking. If spam
+# volume turns out to be high enough that this becomes noisy, the fix is to
+# switch this one function to a daily digest instead of a message per SKIP,
+# nothing else in the file would need to change.
+SKIP_NOTIFY_DAN = os.environ.get("SKIP_NOTIFY_DAN", "true").lower() == "true"
+
+
+def notify_dan_skip(channel: str, sender: str, guest_text: str):
+    if not SKIP_NOTIFY_DAN:
+        return
+    snippet = (guest_text or "").strip().replace("\n", " ")
+    if len(snippet) > 200:
+        snippet = snippet[:200] + "..."
+    lines = [
+        "Concierge FYI, skipped this as spam/marketing, no action needed",
+        f"Channel: {channel}", f"From: {sender}", f'Message: "{snippet}"',
+    ]
+    text = "\n".join(lines)
+    if _deliver_to_dan(text, "BrunnenBar concierge, skipped message FYI"):
+        logger.info("Dan notified (skip FYI) for %s on %s", sender, channel)
+    else:
+        logger.warning("Could not reach Dan with skip FYI for %s on %s (not urgent, not retried)", sender, channel)
+
+
+# Real incident, 20 Aug 2026. A message that did not fit any guest category
+# (a staff member asking about pay/healthcare) made the model narrate its own
+# reasoning in prose instead of outputting the bare SKIP marker, for example
+# "this appears to be a message from someone who thinks they are contacting
+# their employer... SKIP". Because the reply was not an EXACT match to "SKIP",
+# none of the marker checks below caught it, and the raw internal reasoning,
+# including the literal word SKIP, was sent straight to that person as if it
+# were Dan's own reply. This can happen with any of the four markers, not just
+# SKIP, any time the model narrates instead of complying. These tokens are
+# written in this exact uppercase form, and only ever appear that way when the
+# model is behaving correctly, as the entire message (SKIP) or as the literal
+# first line (HANDOFF:, ESCALATE_EMERGENCY, ESCALATE_COMPLAINT), both already
+# handled by the checks above before this function ever runs. A real guest
+# facing reply in the house voice is lowercase and casual and would not
+# contain these exact tokens, so finding one anywhere in what is left over is
+# a reliable sign of a leak, not a false positive from ordinary conversation.
+_LEAK_MARKERS = ("SKIP", "HANDOFF:", "ESCALATE_EMERGENCY", "ESCALATE_COMPLAINT")
+
+
+def _looks_like_leaked_internal_text(reply: str) -> bool:
+    return any(m in reply for m in _LEAK_MARKERS)
 
 
 def _maybe_alert_api_failure(channel: str, sender: str, text: str):
@@ -1564,7 +1634,8 @@ def handle_email(svc, msg_id):
         mark_handled()
         return
     if reply.upper() == "SKIP":
-        logger.info("email classified spam/non guest, no reply, no alert, from %s", from_addr)
+        logger.info("email classified spam/non guest, no reply to sender, FYI to Dan, from %s", from_addr)
+        notify_dan_skip("email", from_addr, text)
         mark_handled()
         return
     if reply.upper().startswith("HANDOFF:"):
@@ -1584,6 +1655,12 @@ def handle_email(svc, msg_id):
         reply = lines[1].strip() if len(lines) > 1 and lines[1].strip() else _handoff_line(False, lang)
         logger.info("email complaint escalation from %s", from_addr)
         alert_dan("unhappy or hostile guest, complaint (email)", "email", from_addr, text)
+    if _looks_like_leaked_internal_text(reply):
+        logger.error("Blocked an email reply that looks like leaked internal reasoning from %s: %s", from_addr, reply[:300])
+        alert_dan("bot's draft looked like leaked internal reasoning, blocked before sending, needs your own reply (email)",
+                  "email", from_addr, text, reply[:200])
+        mark_handled()
+        return
     conv_append(sender_key, "assistant", reply)
     if AUTO_ACK:
         try:
