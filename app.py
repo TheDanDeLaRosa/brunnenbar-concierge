@@ -87,6 +87,29 @@ DUALHOOK_BASE_URL = os.environ.get("DUALHOOK_BASE_URL", "https://api.dualhook.co
 REPLY_DELAY_MIN = int(os.environ.get("REPLY_DELAY_MIN", "35"))
 REPLY_DELAY_MAX = int(os.environ.get("REPLY_DELAY_MAX", "110"))
 
+# Dan's own phone, digits only, no plus, WhatsApp format. Wherever the concierge
+# cannot safely answer a real guest itself (a price/policy handoff or an unhappy
+# guest), it pings this number immediately with why, so a handoff is never silent.
+# Never fires on plain spam SKIP, that would just be noise.
+DAN_ALERT_WHATSAPP = os.environ.get("DAN_ALERT_WHATSAPP", "4915125499245")
+
+# Durable conversation memory. Without this, the bot's per guest chat history
+# lives only in this process (see _conv below) and is wiped on every redeploy,
+# crash, or Railway restart, so a guest who wrote before the last deploy looks
+# like a stranger. Upstash Redis over its plain HTTPS REST API (no client
+# library, no persistent TCP connection needed) makes it survive. Create a free
+# database at upstash.com, copy the REST URL and token from the console into
+# Railway, nothing else to configure. If these are not set yet, the service
+# falls back to the in memory dict exactly as before, so it keeps working, just
+# without persistence, until they are set.
+UPSTASH_REDIS_REST_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "")
+UPSTASH_REDIS_REST_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
+# How many messages of a thread the bot keeps and reads back before replying,
+# per guest. 60 is roughly 30 back and forth exchanges, enough to cover a real
+# event negotiation spread over several days, without sending an unbounded
+# amount of history to Claude on every single reply.
+CONV_MAX_TURNS = int(os.environ.get("CONV_MAX_TURNS", "60"))
+
 # Reservations. Google Calendar credentials already live in Railway.
 RESERVIERUNGEN_CALENDAR_ID = os.environ.get("RESERVIERUNGEN_CALENDAR_ID", "")
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
@@ -129,18 +152,64 @@ TABLES = {
 GRAPH = "https://graph.facebook.com/" + GRAPH_VERSION
 _handled = set()
 _last_msg = {}          # sender -> most recent message id, for debounce
-_conv = {}              # sender -> list of {role, content}, short memory
+_conv = {}              # sender -> list of {role, content}, in memory fallback only
 _conv_lock = threading.Lock()
+_UPSTASH_ON = bool(UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN)
+
+
+def _upstash(*command):
+    """Run one Redis command against Upstash's REST API and return the
+    'result' field, or None on any failure so callers can fail safe. See
+    https://upstash.com/docs/redis/features/restapi, POST a JSON array of
+    [COMMAND, arg1, ...] to the base URL with a Bearer token."""
+    try:
+        r = httpx.post(
+            UPSTASH_REDIS_REST_URL,
+            headers={"Authorization": "Bearer " + UPSTASH_REDIS_REST_TOKEN},
+            json=list(command),
+            timeout=10,
+        )
+        r.raise_for_status()
+        body = r.json()
+        if "error" in body:
+            logger.error("Upstash %s error: %s", command[0] if command else "?", body["error"])
+            return None
+        return body.get("result")
+    except Exception as e:
+        logger.error("Upstash %s failed: %s", command[0] if command else "?", e)
+        return None
 
 
 def conv_append(sender: str, role: str, content: str):
+    """Record one turn of a guest thread, durably if Upstash is configured,
+    otherwise in this process's memory only (wiped on next restart)."""
+    if _UPSTASH_ON:
+        key = "conv:" + sender
+        entry = json.dumps({"role": role, "content": content})
+        _upstash("RPUSH", key, entry)
+        _upstash("LTRIM", key, -CONV_MAX_TURNS, -1)
+        return
     with _conv_lock:
         h = _conv.setdefault(sender, [])
         h.append({"role": role, "content": content})
-        del h[:-12]
+        del h[:-CONV_MAX_TURNS]
 
 
 def conv_history(sender: str):
+    """The full remembered thread for one guest, oldest first, read back
+    before every reply so the bot never starts a returning guest from zero."""
+    if _UPSTASH_ON:
+        raw = _upstash("LRANGE", "conv:" + sender, 0, -1)
+        if raw is None:
+            logger.warning("Upstash read failed for %s, answering with no history rather than guessing", sender)
+            return []
+        out = []
+        for item in raw:
+            try:
+                out.append(json.loads(item))
+            except Exception:
+                logger.warning("Skipping unparseable conv entry for %s", sender)
+        return out
     with _conv_lock:
         return list(_conv.get(sender, []))
 
@@ -434,9 +503,9 @@ SYSTEM_PROMPT = """You are the concierge for BrunnenBar, a neighbourhood cocktai
 TRIAGE FIRST. Decide what kind of message this is.
 If it is a genuine guest, a reservation, a birthday or group, an event, opening hours, or a normal guest question, answer it following the rules below.
 If a real guest is just being friendly or playful, small talk, a compliment, an emoji, or they ask for something light like a joke, answer briefly and warmly in character. Never go dead silent on a real person, that is a robot tell. If they ask for a joke, just tell a short clean easy one, have fun with it, you are a fun neighbourhood bar.
-If it is spam, a cold sales pitch, a marketing, collaboration, press, sponsoring or supplier message, a delivery or app notification, or clearly not from a real guest, reply with exactly the single word SKIP and nothing else.
-If it is about prices or Mindestumsatz beyond the guidance here, or a real policy question you are genuinely unsure about, also reply with the single word SKIP, because Dan will handle it himself. But do NOT use SKIP just because a guest is being casual or off topic, only for non guests and for price or policy you cannot safely answer.
-If a guest is unhappy or complaining, do not try to solve it. Send one short warm line that you are sorry and that you are passing it straight to Dan who will get back to them personally, then stop.
+If it is spam, a cold sales pitch, a marketing, collaboration, press, sponsoring or supplier message, a delivery or app notification, or clearly not from a real guest, reply with exactly the single word SKIP and nothing else. This is just noise, Dan does not need to be paged for it.
+If it is a real guest asking about prices or Mindestumsatz beyond the guidance here, or a real policy question you are genuinely unsure about, do not guess and do not go silent. Instead reply with exactly HANDOFF: followed by a short few word reason for Dan in English, for example HANDOFF: asking exact Mindestumsatz for a 40 person event. Nothing else in that reply, no other text. But do NOT use HANDOFF just because a guest is being casual or off topic, only for a real question you cannot safely answer yourself.
+If a guest is unhappy or complaining, do not try to solve it. Your reply must be exactly two lines. The first line must be exactly ESCALATE_COMPLAINT with nothing else on it. The second line is one short warm sentence to the guest, that you are sorry and that you are passing it straight to Dan who will get back to them personally. Nothing else in the reply.
 
 VOICE. You are texting like Dan, a busy bar owner tapping out a quick reply on his phone, NOT writing customer service. Casual, real, a bit terse. Mostly short, often a single line. Do not gush and do not sound delighted, cut openers like das freut mich sehr zu hören, wir freuen uns riesig, sehr gerne. Just answer the thing, and if you need something back ask ONE short question, then stop. Do not tie a neat bow on every message, do not restate what the guest just said, do not add reassurance nobody asked for. Informal du and euch, mirror Sie only if the guest is clearly formal. Lowercase and a relaxed run on sentence are fine, that is how people text. A quick smiley now and then is fine, not every message. Sign LG Dan only once in a while the way you would sign off a thread, not on every text. Sounding a little imperfect is good, it is human.
 
@@ -466,7 +535,31 @@ RESERVATIONS up to six people. You need six things, the date, the time, the numb
 
 SAME DAY BY PHONE. This rule comes before the booking rule. If a guest wants a table for today AND the bar is open today AND it is after 18 Uhr right now, never call book_table. Instead warmly tell them to please call the bar directly under 0821 47019035 rather than WhatsApp, because a table for tonight is arranged fastest by phone.
 
-GROUPS AND EVENTS, seven people or more, or any birthday, party or private booking. Treat it as an event and do not confirm anything. Warmly work through the occasion, whether they have been to BrunnenBar before, the date and time, how many people, drinnen or draussen, and roughly what they have in mind. Then tell them Dan gets back to them personally with an Angebot, right here in the chat. We handle events on the channel the guest wrote on, so NEVER tell a guest to send an email and never say the Angebot comes by email or per Mail, the follow up happens here on WhatsApp or wherever they messaged. Never mention Mindestumsatz or prices. If a guest asks about price straight away, do not give a number, instead ask warmly how many people they are and whether they have been to the bar before.
+GROUPS AND EVENTS, seven people or more, or any birthday, party or private booking. Treat it as an event and do not confirm anything yourself, Dan closes these personally. Walk through this warmly over several messages, one thing at a time, never as a stacked list, and read the conversation so far so you never ask something already answered.
+
+Step one, the basics. Get the occasion, the date, roughly what time, and how many people.
+
+Step two, ask if they have been to BrunnenBar before, warmly, this shapes how much you explain next.
+
+Step three, once you know roughly how many people, explain the bar so they understand what they are choosing between, in your own words, using the real examples below for phrasing and feel, never copied word for word twice in a row. We have a hinterer Bereich, a separate and more private lounge section at the back, good for a partial private feel without closing the whole place. Or the whole bar can be closed exclusively just for them.
+
+Step four, explain how paying for the space works, in your own words, using the real examples below for phrasing. We do not charge a flat Miete for the room. Instead there is a Mindestumsatz, a minimum spend across the group that covers what the space would normally bring in on a night like that, and it runs through their drinks like any normal tab, it is not a separate fee on top. Once you reach this point in the conversation, and only once you reach this point, you may give the actual number for whichever area fits what they are asking for, hinterer Bereich is 700 Euro Mindestumsatz, the whole bar closed exclusively is 1700 Euro Mindestumsatz. Never give either number earlier in the conversation, and never give both numbers at once, only the one that matches their group size and what they want.
+
+Step five, for anything that sounds like a closed, private event rather than just a slightly bigger table, also find out three more things over the rest of the conversation, again one at a time. The music, ask if they will bring their own Spotify playlist or want a DJ. The food, ask what they have in mind, we have no kitchen ourselves but guests are welcome to bring their own food or cake, and caterers like Thassos are an option. And how they want to handle guests paying, ask if they are covering their guests themselves, want a drinks budget, or if guests just pay for their own.
+
+Throughout, warmly invite them to come by and see the space in person if they would like, that is always a good next step and something Dan says often.
+
+Once you have gathered what you need, tell them Dan gets back to them personally with an Angebot, right here in the chat. We handle events on the channel the guest wrote on, so NEVER tell a guest to send an email and never say the Angebot comes by email or per Mail, the follow up happens here on WhatsApp or wherever they messaged.
+
+HOW DAN REALLY EXPLAINS EVENTS AND PRICING, real lines from his own chats, copy this feel, never quote the older 1600 or a Trinkgeld percentage from anywhere, 700 and 1700 covering everything are the only correct current numbers.
+The two areas, die bar ist im prinzip in zwei bereiche aufgeteilt mit der hauptbar in der mitte, vorne ist der hauptbereich mit den tischen im eingangsbereich und hinten haben wir nochmal einen etwas separateren lounge bereich.
+No Miete, framing the hinterer Bereich, miete nehmen wir dafür keine, wir arbeiten aber mit dem mindestumsatz den wir am wochenende normalerweise auch machen, das sind 700 euro und der läuft ganz normal über eure getränke.
+No Miete, framing the whole bar, eine locationmiete nehmen wir nicht, wir arbeiten mit einem mindestumsatz und für die komplette bar liegt der bei 1700 euro, der läuft ganz normal über eure getränke.
+Helping them choose, für eine gruppe in eurer größe ist der hintere bereich wirklich perfekt, die komplette bar wäre natürlich auch möglich, das liegt dann aber deutlich höher und lohnt sich eigentlich nur wenn euch wichtig ist den abend komplett unter euch zu verbringen.
+Food, eigenes essen könnt ihr gerne mitbringen, eine eigene küche haben wir nämlich nicht, und wenn ihr was größeres wollt arbeiten wir auch mit caterern zusammen.
+Music, mit eigener musik oder dj.
+Guest payment options, abrechnen können wir ganz flexibel, entweder alles auf eine rechnung, ein getränkebudget oder jeder zahlt selbst.
+Come by invite, sehr gerne kommst du vorher mal vorbei, dann zeige ich dir alles in ruhe und wir gehen die details zusammen durch.
 
 HOW DAN REALLY WRITES, real lines from his own chats, copy this feel, these are only voice anchors so never quote the prices from here.
 Reservation confirm, hallo Stephi sehr gerne, ich reservier dir einen tisch für 3 am donnerstag den 27.8 um 19 uhr draußen, wir freuen uns auf euch.
@@ -480,7 +573,7 @@ FACTS YOU MAY SHARE. BrunnenBar is on Am Brunnenlech in Augsburg. There is no ki
 
 Never congratulate in advance for a birthday, wedding or anything that has not happened yet, that is bad luck, show excitement about hosting instead. Never put a bank account, IBAN or card number into a message.
 
-When you are not calling the book_table tool, output only the message text to send, or the single word SKIP. Never mention the tool or JSON to the guest."""
+When you are not calling the book_table tool, output only the message text to send, or the single word SKIP, or a HANDOFF: reason line, or the two line ESCALATE_COMPLAINT format above. Never mention the tool or JSON to the guest."""
 
 
 BOOK_TOOL = {
@@ -690,6 +783,24 @@ def debug():
         "RESERVIERUNGEN_CALENDAR_ID": bool(RESERVIERUNGEN_CALENDAR_ID),
         "TURN_HOURS": TURN_HOURS,
         "bookable_tables": len(TABLES),
+        "DAN_ALERT_WHATSAPP": bool(DAN_ALERT_WHATSAPP),
+        "UPSTASH_REDIS_REST_URL": bool(UPSTASH_REDIS_REST_URL),
+        "UPSTASH_REDIS_REST_TOKEN": bool(UPSTASH_REDIS_REST_TOKEN),
+        "conv_memory_backend": "upstash" if _UPSTASH_ON else "in_memory_ephemeral",
+        "CONV_MAX_TURNS": CONV_MAX_TURNS,
+    }
+
+
+@app.get("/conversations/{sender}")
+def conversation_debug(sender: str):
+    """Peek at one guest's remembered thread, to confirm memory actually
+    survived a redeploy. sender is the raw WhatsApp number (digits, no plus),
+    Instagram scoped id, or email: prefixed address, whatever conv_append was
+    called with for that channel."""
+    return {
+        "sender": sender,
+        "backend": "upstash" if _UPSTASH_ON else "in_memory_ephemeral",
+        "turns": conv_history(sender),
     }
 
 
@@ -870,6 +981,25 @@ async def whatsapp_receive(request: Request):
                 conv_append(sender, "user", text)
                 _last_msg[sender] = mid
                 threading.Thread(target=handle_later, args=("whatsapp", sender, text, mid), daemon=True).start()
+            # Coexistence echo, a reply Dan or a teammate typed by hand straight in the
+            # WhatsApp Business phone app. Meta mirrors these to us as smb_message_echoes
+            # so the bot's memory of a thread is not just its own replies, if someone
+            # answers a guest manually the bot needs to see that too before it ever
+            # replies again in that thread.
+            for echo in value.get("smb_message_echoes", []):
+                em = echo.get("message", {}) or {}
+                mid = em.get("id")
+                if not mid or mid in _handled:
+                    continue
+                _handled.add(mid)
+                if em.get("type") != "text":
+                    continue
+                recipient = em.get("to") or echo.get("recipient_id") or echo.get("to")
+                text = (em.get("text") or {}).get("body", "")
+                if not recipient or not text:
+                    continue
+                logger.info("WhatsApp echo (manual reply) to %s: %s", recipient, text[:120])
+                conv_append(recipient, "assistant", text)
     return {"received": True}
 
 
@@ -957,9 +1087,23 @@ def handle(channel: str, sender: str, text: str):
         reply = process_booking(sender, value, lang) or _handoff_line(bool(value.get("sie")), lang)
     else:
         reply = value
-    if not reply or reply.strip().upper() == "SKIP":
-        logger.info("No reply, classified as not a guest inquiry or empty draft")
+    reply = (reply or "").strip()
+    if not reply:
+        logger.info("No reply, empty draft")
         return
+    if reply.upper() == "SKIP":
+        logger.info("Classified as spam/non guest, no reply, no alert")
+        return
+    if reply.upper().startswith("HANDOFF:"):
+        reason = reply.split(":", 1)[1].strip() if ":" in reply else "no reason given"
+        logger.info("Handoff to Dan (%s, %s): %s", channel, sender, reason)
+        alert_dan("price/policy question", channel, sender, text, reason)
+        return
+    if reply.startswith("ESCALATE_COMPLAINT"):
+        lines = reply.split("\n", 1)
+        reply = lines[1].strip() if len(lines) > 1 and lines[1].strip() else _handoff_line(False, lang)
+        logger.info("Complaint escalation (%s, %s)", channel, sender)
+        alert_dan("unhappy guest, complaint", channel, sender, text)
     logger.info("Draft reply (%s): %s", channel, reply[:200])
     conv_append(sender, "assistant", reply)
     if not AUTO_ACK:
@@ -1065,6 +1209,24 @@ def send_whatsapp(to: str, text: str):
     except Exception as e:
         detail = getattr(e, "response", None)
         logger.error("WhatsApp send failed via %s: %s %s", via, e, detail.text if detail is not None else "")
+
+
+def alert_dan(category: str, channel: str, sender: str, guest_text: str, reason: str = ""):
+    """Ping Dan on WhatsApp the moment the concierge cannot safely answer a real
+    guest itself, so a handoff is never silent. Only fires for a genuine guest
+    handoff (price/policy) or an unhappy guest, never for plain spam SKIP."""
+    if not DAN_ALERT_WHATSAPP:
+        logger.warning("DAN_ALERT_WHATSAPP not set, cannot alert Dan")
+        return
+    snippet = (guest_text or "").strip().replace("\n", " ")
+    if len(snippet) > 300:
+        snippet = snippet[:300] + "..."
+    lines = [f"Concierge needs you: {category}", f"Channel: {channel}", f"From: {sender}"]
+    if reason:
+        lines.append(f"Why: {reason}")
+    lines.append(f'Message: "{snippet}"')
+    send_whatsapp(DAN_ALERT_WHATSAPP, "\n".join(lines))
+    logger.info("Dan alerted (%s) for %s on %s", category, sender, channel)
 
 
 def send_instagram(recipient_id: str, text: str):
@@ -1264,10 +1426,26 @@ def handle_email(svc, msg_id):
         reply = process_booking(sender_key, value, lang) or _handoff_line(bool(value.get("sie")), lang)
     else:
         reply = value
-    if not reply or reply.strip().upper() == "SKIP":
-        logger.info("email classified SKIP or empty from %s", from_addr)
+    reply = (reply or "").strip()
+    if not reply:
+        logger.info("email empty draft from %s", from_addr)
         mark_handled()
         return
+    if reply.upper() == "SKIP":
+        logger.info("email classified spam/non guest, no reply, no alert, from %s", from_addr)
+        mark_handled()
+        return
+    if reply.upper().startswith("HANDOFF:"):
+        reason = reply.split(":", 1)[1].strip() if ":" in reply else "no reason given"
+        logger.info("email handoff to Dan from %s: %s", from_addr, reason)
+        alert_dan("price/policy question (email)", "email", from_addr, text, reason)
+        mark_handled()
+        return
+    if reply.startswith("ESCALATE_COMPLAINT"):
+        lines = reply.split("\n", 1)
+        reply = lines[1].strip() if len(lines) > 1 and lines[1].strip() else _handoff_line(False, lang)
+        logger.info("email complaint escalation from %s", from_addr)
+        alert_dan("unhappy guest, complaint (email)", "email", from_addr, text)
     conv_append(sender_key, "assistant", reply)
     if AUTO_ACK:
         try:
