@@ -92,6 +92,24 @@ REPLY_DELAY_MAX = int(os.environ.get("REPLY_DELAY_MAX", "110"))
 # guest), it pings this number immediately with why, so a handoff is never silent.
 # Never fires on plain spam SKIP, that would just be noise.
 DAN_ALERT_WHATSAPP = os.environ.get("DAN_ALERT_WHATSAPP", "4915125499245")
+# Backup alert path. If the WhatsApp alert above fails to send, for example the
+# Dualhook connection itself is down, that is exactly the moment Dan most needs
+# to hear about it, and WhatsApp cannot tell him. Email runs on wholly separate
+# infrastructure (Gmail API, not Meta), so it is unlikely to fail at the same
+# time. Only used as a fallback, and only if GMAIL_REFRESH_TOKEN is already
+# configured for the email lane. Optional, no address means no email fallback.
+DAN_ALERT_EMAIL = os.environ.get("DAN_ALERT_EMAIL", "")
+# How often the bot is allowed to alert Dan about the model itself failing to
+# draft a reply at all, for example the Anthropic API being down or the key
+# being invalid. Without a cooldown, an extended outage would page Dan on every
+# single guest message. Seconds, default 15 minutes.
+API_FAILURE_ALERT_COOLDOWN = int(os.environ.get("API_FAILURE_ALERT_COOLDOWN", "900"))
+_last_api_failure_alert = {"ts": 0.0}
+# Ceiling on the in memory webhook dedup set below, so a long running process
+# does not slowly leak memory over months. The set only needs to catch retries
+# within roughly the same delivery window, so clearing it once it gets large is
+# safe.
+HANDLED_MAX = int(os.environ.get("HANDLED_MAX", "20000"))
 
 # Durable conversation memory. Without this, the bot's per guest chat history
 # lives only in this process (see _conv below) and is wiped on every redeploy,
@@ -155,6 +173,28 @@ _last_msg = {}          # sender -> most recent message id, for debounce
 _conv = {}              # sender -> list of {role, content}, in memory fallback only
 _conv_lock = threading.Lock()
 _UPSTASH_ON = bool(UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN)
+# Serializes the check then book sequence across every channel and every guest.
+# Without this, two guests messaging around the same moment could both pass the
+# availability check on separate threads before either one actually writes the
+# calendar event, and both get told they have the same table. Booking is rare
+# enough that holding one process wide lock for the couple hundred milliseconds
+# a calendar round trip takes has no real cost, and this only works because the
+# whole service is one Railway process, if that ever changes to multiple
+# instances this lock stops being enough and needs a real distributed lock.
+_book_lock = threading.Lock()
+
+
+def _already_handled(mid: str) -> bool:
+    """True if this message id was already processed on any channel. Also caps
+    the dedup set at HANDLED_MAX so a long running process does not grow this
+    forever, see the comment on HANDLED_MAX above."""
+    if len(_handled) > HANDLED_MAX:
+        logger.info("_handled dedup set exceeded %d entries, clearing", HANDLED_MAX)
+        _handled.clear()
+    if mid in _handled:
+        return True
+    _handled.add(mid)
+    return False
 
 
 def _upstash(*command):
@@ -411,10 +451,14 @@ def create_reservation(name, contact, party, area, start_dt, occasion, table, no
     return svc.events().insert(calendarId=RESERVIERUNGEN_CALENDAR_ID, body=body).execute()
 
 
-def process_booking(sender: str, data: dict, lang: str = "de") -> str:
+def process_booking(sender: str, data: dict, lang: str = "de", channel: str = "whatsapp") -> str:
     """Given the details the model gave the tool, check the table map, book if a
     table is free, and return the guest reply in the guest's language. Never
-    overbooks."""
+    overbooks, because the whole check then book sequence runs inside
+    _book_lock, see the comment on that lock above. Every path where the guest
+    is told Dan is handling it also actually alerts Dan, so that promise is
+    never just words, see [[project_brunnenbar_cloud_concierge]] on the earlier
+    SKIP path having the same gap for the text reply side of the bot."""
     try:
         party = int(data.get("party") or 0)
         area = "draussen" if str(data.get("area", "")).lower().startswith("drau") else "drinnen"
@@ -426,23 +470,32 @@ def process_booking(sender: str, data: dict, lang: str = "de") -> str:
         sie = bool(data.get("sie"))
     except Exception as e:
         logger.error("booking parse failed: %s data=%s", e, data)
+        alert_dan("booking details from the guest did not parse, needs a manual look",
+                  channel, sender, json.dumps(data, ensure_ascii=False), str(e))
         return ""
+    what = f"{party} Personen, {area}, {date_iso} {hhmm}, {name}"
     if not (BOOKING_ENABLED and GOOGLE_REFRESH_TOKEN and RESERVIERUNGEN_CALENDAR_ID):
         logger.warning("booking not configured, handing off")
+        alert_dan("booking requested but calendar is not configured", channel, sender, what,
+                   "BOOKING_ENABLED/GOOGLE_REFRESH_TOKEN/RESERVIERUNGEN_CALENDAR_ID, check Railway")
         return _handoff_line(sie, lang)
-    try:
-        table = find_free_table(date_iso, start_dt, party, area)
-    except Exception as e:
-        logger.error("availability check failed: %s", e)
-        return _handoff_line(sie, lang)
-    if not table:
-        logger.info("no free table for %s %s party %s %s", date_iso, hhmm, party, area)
-        return _full_line(sie, lang)
-    try:
-        create_reservation(name, sender, party, area, start_dt, occasion, table)
-    except Exception as e:
-        logger.error("create_reservation failed: %s", e)
-        return _handoff_line(sie, lang)
+    with _book_lock:
+        try:
+            table = find_free_table(date_iso, start_dt, party, area)
+        except Exception as e:
+            logger.error("availability check failed: %s", e)
+            alert_dan("booking availability check failed, needs a manual look", channel, sender, what, str(e))
+            return _handoff_line(sie, lang)
+        if not table:
+            logger.info("no free table for %s %s party %s %s", date_iso, hhmm, party, area)
+            alert_dan("bar is full at the requested time, guest needs a manual answer", channel, sender, what)
+            return _full_line(sie, lang)
+        try:
+            create_reservation(name, sender, party, area, start_dt, occasion, table)
+        except Exception as e:
+            logger.error("create_reservation failed: %s", e)
+            alert_dan("table was free but saving the booking to the calendar failed", channel, sender, what, str(e))
+            return _handoff_line(sie, lang)
     logger.info("booked table %s for %s party %s %s %s", table, name, party, date_iso, hhmm)
     h = start_dt.strftime("%H")
     if lang == "en":
@@ -505,7 +558,10 @@ If it is a genuine guest, a reservation, a birthday or group, an event, opening 
 If a real guest is just being friendly or playful, small talk, a compliment, an emoji, or they ask for something light like a joke, answer briefly and warmly in character. Never go dead silent on a real person, that is a robot tell. If they ask for a joke, just tell a short clean easy one, have fun with it, you are a fun neighbourhood bar.
 If it is spam, a cold sales pitch, a marketing, collaboration, press, sponsoring or supplier message, a delivery or app notification, or clearly not from a real guest, reply with exactly the single word SKIP and nothing else. This is just noise, Dan does not need to be paged for it.
 If it is a real guest asking about prices or Mindestumsatz beyond the guidance here, or a real policy question you are genuinely unsure about, do not guess and do not go silent. Instead reply with exactly HANDOFF: followed by a short few word reason for Dan in English, for example HANDOFF: asking exact Mindestumsatz for a 40 person event. Nothing else in that reply, no other text. But do NOT use HANDOFF just because a guest is being casual or off topic, only for a real question you cannot safely answer yourself.
-If a guest is unhappy or complaining, do not try to solve it. Your reply must be exactly two lines. The first line must be exactly ESCALATE_COMPLAINT with nothing else on it. The second line is one short warm sentence to the guest, that you are sorry and that you are passing it straight to Dan who will get back to them personally. Nothing else in the reply.
+If a guest wants to cancel, move, or change an existing reservation or event, this is also a HANDOFF, exactly like a policy question, reply with HANDOFF: cancel or reschedule request and nothing else. You have no way to actually change or remove anything from the calendar yourself, there is no tool for it, so never tell a guest a change is done or a date is freed up, only Dan can actually do that.
+If a guest directly asks to speak to a real person, to Dan, or says something like this is not helping, that is also a HANDOFF, reply with HANDOFF: guest wants to speak to a person.
+If a message suggests someone is in immediate danger right now, a medical emergency, a fire, or a fight, do not try to help conversationally. Your reply must be exactly two lines. The first line must be exactly ESCALATE_EMERGENCY with nothing else on it. The second line tells them clearly and simply to call 112 right now, or the bar directly at 0821 47019035, nothing else, no small talk.
+If a guest is unhappy or complaining, or the message is abusive, threatening, or hostile in a way a normal guest would not be, do not try to solve it. Your reply must be exactly two lines. The first line must be exactly ESCALATE_COMPLAINT with nothing else on it. The second line is one short sentence to the guest, warm and apologetic for a genuine complaint, or brief and neutral rather than apologetic if the message is hostile and an apology would not make sense, either way saying you are passing it straight to Dan who will get back to them personally. Nothing else in the reply.
 
 VOICE. You are texting like Dan, a busy bar owner tapping out a quick reply on his phone, NOT writing customer service. Casual, real, a bit terse. Mostly short, often a single line. Do not gush and do not sound delighted, cut openers like das freut mich sehr zu hören, wir freuen uns riesig, sehr gerne. Just answer the thing, and if you need something back ask ONE short question, then stop. Do not tie a neat bow on every message, do not restate what the guest just said, do not add reassurance nobody asked for. Informal du and euch, mirror Sie only if the guest is clearly formal. Lowercase and a relaxed run on sentence are fine, that is how people text. A quick smiley now and then is fine, not every message. Sign LG Dan only once in a while the way you would sign off a thread, not on every text. Sounding a little imperfect is good, it is human.
 
@@ -527,7 +583,7 @@ HARD FORMAT RULES, no exceptions. Never use hyphens, dashes, bullet points, numb
 
 LANGUAGE. Reply completely in the language the guest wrote in, and never mix two languages in one message. If the guest writes English, the whole reply must be natural English, so write inside or outside, not drinnen or draussen, and do not drop in German phrases like sehr gerne. The only German you keep in an English reply is the sign off LG Dan. If the guest writes German, reply fully in German. The words drinnen and draussen only ever appear inside the book_table tool call, never in an English guest message.
 
-CONTEXT AND OWNING MISTAKES. You can see the whole conversation, so read it before you reply and fit where the chat already is. Do not greet a returning guest as if this is the first message, do not ask something that was already answered, and pick up naturally from what was said. Very important, if YOU said something wrong earlier, for example the wrong day or wrong hours, and the guest corrects you, own it warmly and apologise, something like sorry, da hab ich mich vertan, and then give the right answer. Never act as if the guest made the mistake and never pretend it did not happen.
+READ THE WHOLE THREAD FIRST, EVERY SINGLE TIME. Before you write one word of a reply, actually read every message in the conversation history you were given for this sender, start to finish, not just the newest one. This includes turns marked as an assistant echo, meaning a reply Dan or the team typed by hand straight in the phone app rather than through you, treat those exactly as if you had said them yourself. The whole point of you seeing this history is so nothing has to be repeated to you. Use it actively. If a name, a business, an occasion, a date, a promise, or a role was mentioned earlier in the thread, for example a guest saying they are a vendor or supplier rather than a guest booking a table, or a group naming who is organising, carry that forward into how you answer now, do not treat the sender as a stranger just because you are seeing this message fresh. Do not greet a returning guest as if this is the first message, do not ask something that was already answered anywhere earlier in the thread, and pick up naturally from exactly where the conversation already is. Very important, if YOU said something wrong earlier, for example the wrong day or wrong hours, and the guest corrects you, own it warmly and apologise, something like sorry, da hab ich mich vertan, and then give the right answer. Never act as if the guest made the mistake and never pretend it did not happen. If the history looks thin or clearly missing for someone who talks like a returning guest, do not fake familiarity you do not have, just answer naturally from what you do see. If an assistant echo shows Dan or the team already answered a price, policy, cancellation, or complaint question in this thread by hand, do not answer that same question again yourself or give a different number, just continue naturally from what they already told the guest.
 
 TIME AND OPENING HOURS. For anything about whether the bar is open, or what day or time it is, rely ONLY on the AKTUELLER ZEITPUNKT line given to you and never guess the weekday. Opening hours are Donnerstag 18 bis 24 Uhr, Freitag und Samstag 18 bis 2 Uhr, sonst geschlossen. There is a Happy Hour bis 20 Uhr, mention it warmly but never quote prices. If today is a closed day, say so kindly and name the next open day.
 
@@ -573,7 +629,7 @@ FACTS YOU MAY SHARE. BrunnenBar is on Am Brunnenlech in Augsburg. There is no ki
 
 Never congratulate in advance for a birthday, wedding or anything that has not happened yet, that is bad luck, show excitement about hosting instead. Never put a bank account, IBAN or card number into a message.
 
-When you are not calling the book_table tool, output only the message text to send, or the single word SKIP, or a HANDOFF: reason line, or the two line ESCALATE_COMPLAINT format above. Never mention the tool or JSON to the guest."""
+When you are not calling the book_table tool, output only the message text to send, or the single word SKIP, or a HANDOFF: reason line, or the two line ESCALATE_EMERGENCY or ESCALATE_COMPLAINT format above. Never mention the tool or JSON to the guest."""
 
 
 BOOK_TOOL = {
@@ -784,6 +840,10 @@ def debug():
         "TURN_HOURS": TURN_HOURS,
         "bookable_tables": len(TABLES),
         "DAN_ALERT_WHATSAPP": bool(DAN_ALERT_WHATSAPP),
+        "DAN_ALERT_EMAIL": bool(DAN_ALERT_EMAIL),
+        "API_FAILURE_ALERT_COOLDOWN": API_FAILURE_ALERT_COOLDOWN,
+        "HANDLED_MAX": HANDLED_MAX,
+        "handled_set_size": len(_handled),
         "UPSTASH_REDIS_REST_URL": bool(UPSTASH_REDIS_REST_URL),
         "UPSTASH_REDIS_REST_TOKEN": bool(UPSTASH_REDIS_REST_TOKEN),
         "conv_memory_backend": "upstash" if _UPSTASH_ON else "in_memory_ephemeral",
@@ -969,9 +1029,8 @@ async def whatsapp_receive(request: Request):
             value = change.get("value", {})
             for msg in value.get("messages", []):
                 mid = msg.get("id")
-                if not mid or mid in _handled:
+                if not mid or _already_handled(mid):
                     continue
-                _handled.add(mid)
                 if msg.get("type") != "text":
                     logger.info("WhatsApp non text message, skipping")
                     continue
@@ -989,9 +1048,8 @@ async def whatsapp_receive(request: Request):
             for echo in value.get("smb_message_echoes", []):
                 em = echo.get("message", {}) or {}
                 mid = em.get("id")
-                if not mid or mid in _handled:
+                if not mid or _already_handled(mid):
                     continue
-                _handled.add(mid)
                 if em.get("type") != "text":
                     continue
                 recipient = em.get("to") or echo.get("recipient_id") or echo.get("to")
@@ -1023,9 +1081,8 @@ async def instagram_receive(request: Request):
             message = event.get("message") or {}
             mid = message.get("mid")
             text = message.get("text", "")
-            if message.get("is_echo") or not text or not mid or mid in _handled:
+            if message.get("is_echo") or not text or not mid or _already_handled(mid):
                 continue
-            _handled.add(mid)
             sender = event.get("sender", {}).get("id")
             logger.info("Instagram in from %s: %s", sender, text[:120])
             conv_append(sender, "user", text)
@@ -1054,9 +1111,8 @@ async def messenger_receive(request: Request):
             message = event.get("message") or {}
             mid = message.get("mid")
             text = message.get("text", "")
-            if message.get("is_echo") or not text or not mid or mid in _handled:
+            if message.get("is_echo") or not text or not mid or _already_handled(mid):
                 continue
-            _handled.add(mid)
             sender = event.get("sender", {}).get("id")
             logger.info("Messenger in from %s: %s", sender, text[:120])
             conv_append(sender, "user", text)
@@ -1082,9 +1138,12 @@ def handle_later(channel: str, sender: str, text: str, mid: str = None):
 
 def handle(channel: str, sender: str, text: str):
     action, value, lang = claude_decide(sender, text)
+    if action == "none" and not value:
+        _maybe_alert_api_failure(channel, sender, text)
+        return
     if action == "book":
         logger.info("book_table called by model: %s", value)
-        reply = process_booking(sender, value, lang) or _handoff_line(bool(value.get("sie")), lang)
+        reply = process_booking(sender, value, lang, channel) or _handoff_line(bool(value.get("sie")), lang)
     else:
         reply = value
     reply = (reply or "").strip()
@@ -1097,13 +1156,19 @@ def handle(channel: str, sender: str, text: str):
     if reply.upper().startswith("HANDOFF:"):
         reason = reply.split(":", 1)[1].strip() if ":" in reply else "no reason given"
         logger.info("Handoff to Dan (%s, %s): %s", channel, sender, reason)
-        alert_dan("price/policy question", channel, sender, text, reason)
+        alert_dan("price/policy/cancel/reschedule question", channel, sender, text, reason)
         return
+    if reply.startswith("ESCALATE_EMERGENCY"):
+        lines = reply.split("\n", 1)
+        reply = lines[1].strip() if len(lines) > 1 and lines[1].strip() else \
+            "bitte ruf sofort die 112 an oder uns direkt unter 0821 47019035"
+        logger.warning("EMERGENCY escalation (%s, %s)", channel, sender)
+        alert_dan("URGENT, possible emergency or safety issue", channel, sender, text)
     if reply.startswith("ESCALATE_COMPLAINT"):
         lines = reply.split("\n", 1)
         reply = lines[1].strip() if len(lines) > 1 and lines[1].strip() else _handoff_line(False, lang)
         logger.info("Complaint escalation (%s, %s)", channel, sender)
-        alert_dan("unhappy guest, complaint", channel, sender, text)
+        alert_dan("unhappy or hostile guest, complaint", channel, sender, text)
     logger.info("Draft reply (%s): %s", channel, reply[:200])
     conv_append(sender, "assistant", reply)
     if not AUTO_ACK:
@@ -1188,7 +1253,10 @@ def claude_decide(sender: str, text: str):
         return ("none", "", lang)
 
 
-def send_whatsapp(to: str, text: str):
+def send_whatsapp(to: str, text: str) -> bool:
+    """Send one WhatsApp message. Returns True only on a confirmed send, so
+    callers like alert_dan know whether they need a fallback path rather than
+    just hoping the log line was enough."""
     if DUALHOOK_API_KEY:
         url = DUALHOOK_BASE_URL + "/" + WHATSAPP_PHONE_NUMBER_ID + "/messages"
         headers = {"Authorization": "Bearer " + DUALHOOK_API_KEY}
@@ -1206,17 +1274,48 @@ def send_whatsapp(to: str, text: str):
         )
         r.raise_for_status()
         logger.info("WhatsApp reply sent to %s via %s", to, via)
+        return True
     except Exception as e:
         detail = getattr(e, "response", None)
         logger.error("WhatsApp send failed via %s: %s %s", via, e, detail.text if detail is not None else "")
+        return False
+
+
+def _email_alert_fallback(subject: str, body: str) -> bool:
+    """Send Dan an alert by email instead of WhatsApp. Only used when the
+    WhatsApp alert itself failed to send, since that is exactly the situation
+    where WhatsApp cannot be trusted to reach him. Runs on the Gmail lane,
+    wholly separate infrastructure from Meta/Dualhook, so it is unlikely to be
+    down at the same time. Silently does nothing if email is not configured or
+    DAN_ALERT_EMAIL is not set, callers already log the overall failure."""
+    if not (GMAIL_REFRESH_TOKEN and DAN_ALERT_EMAIL):
+        return False
+    try:
+        import base64
+        from email.mime.text import MIMEText
+        svc = _gmail_service()
+        mime = MIMEText(body, "plain", "utf-8")
+        mime["To"] = DAN_ALERT_EMAIL
+        mime["From"] = BAR_EMAIL
+        mime["Subject"] = subject
+        raw = base64.urlsafe_b64encode(mime.as_bytes()).decode()
+        svc.users().messages().send(userId="me", body={"raw": raw}).execute()
+        return True
+    except Exception as e:
+        logger.error("email alert fallback failed: %s", e)
+        return False
 
 
 def alert_dan(category: str, channel: str, sender: str, guest_text: str, reason: str = ""):
-    """Ping Dan on WhatsApp the moment the concierge cannot safely answer a real
-    guest itself, so a handoff is never silent. Only fires for a genuine guest
-    handoff (price/policy) or an unhappy guest, never for plain spam SKIP."""
-    if not DAN_ALERT_WHATSAPP:
-        logger.warning("DAN_ALERT_WHATSAPP not set, cannot alert Dan")
+    """Ping Dan the moment the concierge cannot safely answer a real guest
+    itself, so a handoff is never silent. Only fires for a genuine guest
+    handoff (price/policy), an unhappy guest, a booking that failed somewhere,
+    or another real reason a human is needed, never for plain spam SKIP. Tries
+    WhatsApp first, and if that specific send fails falls back to email so a
+    Dualhook outage cannot take out both the guest reply AND the one alert that
+    was supposed to tell Dan something is wrong."""
+    if not DAN_ALERT_WHATSAPP and not (GMAIL_REFRESH_TOKEN and DAN_ALERT_EMAIL):
+        logger.warning("No Dan alert channel configured (DAN_ALERT_WHATSAPP or DAN_ALERT_EMAIL), cannot alert Dan")
         return
     snippet = (guest_text or "").strip().replace("\n", " ")
     if len(snippet) > 300:
@@ -1225,8 +1324,37 @@ def alert_dan(category: str, channel: str, sender: str, guest_text: str, reason:
     if reason:
         lines.append(f"Why: {reason}")
     lines.append(f'Message: "{snippet}"')
-    send_whatsapp(DAN_ALERT_WHATSAPP, "\n".join(lines))
-    logger.info("Dan alerted (%s) for %s on %s", category, sender, channel)
+    text = "\n".join(lines)
+    sent = send_whatsapp(DAN_ALERT_WHATSAPP, text) if DAN_ALERT_WHATSAPP else False
+    if sent:
+        logger.info("Dan alerted via WhatsApp (%s) for %s on %s", category, sender, channel)
+        return
+    if _email_alert_fallback("BrunnenBar concierge needs you: " + category, text):
+        logger.info("Dan alerted via email fallback (%s) for %s on %s", category, sender, channel)
+    else:
+        logger.error(
+            "Dan alert FAILED on every configured channel (%s) for %s on %s, "
+            "check DAN_ALERT_WHATSAPP and DAN_ALERT_EMAIL/GMAIL_REFRESH_TOKEN in Railway",
+            category, sender, channel,
+        )
+
+
+def _maybe_alert_api_failure(channel: str, sender: str, text: str):
+    """The model itself failed to draft anything, for example the Anthropic API
+    is down, rate limited, or ANTHROPIC_API_KEY is wrong. Without this the guest
+    just gets silence and Dan never finds out, since this looks identical to an
+    intentional SKIP from the outside. Rate limited by API_FAILURE_ALERT_COOLDOWN
+    so an extended outage pages Dan once, not on every single guest message."""
+    now = time.time()
+    if now - _last_api_failure_alert["ts"] < API_FAILURE_ALERT_COOLDOWN:
+        logger.warning("Claude API failure alert suppressed (cooldown), %s %s", channel, sender)
+        return
+    _last_api_failure_alert["ts"] = now
+    alert_dan(
+        "bot could not draft any reply at all, guest got no reply",
+        channel, sender, text,
+        "check the Anthropic API key, quota and status, then reply to this guest yourself",
+    )
 
 
 def send_instagram(recipient_id: str, text: str):
@@ -1421,9 +1549,13 @@ def handle_email(svc, msg_id):
     conv_append(sender_key, "user", text)
     _last_msg[sender_key] = msg_id
     action, value, lang = claude_decide(sender_key, text)
+    if action == "none" and not value:
+        _maybe_alert_api_failure("email", sender_key, text)
+        mark_handled()
+        return
     if action == "book":
         logger.info("book_table called by model from email: %s", value)
-        reply = process_booking(sender_key, value, lang) or _handoff_line(bool(value.get("sie")), lang)
+        reply = process_booking(sender_key, value, lang, "email") or _handoff_line(bool(value.get("sie")), lang)
     else:
         reply = value
     reply = (reply or "").strip()
@@ -1438,14 +1570,20 @@ def handle_email(svc, msg_id):
     if reply.upper().startswith("HANDOFF:"):
         reason = reply.split(":", 1)[1].strip() if ":" in reply else "no reason given"
         logger.info("email handoff to Dan from %s: %s", from_addr, reason)
-        alert_dan("price/policy question (email)", "email", from_addr, text, reason)
+        alert_dan("price/policy/cancel/reschedule question (email)", "email", from_addr, text, reason)
         mark_handled()
         return
+    if reply.startswith("ESCALATE_EMERGENCY"):
+        lines = reply.split("\n", 1)
+        reply = lines[1].strip() if len(lines) > 1 and lines[1].strip() else \
+            "bitte ruf sofort die 112 an oder uns direkt unter 0821 47019035"
+        logger.warning("EMERGENCY escalation (email) from %s", from_addr)
+        alert_dan("URGENT, possible emergency or safety issue (email)", "email", from_addr, text)
     if reply.startswith("ESCALATE_COMPLAINT"):
         lines = reply.split("\n", 1)
         reply = lines[1].strip() if len(lines) > 1 and lines[1].strip() else _handoff_line(False, lang)
         logger.info("email complaint escalation from %s", from_addr)
-        alert_dan("unhappy guest, complaint (email)", "email", from_addr, text)
+        alert_dan("unhappy or hostile guest, complaint (email)", "email", from_addr, text)
     conv_append(sender_key, "assistant", reply)
     if AUTO_ACK:
         try:
