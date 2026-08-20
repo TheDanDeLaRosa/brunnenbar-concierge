@@ -553,16 +553,19 @@ def _full_line(sie=False, lang="de"):
 
 SYSTEM_PROMPT = """You are the concierge for BrunnenBar, a neighbourhood cocktail bar in Augsburg, Germany. You reply to guest messages on WhatsApp and Instagram on behalf of the owner Daniel, called Dan, as if you were Dan or his team.
 
-TRIAGE FIRST. Decide what kind of message this is.
-If it is a genuine guest, a reservation, a birthday or group, an event, opening hours, or a normal guest question, answer it following the rules below.
-If a real guest is just being friendly or playful, small talk, a compliment, an emoji, or they ask for something light like a joke, answer briefly and warmly in character. Never go dead silent on a real person, that is a robot tell. If they ask for a joke, just tell a short clean easy one, have fun with it, you are a fun neighbourhood bar.
-If it is spam, a cold sales pitch, a marketing, collaboration, press, sponsoring or supplier message, or an automated delivery or app notification, reply with exactly the single word SKIP and nothing else. This is just noise, Dan does not need to be paged for it.
-If a message is clearly not about the bar at all but is still written by a real person with a real need, for example a staff member asking about their pay, hours, or a schedule, or anything that reads like an internal or business matter rather than a guest one, this is NOT spam and must never be SKIP, a real person is waiting on an answer. Treat it exactly like a policy question, reply with exactly HANDOFF: followed by a short reason, for example HANDOFF: staff member asking about May pay, so Dan actually sees it and can follow up, most likely outside this channel.
-If it is a real guest asking about prices or Mindestumsatz beyond the guidance here, or a real policy question you are genuinely unsure about, do not guess and do not go silent. Instead reply with exactly HANDOFF: followed by a short few word reason for Dan in English, for example HANDOFF: asking exact Mindestumsatz for a 40 person event. Nothing else in that reply, no other text. But do NOT use HANDOFF just because a guest is being casual or off topic, only for a real question you cannot safely answer yourself.
-If a guest wants to cancel, move, or change an existing reservation or event, this is also a HANDOFF, exactly like a policy question, reply with HANDOFF: cancel or reschedule request and nothing else. You have no way to actually change or remove anything from the calendar yourself, there is no tool for it, so never tell a guest a change is done or a date is freed up, only Dan can actually do that.
-If a guest directly asks to speak to a real person, to Dan, or says something like this is not helping, that is also a HANDOFF, reply with HANDOFF: guest wants to speak to a person.
-If a message suggests someone is in immediate danger right now, a medical emergency, a fire, or a fight, do not try to help conversationally. Your reply must be exactly two lines. The first line must be exactly ESCALATE_EMERGENCY with nothing else on it. The second line tells them clearly and simply to call 112 right now, or the bar directly at 0821 47019035, nothing else, no small talk.
-If a guest is unhappy or complaining, or the message is abusive, threatening, or hostile in a way a normal guest would not be, do not try to solve it. Your reply must be exactly two lines. The first line must be exactly ESCALATE_COMPLAINT with nothing else on it. The second line is one short sentence to the guest, warm and apologetic for a genuine complaint, or brief and neutral rather than apologetic if the message is hostile and an apology would not make sense, either way saying you are passing it straight to Dan who will get back to them personally. Nothing else in the reply.
+CALL A TOOL, ALWAYS. Every single turn, you must call either book_table or send_reply, exactly once. Never answer with plain text outside of a tool call, not even a single word, not even to explain yourself, not even if you are unsure or the conversation history looks incomplete to you. If anything about the context is unclear, that uncertainty is never something to write out loud anywhere, in a tool call or otherwise, just make the best call you can with send_reply action reply and, if truly necessary, ask the guest the single most useful clarifying question the normal way.
+
+TRIAGE FIRST. Decide what kind of message this is, then call send_reply with the matching action.
+If it is a genuine guest, a reservation, a birthday or group, an event, opening hours, or a normal guest question, call send_reply action reply, message set to your answer, following the rules below.
+If a real guest is just being friendly or playful, small talk, a compliment, an emoji, or they ask for something light like a joke, call send_reply action reply and answer briefly and warmly in character. Never go dead silent on a real person, that is a robot tell. If they ask for a joke, just tell a short clean easy one, have fun with it, you are a fun neighbourhood bar.
+If it is spam, a cold sales pitch, a marketing, collaboration, press, sponsoring or supplier message, or an automated delivery or app notification, call send_reply action skip, no message needed. This is just noise, Dan does not need to be paged for it.
+If a message is clearly not about the bar at all but is still written by a real person with a real need, for example a staff member asking about their pay, hours, or a schedule, or anything that reads like an internal or business matter rather than a guest one, this is NOT spam and must never be action skip, a real person is waiting on an answer. Treat it exactly like a policy question, call send_reply action handoff with reason set to a short reason, for example staff member asking about May pay, so Dan actually sees it and can follow up, most likely outside this channel.
+If it is a real guest asking about prices or Mindestumsatz beyond the guidance here, or a real policy question you are genuinely unsure about, do not guess and do not go silent. Call send_reply action handoff with reason set to a short few word reason for Dan in English, for example asking exact Mindestumsatz for a 40 person event. But do NOT use handoff just because a guest is being casual or off topic, only for a real question you cannot safely answer yourself.
+If a guest wants to cancel an existing reservation or event outright, do not leave them hanging with silence, acknowledge it briefly the way Dan would. Call send_reply action cancel_request, message set to one short sentence, for example alles gut und danke fuers Bescheid geben, bis zum naechsten mal. Do NOT explain that you will handle it or take care of it, Dan does not narrate next steps in a short acknowledgment like this, just close it out warmly and briefly. You still cannot actually remove anything from the calendar yourself, there is no tool for it, Dan does that after seeing the alert, so keep the message brief and generic, never invent details about the booking you were not told.
+If a guest wants to move or reschedule an existing reservation or event to a different time or date, that is a handoff, exactly like a policy question, reason set to reschedule request, since that needs Dan to actually check real availability for the new time, not something to promise on your own.
+If a guest directly asks to speak to a real person, to Dan, or says something like this is not helping, that is also a handoff, reason set to guest wants to speak to a person.
+If a message suggests someone is in immediate danger right now, a medical emergency, a fire, or a fight, do not try to help conversationally. Call send_reply action escalate_emergency, message set to a clear simple line telling them to call 112 right now, or the bar directly at 0821 47019035, nothing else, no small talk.
+If a guest is unhappy or complaining, or the message is abusive, threatening, or hostile in a way a normal guest would not be, do not try to solve it. Call send_reply action escalate_complaint, message set to one short sentence to the guest, warm and apologetic for a genuine complaint, or brief and neutral rather than apologetic if the message is hostile and an apology would not make sense, either way saying you are passing it straight to Dan who will get back to them personally.
 
 VOICE. You are texting like Dan, a busy bar owner tapping out a quick reply on his phone, NOT writing customer service. Casual, real, a bit terse. Mostly short, often a single line. Do not gush and do not sound delighted, cut openers like das freut mich sehr zu hören, wir freuen uns riesig, sehr gerne. Just answer the thing, and if you need something back ask ONE short question, then stop. Do not tie a neat bow on every message, do not restate what the guest just said, do not add reassurance nobody asked for. Informal du and euch, mirror Sie only if the guest is clearly formal. Lowercase and a relaxed run on sentence are fine, that is how people text. A quick smiley now and then is fine, not every message. Sign LG Dan only once in a while the way you would sign off a thread, not on every text. Sounding a little imperfect is good, it is human.
 
@@ -596,13 +599,13 @@ GROUPS AND EVENTS, seven people or more, or any birthday, party or private booki
 
 Step one, the basics. Get the occasion, the date, roughly what time, and how many people.
 
-Step two, ask if they have been to BrunnenBar before, warmly, this shapes how much you explain next.
+Step two, ask if they have been to BrunnenBar before, warmly. This is about warmth and tone, not a reason to skip Step three, having stopped by for drinks before does not mean a guest knows how the private event setup works, always explain the two areas in Step three regardless of their answer here.
 
-Step three, once you know roughly how many people, explain the bar so they understand what they are choosing between, in your own words, using the real examples below for phrasing and feel, never copied word for word twice in a row. We have a hinterer Bereich, a separate and more private lounge section at the back, good for a partial private feel without closing the whole place. Or the whole bar can be closed exclusively just for them.
+Step three, once you know roughly how many people, explain the bar so they understand what they are choosing between, in your own words, using the real examples below for phrasing and feel, never copied word for word twice in a row, and do this for every group event regardless of whether they have been to BrunnenBar before. We have a hinterer Bereich, a separate and more private lounge section at the back, good for a partial private feel without closing the whole place. Or the whole bar can be closed exclusively just for them. If someone booking the hinterer Bereich also wants outside seating for part or all of the evening, that is possible too, it is not tied only to the full exclusive bar, but it does not happen automatically like the hinterer Bereich itself, the outside tables have to actually be reserved for a specific time and a specific number of guests ahead of time, otherwise they stay open to walk in guests. If they mention wanting to start outside or spend time outside, ask for that specific headcount and time window so it can actually be reserved.
 
-Step four, explain how paying for the space works, in your own words, using the real examples below for phrasing. We do not charge a flat Miete for the room. Instead there is a Mindestumsatz, a minimum spend across the group that covers what the space would normally bring in on a night like that, and it runs through their drinks like any normal tab, it is not a separate fee on top. Once you reach this point in the conversation, and only once you reach this point, you may give the actual number for whichever area fits what they are asking for, hinterer Bereich is 700 Euro Mindestumsatz, the whole bar closed exclusively is 1700 Euro Mindestumsatz. Never give either number earlier in the conversation, and never give both numbers at once, only the one that matches their group size and what they want.
+Step four, explain how paying for the space works, in your own words, using the real examples below for phrasing. We do not charge a flat Miete for the room. Instead there is a Mindestumsatz, a minimum spend across the group that covers what the space would normally bring in on a night like that, and it runs through their drinks like any normal tab, it is not a separate fee on top. Once you reach this point in the conversation, and only once you reach this point, you may give the actual number for whichever area fits what they are asking for, hinterer Bereich is 700 Euro Mindestumsatz, the whole bar closed exclusively is 1700 Euro Mindestumsatz. Never give either number earlier in the conversation, and never give both numbers at once, only the one that matches their group size and what they want. The hinterer Bereich alone comfortably fits 20 to 30 people, so a group that size does not need the whole bar for capacity reasons, the whole bar is about wanting full exclusivity instead, you can say so if it helps them decide. If a guest pushes back on the whole bar price because their group is a bit small for it, do not offer a discount or any flexibility on the number yourself, that is Dan's call to make personally, treat it as a HANDOFF like any other pricing question you cannot resolve yourself.
 
-Step five, for anything that sounds like a closed, private event rather than just a slightly bigger table, also find out three more things over the rest of the conversation, again one at a time. The music, ask if they will bring their own Spotify playlist or want a DJ. The food, ask what they have in mind, we have no kitchen ourselves but guests are welcome to bring their own food or cake, and caterers like Thassos are an option. And how they want to handle guests paying, ask if they are covering their guests themselves, want a drinks budget, or if guests just pay for their own.
+Step five, for anything that sounds like a closed, private event rather than just a slightly bigger table, also find out three more things over the rest of the conversation, again one at a time. The music, a DJ is only possible when the group is closing the whole bar exclusively, because the hinterer Bereich shares the rest of the bar with normal walk in guests who never opted into a DJ. If they are booking the hinterer Bereich, only ask about their own Spotify playlist, never offer a DJ as an option. If they are booking the whole bar exclusively, ask whether they will bring their own Spotify playlist or want a DJ. The food, ask what they have in mind, we have no kitchen ourselves but guests are welcome to bring their own food or cake, and caterers like Thassos are an option. And how they want to handle guests paying, ask if they are covering their guests themselves, want a drinks budget, or if guests just pay for their own.
 
 Throughout, warmly invite them to come by and see the space in person if they would like, that is always a good next step and something Dan says often.
 
@@ -614,7 +617,8 @@ No Miete, framing the hinterer Bereich, miete nehmen wir dafür keine, wir arbei
 No Miete, framing the whole bar, eine locationmiete nehmen wir nicht, wir arbeiten mit einem mindestumsatz und für die komplette bar liegt der bei 1700 euro, der läuft ganz normal über eure getränke.
 Helping them choose, für eine gruppe in eurer größe ist der hintere bereich wirklich perfekt, die komplette bar wäre natürlich auch möglich, das liegt dann aber deutlich höher und lohnt sich eigentlich nur wenn euch wichtig ist den abend komplett unter euch zu verbringen.
 Food, eigenes essen könnt ihr gerne mitbringen, eine eigene küche haben wir nämlich nicht, und wenn ihr was größeres wollt arbeiten wir auch mit caterern zusammen.
-Music, mit eigener musik oder dj.
+Music for the hinterer Bereich, only Spotify, wie stehts mit der musik, bringt ihr ne eigene spotify playlist mit.
+Music for the whole bar, DJ is possible here, wie stehts mit der musik, bringt ihr ne eigene spotify playlist mit oder hättet ihr gern nen dj.
 Guest payment options, abrechnen können wir ganz flexibel, entweder alles auf eine rechnung, ein getränkebudget oder jeder zahlt selbst.
 Come by invite, sehr gerne kommst du vorher mal vorbei, dann zeige ich dir alles in ruhe und wir gehen die details zusammen durch.
 
@@ -630,7 +634,7 @@ FACTS YOU MAY SHARE. BrunnenBar is on Am Brunnenlech in Augsburg. There is no ki
 
 Never congratulate in advance for a birthday, wedding or anything that has not happened yet, that is bad luck, show excitement about hosting instead. Never put a bank account, IBAN or card number into a message.
 
-When you are not calling the book_table tool, output only the message text to send, or the single word SKIP, or a HANDOFF: reason line, or the two line ESCALATE_EMERGENCY or ESCALATE_COMPLAINT format above. Never mention the tool or JSON to the guest."""
+Every turn ends in exactly one tool call, book_table or send_reply, never both, never neither, never plain text. Never mention a tool, an action name, or JSON to the guest, the message field is the only thing they ever see."""
 
 
 BOOK_TOOL = {
@@ -654,6 +658,69 @@ BOOK_TOOL = {
             "sie": {"type": "boolean", "description": "true only if addressing the guest formally with Sie"},
         },
         "required": ["name", "party", "area", "date", "time", "occasion", "sie"],
+    },
+}
+
+
+# Real incident, 20 Aug 2026, twice in one session. The model is asked to
+# either write a normal reply or output one of a few exact marker strings
+# (SKIP, HANDOFF:, and so on). Twice, instead of complying, it narrated its
+# own reasoning in plain prose, once ending in a real marker (caught by a
+# keyword guard), once with no marker at all, just English meta commentary
+# about not being able to see the conversation history, followed by an
+# otherwise fine reply. Because that second case used no banned keyword, the
+# keyword guard did not catch it and the raw reasoning went straight to the
+# guest. A keyword list can only ever catch the exact leaks already seen, not
+# the next shape this takes. The real fix is structural, never let free text
+# reach a guest at all. send_reply forces every non booking answer through a
+# tool call with a strict schema, so the field we actually send is always a
+# validated tool input, never raw model text. Any reasoning the model does
+# happens in ordinary text content blocks before the tool call, which this
+# code never reads and never sends. Used together with tool_choice any in
+# claude_decide, the model is required to call either this or book_table on
+# every single turn, plain unstructured text is no longer a possible output
+# at all.
+SEND_REPLY_TOOL = {
+    "name": "send_reply",
+    "description": (
+        "Send your actual response for this turn. You must call either this tool or "
+        "book_table on every turn, never answer with plain text outside a tool call. "
+        "Use action reply for a normal message to the guest. Use action skip for spam "
+        "or a clearly non guest automated message, no message needed. Use action "
+        "handoff when you cannot safely answer yourself (price/policy questions, "
+        "reschedule requests, a guest asking for a real person), give a short reason, "
+        "no message needed, the guest gets nothing this turn, Dan follows up. Use "
+        "action cancel_request when a guest wants to cancel an existing booking "
+        "outright, give a short message field just as described in the CANCEL_REQUEST "
+        "rules above. Use action escalate_emergency for immediate danger, message field "
+        "as described in the ESCALATE_EMERGENCY rules above. Use action "
+        "escalate_complaint for an unhappy or hostile guest, message field as described "
+        "in the ESCALATE_COMPLAINT rules above."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["reply", "skip", "handoff", "cancel_request", "escalate_emergency", "escalate_complaint"],
+            },
+            "message": {
+                "type": "string",
+                "description": (
+                    "The exact guest facing text to send, in the house voice rules above. "
+                    "Required for reply, cancel_request, escalate_emergency, and "
+                    "escalate_complaint. Leave empty for skip and handoff, those never "
+                    "send anything to the guest this turn. Never include any internal "
+                    "reasoning, explanation of your classification, or mention of tools, "
+                    "markers, or missing context here, only what a guest should read."
+                ),
+            },
+            "reason": {
+                "type": "string",
+                "description": "For action handoff only, a short few word reason for Dan in English.",
+            },
+        },
+        "required": ["action"],
     },
 }
 
@@ -1140,38 +1207,38 @@ def handle_later(channel: str, sender: str, text: str, mid: str = None):
 
 def handle(channel: str, sender: str, text: str):
     action, value, lang = claude_decide(sender, text)
-    if action == "none" and not value:
+    if action == "none":
         _maybe_alert_api_failure(channel, sender, text)
         return
     if action == "book":
         logger.info("book_table called by model: %s", value)
         reply = process_booking(sender, value, lang, channel) or _handoff_line(bool(value.get("sie")), lang)
+    elif action == "skip":
+        logger.info("Classified as spam/non guest, no reply to sender, FYI to Dan")
+        notify_dan_skip(channel, sender, text)
+        return
+    elif action == "handoff":
+        logger.info("Handoff to Dan (%s, %s): %s", channel, sender, value)
+        alert_dan("price/policy/reschedule question", channel, sender, text, value)
+        return
+    elif action == "cancel_request":
+        reply = (value or "").strip() or "alles gut und danke fuers Bescheid geben, bis zum naechsten mal"
+        logger.info("Cancel request (%s, %s)", channel, sender)
+        alert_dan("guest wants to cancel, please remove them from the calendar", channel, sender, text)
+    elif action == "escalate_emergency":
+        reply = (value or "").strip() or "bitte ruf sofort die 112 an oder uns direkt unter 0821 47019035"
+        logger.warning("EMERGENCY escalation (%s, %s)", channel, sender)
+        alert_dan("URGENT, possible emergency or safety issue", channel, sender, text)
+    elif action == "escalate_complaint":
+        reply = (value or "").strip() or _handoff_line(False, lang)
+        logger.info("Complaint escalation (%s, %s)", channel, sender)
+        alert_dan("unhappy or hostile guest, complaint", channel, sender, text)
     else:
         reply = value
     reply = (reply or "").strip()
     if not reply:
         logger.info("No reply, empty draft")
         return
-    if reply.upper() == "SKIP":
-        logger.info("Classified as spam/non guest, no reply to sender, FYI to Dan")
-        notify_dan_skip(channel, sender, text)
-        return
-    if reply.upper().startswith("HANDOFF:"):
-        reason = reply.split(":", 1)[1].strip() if ":" in reply else "no reason given"
-        logger.info("Handoff to Dan (%s, %s): %s", channel, sender, reason)
-        alert_dan("price/policy/cancel/reschedule question", channel, sender, text, reason)
-        return
-    if reply.startswith("ESCALATE_EMERGENCY"):
-        lines = reply.split("\n", 1)
-        reply = lines[1].strip() if len(lines) > 1 and lines[1].strip() else \
-            "bitte ruf sofort die 112 an oder uns direkt unter 0821 47019035"
-        logger.warning("EMERGENCY escalation (%s, %s)", channel, sender)
-        alert_dan("URGENT, possible emergency or safety issue", channel, sender, text)
-    if reply.startswith("ESCALATE_COMPLAINT"):
-        lines = reply.split("\n", 1)
-        reply = lines[1].strip() if len(lines) > 1 and lines[1].strip() else _handoff_line(False, lang)
-        logger.info("Complaint escalation (%s, %s)", channel, sender)
-        alert_dan("unhappy or hostile guest, complaint", channel, sender, text)
     if _looks_like_leaked_internal_text(reply):
         logger.error("Blocked a reply that looks like leaked internal reasoning (%s, %s): %s", channel, sender, reply[:300])
         alert_dan("bot's draft looked like leaked internal reasoning, blocked before sending, needs your own reply",
@@ -1209,10 +1276,27 @@ def _clean_messages(history):
 
 
 def claude_decide(sender: str, text: str):
-    """Ask the model what to do. Returns (action, value, lang), where action is
-    'book' with value a details dict, 'text' with value the reply string, or
-    'none'. Booking goes through the book_table tool, which is far more reliable
-    than asking the model to emit a special line."""
+    """Ask the model what to do. Returns (action, value, lang). action is one
+    of 'book' (value a details dict from book_table), 'reply' (value the
+    message string), 'skip', 'handoff' (value the reason string),
+    'cancel_request', 'escalate_emergency', 'escalate_complaint' (those three
+    with value the message string), or 'none' on any failure including the
+    model not calling a tool at all.
+
+    Both book_table and send_reply are offered with tool_choice any, forcing
+    the model to call one of them on every turn rather than ever answering
+    with plain free text. This exists because plain text answers proved
+    unsafe twice in one real session, once the model wrote out its own
+    classification reasoning ending in a real marker word, once with no
+    marker at all, just prose about not being able to see conversation
+    history, and both times that raw text would have gone straight to a real
+    person if it were ever read as the reply. A tool call's input is
+    schema-validated, the model's own reasoning can still happen in ordinary
+    text content blocks alongside the tool call, but this function only ever
+    reads the tool's structured input, never those text blocks, so raw
+    reasoning has no path to a guest anymore. If the model still returns no
+    tool call at all, action is 'none', which the caller treats exactly like
+    an API failure, alerts Dan, and sends nothing rather than guess."""
     lang = detect_lang(text)
     if not ANTHROPIC_API_KEY:
         logger.warning("No ANTHROPIC_API_KEY, cannot draft")
@@ -1243,7 +1327,8 @@ def claude_decide(sender: str, text: str):
                 "model": "claude-sonnet-4-5",
                 "max_tokens": 500,
                 "system": system,
-                "tools": [BOOK_TOOL],
+                "tools": [BOOK_TOOL, SEND_REPLY_TOOL],
+                "tool_choice": {"type": "any"},
                 "messages": messages,
             },
             timeout=30,
@@ -1251,10 +1336,26 @@ def claude_decide(sender: str, text: str):
         r.raise_for_status()
         parts = r.json().get("content", [])
         for p in parts:
-            if p.get("type") == "tool_use" and p.get("name") == "book_table":
+            if p.get("type") != "tool_use":
+                continue
+            if p.get("name") == "book_table":
                 return ("book", p.get("input", {}) or {}, lang)
-        text_out = "".join(p.get("text", "") for p in parts if p.get("type") == "text").strip()
-        return ("text", text_out, lang)
+            if p.get("name") == "send_reply":
+                inp = p.get("input", {}) or {}
+                action = (inp.get("action") or "").strip().lower()
+                message = (inp.get("message") or "").strip()
+                reason = (inp.get("reason") or "").strip()
+                if action in ("reply", "cancel_request", "escalate_emergency", "escalate_complaint"):
+                    return (action, message, lang)
+                if action == "handoff":
+                    return ("handoff", reason or "no reason given", lang)
+                if action == "skip":
+                    return ("skip", "", lang)
+                logger.error("send_reply called with an unrecognized action %r, treating as failure", action)
+                return ("none", "", lang)
+        logger.error("Claude response had no book_table or send_reply tool call, raw text ignored on purpose: %s",
+                     "".join(p.get("text", "") for p in parts if p.get("type") == "text")[:300])
+        return ("none", "", lang)
     except Exception as e:
         detail = getattr(e, "response", None)
         logger.error("Claude decide failed: %s %s", e, detail.text if detail is not None else "")
@@ -1386,23 +1487,28 @@ def notify_dan_skip(channel: str, sender: str, guest_text: str):
         logger.warning("Could not reach Dan with skip FYI for %s on %s (not urgent, not retried)", sender, channel)
 
 
-# Real incident, 20 Aug 2026. A message that did not fit any guest category
+# SECOND LAYER of defense, not the primary one anymore. The primary fix, as of
+# the second incident below, is that claude_decide forces every turn through a
+# schema-validated send_reply/book_table tool call, so raw model text can no
+# longer become the guest facing message at all, see the long comment on
+# claude_decide. This keyword check stays as cheap insurance in case a
+# malformed or old-format value ever slips through some other path, it is
+# not relied on as the only safeguard the way it briefly was.
+#
+# Real incident #1, 20 Aug 2026. A message that did not fit any guest category
 # (a staff member asking about pay/healthcare) made the model narrate its own
-# reasoning in prose instead of outputting the bare SKIP marker, for example
-# "this appears to be a message from someone who thinks they are contacting
-# their employer... SKIP". Because the reply was not an EXACT match to "SKIP",
-# none of the marker checks below caught it, and the raw internal reasoning,
-# including the literal word SKIP, was sent straight to that person as if it
-# were Dan's own reply. This can happen with any of the four markers, not just
-# SKIP, any time the model narrates instead of complying. These tokens are
-# written in this exact uppercase form, and only ever appear that way when the
-# model is behaving correctly, as the entire message (SKIP) or as the literal
-# first line (HANDOFF:, ESCALATE_EMERGENCY, ESCALATE_COMPLAINT), both already
-# handled by the checks above before this function ever runs. A real guest
-# facing reply in the house voice is lowercase and casual and would not
-# contain these exact tokens, so finding one anywhere in what is left over is
-# a reliable sign of a leak, not a false positive from ordinary conversation.
-_LEAK_MARKERS = ("SKIP", "HANDOFF:", "ESCALATE_EMERGENCY", "ESCALATE_COMPLAINT")
+# reasoning in prose instead of outputting the bare SKIP marker, ending in the
+# literal word SKIP, which was sent straight to that person as if it were
+# Dan's own reply, because the reply was not an EXACT match to "SKIP" and fell
+# through every marker check.
+#
+# Real incident #2, 20 Aug 2026, same day. A different message made the model
+# narrate a completely different kind of reasoning, in English, about not
+# being able to see the conversation history, with NO marker word anywhere in
+# it, followed by an otherwise fine reply. This keyword list could not catch
+# that shape by construction, which is exactly why the fix had to be
+# structural (the tool_choice change above) rather than one more keyword.
+_LEAK_MARKERS = ("SKIP", "HANDOFF:", "CANCEL_REQUEST", "ESCALATE_EMERGENCY", "ESCALATE_COMPLAINT")
 
 
 def _looks_like_leaked_internal_text(reply: str) -> bool:
@@ -1619,13 +1725,35 @@ def handle_email(svc, msg_id):
     conv_append(sender_key, "user", text)
     _last_msg[sender_key] = msg_id
     action, value, lang = claude_decide(sender_key, text)
-    if action == "none" and not value:
+    if action == "none":
         _maybe_alert_api_failure("email", sender_key, text)
         mark_handled()
         return
     if action == "book":
         logger.info("book_table called by model from email: %s", value)
         reply = process_booking(sender_key, value, lang, "email") or _handoff_line(bool(value.get("sie")), lang)
+    elif action == "skip":
+        logger.info("email classified spam/non guest, no reply to sender, FYI to Dan, from %s", from_addr)
+        notify_dan_skip("email", from_addr, text)
+        mark_handled()
+        return
+    elif action == "handoff":
+        logger.info("email handoff to Dan from %s: %s", from_addr, value)
+        alert_dan("price/policy/reschedule question (email)", "email", from_addr, text, value)
+        mark_handled()
+        return
+    elif action == "cancel_request":
+        reply = (value or "").strip() or "alles gut und danke fuers Bescheid geben, bis zum naechsten mal"
+        logger.info("email cancel request from %s", from_addr)
+        alert_dan("guest wants to cancel, please remove them from the calendar (email)", "email", from_addr, text)
+    elif action == "escalate_emergency":
+        reply = (value or "").strip() or "bitte ruf sofort die 112 an oder uns direkt unter 0821 47019035"
+        logger.warning("EMERGENCY escalation (email) from %s", from_addr)
+        alert_dan("URGENT, possible emergency or safety issue (email)", "email", from_addr, text)
+    elif action == "escalate_complaint":
+        reply = (value or "").strip() or _handoff_line(False, lang)
+        logger.info("email complaint escalation from %s", from_addr)
+        alert_dan("unhappy or hostile guest, complaint (email)", "email", from_addr, text)
     else:
         reply = value
     reply = (reply or "").strip()
@@ -1633,28 +1761,6 @@ def handle_email(svc, msg_id):
         logger.info("email empty draft from %s", from_addr)
         mark_handled()
         return
-    if reply.upper() == "SKIP":
-        logger.info("email classified spam/non guest, no reply to sender, FYI to Dan, from %s", from_addr)
-        notify_dan_skip("email", from_addr, text)
-        mark_handled()
-        return
-    if reply.upper().startswith("HANDOFF:"):
-        reason = reply.split(":", 1)[1].strip() if ":" in reply else "no reason given"
-        logger.info("email handoff to Dan from %s: %s", from_addr, reason)
-        alert_dan("price/policy/cancel/reschedule question (email)", "email", from_addr, text, reason)
-        mark_handled()
-        return
-    if reply.startswith("ESCALATE_EMERGENCY"):
-        lines = reply.split("\n", 1)
-        reply = lines[1].strip() if len(lines) > 1 and lines[1].strip() else \
-            "bitte ruf sofort die 112 an oder uns direkt unter 0821 47019035"
-        logger.warning("EMERGENCY escalation (email) from %s", from_addr)
-        alert_dan("URGENT, possible emergency or safety issue (email)", "email", from_addr, text)
-    if reply.startswith("ESCALATE_COMPLAINT"):
-        lines = reply.split("\n", 1)
-        reply = lines[1].strip() if len(lines) > 1 and lines[1].strip() else _handoff_line(False, lang)
-        logger.info("email complaint escalation from %s", from_addr)
-        alert_dan("unhappy or hostile guest, complaint (email)", "email", from_addr, text)
     if _looks_like_leaked_internal_text(reply):
         logger.error("Blocked an email reply that looks like leaked internal reasoning from %s: %s", from_addr, reply[:300])
         alert_dan("bot's draft looked like leaked internal reasoning, blocked before sending, needs your own reply (email)",

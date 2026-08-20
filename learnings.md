@@ -6,4 +6,6 @@ Full bar sizing, around 50 guests is the whole bar and that is a nice thing to o
 
 Guest wants to pay by bank transfer, tell them Dan sends the Bankverbindung himself, never type bank details into the chat.
 
-Reschedules are normal and relaxed, hold the date warmly, der [datum] bleibt bis dahin für dich blockiert, sag mir einfach was dir besser passt. As of 20 Aug 2026 this warm line is Dan's own to say once he actually sees the request, the bot itself has no tool to move or cancel a booking, so it hands cancel/reschedule requests straight to Dan (HANDOFF) rather than promising a hold it cannot keep.
+Reschedules are normal and relaxed, hold the date warmly, der [datum] bleibt bis dahin für dich blockiert, sag mir einfach was dir besser passt. As of 20 Aug 2026 this warm line is Dan's own to say once he actually sees the request, the bot itself has no tool to move a booking, so it hands reschedule requests straight to Dan (HANDOFF) rather than promising a hold it cannot keep. Cancellations are different, the bot can acknowledge those itself, see below.
+
+Outside seating for a hinterer Bereich event, corrected by Dan 20 Aug 2026, outside is NOT only available with the full exclusive bar. A group booking the hinterer Bereich can also have outside seating for part or all of the evening, it just has to be reserved ahead of time for a specific headcount and time window, otherwise those tables stay open to walk ins.
