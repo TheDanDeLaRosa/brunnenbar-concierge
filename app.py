@@ -312,10 +312,24 @@ def bar_time_context():
             "Uhrzeit, ist das eine ganz normale Vorausbuchung wie jede andere, SAME DAY BY PHONE gilt "
             "hier NICHT, sammle die ueblichen Angaben und ruf book_table ganz normal auf."
         )
+    # Same root cause class as after_18 above. Resolving a guest's "diesen
+    # Freitag" or "naechsten Donnerstag" into an actual YYYY-MM-DD requires
+    # weekday offset arithmetic, exactly the kind of thing the model got wrong
+    # for the after_18 comparison. Rather than wait for a guest to hit this
+    # the same way Tatjana hit the after_18 bug, computed here directly for
+    # the whole coming week so book_table's date field never depends on the
+    # model doing day of week math itself, only on picking the right line
+    # from a list already given the correct date.
+    next7 = ", ".join(
+        f"{days[(now + timedelta(days=i)).weekday()]} {(now + timedelta(days=i)).strftime('%d.%m.%Y')}"
+        for i in range(1, 8)
+    )
     return (
         "AKTUELLER ZEITPUNKT in Augsburg, verlass dich nur hierauf und rate niemals den Wochentag. "
         f"Es ist {days[wd]}, der {now.strftime('%d.%m.%Y')}, um {now.strftime('%H')} Uhr {now.strftime('%M')}. "
-        f"{today} {status} {same_day_note}"
+        f"{today} {status} {same_day_note} "
+        f"Die naechsten sieben Tage, falls ein Gast einen Wochentag statt eines Datums nennt, niemals selbst "
+        f"ausrechnen, hier direkt nachschlagen: {next7}."
     )
 
 
