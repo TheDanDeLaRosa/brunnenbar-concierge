@@ -278,10 +278,31 @@ def bar_time_context():
     else:
         today = "Heute ist die Bar geschlossen. Offen ist nur Donnerstag, Freitag und Samstag ab 18 Uhr."
     status = "Die Bar ist gerade GEOEFFNET." if open_now else "Die Bar ist gerade GESCHLOSSEN."
+    # SAME_DAY_BY_PHONE FIX 20 Aug 2026: Dan caught the bot telling a guest to
+    # call the bar for a same-day booking at 16:13, well before 18 Uhr, twice
+    # in one thread even after Dan personally stepped in and gave the guest a
+    # table. The SAME_DAY_BY_PHONE rule in the system prompt was always
+    # supposed to require it being after 18 Uhr right now, but leaving that
+    # comparison to the model to work out from the raw time was unreliable.
+    # after_18 is now computed here in code and stated as a direct yes/no
+    # instruction, so the model never has to do that arithmetic itself.
+    after_18 = h >= 18
+    if after_18:
+        same_day_note = (
+            "Es ist JETZT nach 18 Uhr. Will ein Gast einen Tisch fuer HEUTE, gilt SAME DAY BY "
+            "PHONE aus den Regeln, sag ihnen warm sie sollen direkt unter 0821 47019035 anrufen, "
+            "ruf NICHT book_table dafuer auf."
+        )
+    else:
+        same_day_note = (
+            "Es ist JETZT NICHT nach 18 Uhr. Will ein Gast einen Tisch fuer HEUTE zu einer spaeteren "
+            "Uhrzeit, ist das eine ganz normale Vorausbuchung wie jede andere, SAME DAY BY PHONE gilt "
+            "hier NICHT, sammle die ueblichen Angaben und ruf book_table ganz normal auf."
+        )
     return (
         "AKTUELLER ZEITPUNKT in Augsburg, verlass dich nur hierauf und rate niemals den Wochentag. "
         f"Es ist {days[wd]}, der {now.strftime('%d.%m.%Y')}, um {now.strftime('%H')} Uhr {now.strftime('%M')}. "
-        f"{today} {status}"
+        f"{today} {status} {same_day_note}"
     )
 
 
@@ -623,7 +644,7 @@ TIME AND OPENING HOURS. For anything about whether the bar is open, or what day 
 
 RESERVATIONS up to six people. You need six things, the date, the time, the number of people, a name, whether they would like inside or outside, and whether it is for a special occasion. Always ask about the occasion, warmly, even if they have not mentioned one, because we like to note it, and if there is none that is completely fine. If any of these is missing, ask for what is missing warmly in one short flowing message, never as a list, and do not book yet. Once you have all six, do NOT write a confirmation yourself. Instead call the book_table tool with the details. Resolve the date to YYYY-MM-DD using the AKTUELLER ZEITPUNKT line, use 24 hour time as HH:MM, area is exactly drinnen or draussen, occasion is the Anlass or an empty string, and sie is true only if you are speaking to the guest in the formal Sie form. The system then checks the real table availability, books an actual table and sends the guest the confirmation for you, so when you call book_table you do not also write any message. Only ever call book_table for parties of up to six people, never for seven or more.
 
-SAME DAY BY PHONE. This rule comes before the booking rule. If a guest wants a table for today AND the bar is open today AND it is after 18 Uhr right now, never call book_table. Instead warmly tell them to please call the bar directly under 0821 47019035 rather than WhatsApp, because a table for tonight is arranged fastest by phone.
+SAME DAY BY PHONE. This rule comes before the booking rule. Whether this applies right now is stated directly for you at the end of the AKTUELLER ZEITPUNKT line, either "gilt SAME DAY BY PHONE" or "gilt hier NICHT", always trust that line instead of working it out yourself from the clock, that line is always correct and up to date. When it says SAME DAY BY PHONE applies, a guest asking for a table today, never call book_table, instead warmly tell them to please call the bar directly under 0821 47019035 rather than WhatsApp, because a table for tonight is arranged fastest by phone. When it says SAME DAY BY PHONE does not apply, a same day request is a completely normal advance booking like any other day, gather the usual details and call book_table as normal, do not redirect them to call just because the word heute or today came up. If you already told a guest to call, or Dan already personally handled a booking for them earlier in this thread, for example an assistant echo giving them a table, never repeat the call instruction again to the same guest in the same thread, that is now resolved, move on naturally instead, see READ THE WHOLE THREAD FIRST above.
 
 GROUPS AND EVENTS, seven people or more, or any birthday, party or private booking. Treat it as an event and do not confirm anything yourself, Dan closes these personally. Walk through this warmly over several messages, one thing at a time, never as a stacked list, and read the conversation so far so you never ask something already answered.
 
