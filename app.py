@@ -605,7 +605,7 @@ SAME DAY BY PHONE. This rule comes before the booking rule. If a guest wants a t
 
 GROUPS AND EVENTS, seven people or more, or any birthday, party or private booking. Treat it as an event and do not confirm anything yourself, Dan closes these personally. Walk through this warmly over several messages, one thing at a time, never as a stacked list, and read the conversation so far so you never ask something already answered.
 
-Step one, the basics. Get the occasion, the date, roughly what time, and how many people.
+Step one, the basics. Get the occasion, the date, roughly what time, how many people, and the name of whoever is organising it. A WhatsApp or Instagram display name is not reliable enough to hand to Dan on its own, always ask for it directly, warmly, folded in naturally rather than as an interrogation, for example wie darf ich dich denn nennen or unter welchem namen darf ich das notieren. Do not consider Step one finished, and do not move on to explaining the space in Step three, until you actually have a name, not just a guess from the chat profile.
 
 Step two, ask if they have been to BrunnenBar before, warmly. This is about warmth and tone, not a reason to skip Step three, having stopped by for drinks before does not mean a guest knows how the private event setup works, always explain the two areas in Step three regardless of their answer here.
 
@@ -617,7 +617,7 @@ Step five, for anything that sounds like a closed, private event rather than jus
 
 Throughout, warmly invite them to come by and see the space in person if they would like, that is always a good next step and something Dan says often.
 
-Once you have gathered what you need, tell them Dan gets back to them personally with an Angebot, right here in the chat. We handle events on the channel the guest wrote on, so NEVER tell a guest to send an email and never say the Angebot comes by email or per Mail, the follow up happens here on WhatsApp or wherever they messaged.
+Once you have gathered what you need, this is a handoff, not a plain reply. Call send_reply action handoff with reason set to a full compact summary of everything gathered (name, occasion, date, time, headcount, area, and any Step five answers already given) and message set to the warm closing line telling them Dan gets back to them personally with an Angebot, right here in the chat. This actually pings Dan, a plain reply here would not, and Dan needing to follow up must never be a promise that only lives in the chat. We handle events on the channel the guest wrote on, so NEVER tell a guest to send an email and never say the Angebot comes by email or per Mail, the follow up happens here on WhatsApp or wherever they messaged.
 
 HOW DAN REALLY EXPLAINS EVENTS AND PRICING, real lines from his own chats, copy this feel, never quote the older 1600 or a Trinkgeld percentage from anywhere, 700 and 1700 covering everything are the only correct current numbers.
 The two areas, die bar ist im prinzip in zwei bereiche aufgeteilt mit der hauptbar in der mitte, vorne ist der hauptbereich mit den tischen im eingangsbereich und hinten haben wir nochmal einen etwas separateren lounge bereich.
@@ -697,7 +697,16 @@ SEND_REPLY_TOOL = {
         "or a clearly non guest automated message, no message needed. Use action "
         "handoff when you cannot safely answer yourself (price/policy questions, "
         "reschedule requests, a guest asking for a real person), give a short reason, "
-        "no message needed, the guest gets nothing this turn, Dan follows up. Use "
+        "message is usually left empty and the guest gets nothing this turn, Dan "
+        "follows up directly. ONE exception: a GROUPS AND EVENTS inquiry that has just "
+        "become fully qualified (name, occasion, date, time, headcount, and the rest of "
+        "the walkthrough gathered). For that case call handoff with BOTH a reason (a "
+        "full compact summary of every detail gathered in the conversation so far, this "
+        "reason is the only thing Dan sees to work from, so make it complete, not just a "
+        "couple of words) AND a message (the warm closing line telling the guest Dan "
+        "will personally follow up here with an Angebot). This sends the guest their "
+        "closing line and alerts Dan with the full picture in the same turn, so the "
+        "promise that Dan follows up is never just words. Use "
         "action cancel_request when a guest wants to cancel an existing booking "
         "outright, give a short message field just as described in the CANCEL_REQUEST "
         "rules above. Use action escalate_emergency for immediate danger, message field "
@@ -717,15 +726,25 @@ SEND_REPLY_TOOL = {
                 "description": (
                     "The exact guest facing text to send, in the house voice rules above. "
                     "Required for reply, cancel_request, escalate_emergency, and "
-                    "escalate_complaint. Leave empty for skip and handoff, those never "
-                    "send anything to the guest this turn. Never include any internal "
+                    "escalate_complaint. Leave empty for skip and always empty for handoff, "
+                    "EXCEPT the one handoff case for a just-qualified GROUPS AND EVENTS "
+                    "inquiry, where message carries the warm closing line telling the "
+                    "guest Dan will personally follow up. Never include any internal "
                     "reasoning, explanation of your classification, or mention of tools, "
                     "markers, or missing context here, only what a guest should read."
                 ),
             },
             "reason": {
                 "type": "string",
-                "description": "For action handoff only, a short few word reason for Dan in English.",
+                "description": (
+                    "For action handoff only. Usually a short few word reason for Dan in "
+                    "English, for example asking exact Mindestumsatz for a 40 person "
+                    "event. For a just-qualified GROUPS AND EVENTS handoff specifically, "
+                    "make this a full compact summary instead, everything gathered so "
+                    "far, name, occasion, date, time, headcount, area, and any of the "
+                    "step five answers already given, since this is the only context "
+                    "Dan gets to act on."
+                ),
             },
         },
         "required": ["action"],
@@ -1226,9 +1245,20 @@ def handle(channel: str, sender: str, text: str):
         notify_dan_skip(channel, sender, text)
         return
     elif action == "handoff":
-        logger.info("Handoff to Dan (%s, %s): %s", channel, sender, value)
-        alert_dan("price/policy/reschedule question", channel, sender, text, value)
-        return
+        reason = (value or {}).get("reason", "no reason given")
+        guest_message = ((value or {}).get("message") or "").strip()
+        logger.info("Handoff to Dan (%s, %s): %s", channel, sender, reason)
+        if guest_message:
+            # Qualified GROUPS AND EVENTS handoff: alert Dan with the full
+            # summary AND still send the guest their warm closing line, so
+            # "Dan follows up" is a real ping to his phone, not just a line
+            # in the chat nobody acts on. See [[project_brunnenbar_cloud_concierge]]
+            # 20 Aug 2026, Dan caught a real JGA thread where this never fired.
+            alert_dan("event fully qualified, ready for your Angebot", channel, sender, text, reason)
+            reply = guest_message
+        else:
+            alert_dan("price/policy/reschedule question", channel, sender, text, reason)
+            return
     elif action == "cancel_request":
         reply = (value or "").strip() or "alles gut und danke fuers Bescheid geben, bis zum naechsten mal"
         logger.info("Cancel request (%s, %s)", channel, sender)
@@ -1286,7 +1316,9 @@ def _clean_messages(history):
 def claude_decide(sender: str, text: str):
     """Ask the model what to do. Returns (action, value, lang). action is one
     of 'book' (value a details dict from book_table), 'reply' (value the
-    message string), 'skip', 'handoff' (value the reason string),
+    message string), 'skip', 'handoff' (value a dict with 'reason' and
+    'message', message is empty except for a just-qualified GROUPS AND
+    EVENTS handoff, see the send_reply tool description),
     'cancel_request', 'escalate_emergency', 'escalate_complaint' (those three
     with value the message string), or 'none' on any failure including the
     model not calling a tool at all.
@@ -1356,7 +1388,7 @@ def claude_decide(sender: str, text: str):
                 if action in ("reply", "cancel_request", "escalate_emergency", "escalate_complaint"):
                     return (action, message, lang)
                 if action == "handoff":
-                    return ("handoff", reason or "no reason given", lang)
+                    return ("handoff", {"reason": reason or "no reason given", "message": message}, lang)
                 if action == "skip":
                     return ("skip", "", lang)
                 logger.error("send_reply called with an unrecognized action %r, treating as failure", action)
@@ -1746,10 +1778,16 @@ def handle_email(svc, msg_id):
         mark_handled()
         return
     elif action == "handoff":
-        logger.info("email handoff to Dan from %s: %s", from_addr, value)
-        alert_dan("price/policy/reschedule question (email)", "email", from_addr, text, value)
-        mark_handled()
-        return
+        reason = (value or {}).get("reason", "no reason given")
+        guest_message = ((value or {}).get("message") or "").strip()
+        logger.info("email handoff to Dan from %s: %s", from_addr, reason)
+        if guest_message:
+            alert_dan("event fully qualified, ready for your Angebot (email)", "email", from_addr, text, reason)
+            reply = guest_message
+        else:
+            alert_dan("price/policy/reschedule question (email)", "email", from_addr, text, reason)
+            mark_handled()
+            return
     elif action == "cancel_request":
         reply = (value or "").strip() or "alles gut und danke fuers Bescheid geben, bis zum naechsten mal"
         logger.info("email cancel request from %s", from_addr)
