@@ -105,6 +105,19 @@ DAN_ALERT_EMAIL = os.environ.get("DAN_ALERT_EMAIL", "")
 # single guest message. Seconds, default 15 minutes.
 API_FAILURE_ALERT_COOLDOWN = int(os.environ.get("API_FAILURE_ALERT_COOLDOWN", "900"))
 _last_api_failure_alert = {"ts": 0.0}
+# Senders the bot must never auto reply to on WhatsApp. Dan handles these threads
+# personally, for example a vendor relationship where an automated reply is the
+# wrong move even when it reads as plausible. A number in this list still gets
+# logged and kept in conversation memory for the record, it just never triggers
+# a drafted reply or a Dan alert, since Dan is already the one watching it by
+# hand. Digits only, no plus, same format as DAN_ALERT_WHATSAPP. Comma separate
+# in the env var to add more later without a code change.
+SKIP_SENDERS = {
+    s.strip() for s in os.environ.get(
+        "SKIP_SENDERS",
+        "491627557766",  # Carolin Keller, vendor not guest, Dan replies personally, added 21 Aug 2026
+    ).split(",") if s.strip()
+}
 # Ceiling on the in memory webhook dedup set below, so a long running process
 # does not slowly leak memory over months. The set only needs to catch retries
 # within roughly the same delivery window, so clearing it once it gets large is
@@ -987,6 +1000,7 @@ def debug():
         "UPSTASH_REDIS_REST_TOKEN": bool(UPSTASH_REDIS_REST_TOKEN),
         "conv_memory_backend": "upstash" if _UPSTASH_ON else "in_memory_ephemeral",
         "CONV_MAX_TURNS": CONV_MAX_TURNS,
+        "SKIP_SENDERS_count": len(SKIP_SENDERS),
     }
 
 
@@ -1177,6 +1191,9 @@ async def whatsapp_receive(request: Request):
                 text = (msg.get("text") or {}).get("body", "")
                 logger.info("WhatsApp in from %s: %s", sender, text[:120])
                 conv_append(sender, "user", text)
+                if sender in SKIP_SENDERS:
+                    logger.info("WhatsApp sender %s is on SKIP_SENDERS, logged only, no auto reply, Dan replies personally", sender)
+                    continue
                 _last_msg[sender] = mid
                 threading.Thread(target=handle_later, args=("whatsapp", sender, text, mid), daemon=True).start()
             # Coexistence echo, a reply Dan or a teammate typed by hand straight in the
