@@ -498,6 +498,14 @@ def process_booking(sender: str, data: dict, lang: str = "de", channel: str = "w
             return _handoff_line(sie, lang)
     logger.info("booked table %s for %s party %s %s %s", table, name, party, date_iso, hhmm)
     h = start_dt.strftime("%H")
+    # BUG FIXED 20 Aug 2026: the German confirmation lines below used to say
+    # "{h} Uhr" with only the hour, silently dropping the minutes for any
+    # booking not on the hour (e.g. a 19:30 reservation got confirmed to the
+    # guest as "19 Uhr"), while the actual calendar entry was correct. Caught
+    # live by Dan on a real Irma Runde booking. hm now always carries the
+    # exact reserved time, minutes included whenever they are non-zero, and
+    # every template below uses hm instead of the bare hour h.
+    hm = f"{h}:{start_dt.strftime('%M')}" if start_dt.minute else h
     if lang == "en":
         days_en = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
         where = "outside" if area == "draussen" else "inside"
@@ -515,14 +523,14 @@ def process_booking(sender: str, data: dict, lang: str = "de", channel: str = "w
     wd = days_de[start_dt.weekday()]
     if sie:
         return random.choice([
-            f"sehr gerne, ich habe Sie fuer {wd} um {h} Uhr {bereich} eingetragen, bis dann",
-            f"perfekt, {wd} um {h} Uhr {bereich} steht fuer Sie, wir freuen uns",
+            f"sehr gerne, ich habe Sie fuer {wd} um {hm} Uhr {bereich} eingetragen, bis dann",
+            f"perfekt, {wd} um {hm} Uhr {bereich} steht fuer Sie, wir freuen uns",
         ])
     return random.choice([
-        f"top, hab euch fuer {wd} um {h} uhr {bereich} eingetragen. freu mich, bis dann",
-        f"super, {wd} {h} uhr {bereich} steht fuer euch, bis dann",
-        f"passt, hab euch {wd} um {h} uhr {bereich} reserviert. bis {wd} dann",
-        f"cool, {wd} um {h} uhr {bereich} ist eingetragen, freu mich auf euch",
+        f"top, hab euch fuer {wd} um {hm} uhr {bereich} eingetragen. freu mich, bis dann",
+        f"super, {wd} {hm} uhr {bereich} steht fuer euch, bis dann",
+        f"passt, hab euch {wd} um {hm} uhr {bereich} reserviert. bis {wd} dann",
+        f"cool, {wd} um {hm} uhr {bereich} ist eingetragen, freu mich auf euch",
     ])
 
 
