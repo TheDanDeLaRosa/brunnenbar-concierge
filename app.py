@@ -506,6 +506,12 @@ def process_booking(sender: str, data: dict, lang: str = "de", channel: str = "w
     # exact reserved time, minutes included whenever they are non-zero, and
     # every template below uses hm instead of the bare hour h.
     hm = f"{h}:{start_dt.strftime('%M')}" if start_dt.minute else h
+    # 15 MINUTE HOLD POLICY added 20 Aug 2026 at Dan's request. Every table
+    # confirmation now says we hold it 15 minutes and, if running later than
+    # that, to call the bar directly rather than WhatsApp so we can hold it.
+    # This was already documented policy from a manual draft Dan wrote on
+    # 13 Aug 2026 (see [[project_brunnenbar_late_arrival_policy]]) but had
+    # never actually been wired into the automated confirmation before now.
     if lang == "en":
         days_en = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
         where = "outside" if area == "draussen" else "inside"
@@ -513,24 +519,40 @@ def process_booking(sender: str, data: dict, lang: str = "de", channel: str = "w
         h12 = start_dt.hour % 12 or 12
         mins = f":{start_dt.strftime('%M')}" if start_dt.minute else ""
         time_en = f"{h12}{mins} {'am' if start_dt.hour < 12 else 'pm'}"
+        hold_line_en = (
+            " we hold the table for 15 minutes. if you're running later than "
+            "that please call the bar directly at 0821 47019035 rather than "
+            "whatsapp and let us know and we'll hold it for you"
+        )
         return random.choice([
-            f"nice, got you down for {d} at {time_en} {where}. see you then",
-            f"done, you're in for {d} {time_en} {where}. looking forward to it",
-            f"great, booked you {d} at {time_en} {where}, see you then",
+            f"nice, got you down for {d} at {time_en} {where}.{hold_line_en}. see you then",
+            f"done, you're in for {d} {time_en} {where}.{hold_line_en}. looking forward to it",
+            f"great, booked you {d} at {time_en} {where}.{hold_line_en}. see you then",
         ])
     days_de = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
     bereich = "draussen" if area == "draussen" else "drinnen"
     wd = days_de[start_dt.weekday()]
     if sie:
+        hold_line_sie = (
+            " wir halten den Tisch 15 Minuten. falls Sie mehr als 15 Minuten "
+            "spaeter kommen rufen Sie uns bitte direkt in der Bar an unter "
+            "0821 47019035 nicht ueber WhatsApp und geben uns kurz Bescheid "
+            "dann halten wir ihn Ihnen"
+        )
         return random.choice([
-            f"sehr gerne, ich habe Sie fuer {wd} um {hm} Uhr {bereich} eingetragen, bis dann",
-            f"perfekt, {wd} um {hm} Uhr {bereich} steht fuer Sie, wir freuen uns",
+            f"sehr gerne, ich habe Sie fuer {wd} um {hm} Uhr {bereich} eingetragen.{hold_line_sie}. bis dann",
+            f"perfekt, {wd} um {hm} Uhr {bereich} steht fuer Sie.{hold_line_sie}. wir freuen uns",
         ])
+    hold_line_du = (
+        " wir halten den tisch 15 minuten. falls ihr mehr als 15 minuten "
+        "spaeter kommt ruf bitte direkt in der bar an unter 0821 47019035 "
+        "nicht ueber whatsapp und gib uns kurz bescheid dann halten wir ihn euch"
+    )
     return random.choice([
-        f"top, hab euch fuer {wd} um {hm} uhr {bereich} eingetragen. freu mich, bis dann",
-        f"super, {wd} {hm} uhr {bereich} steht fuer euch, bis dann",
-        f"passt, hab euch {wd} um {hm} uhr {bereich} reserviert. bis {wd} dann",
-        f"cool, {wd} um {hm} uhr {bereich} ist eingetragen, freu mich auf euch",
+        f"top, hab euch fuer {wd} um {hm} uhr {bereich} eingetragen.{hold_line_du}. freu mich, bis dann",
+        f"super, {wd} {hm} uhr {bereich} steht fuer euch.{hold_line_du}. bis dann",
+        f"passt, hab euch {wd} um {hm} uhr {bereich} reserviert.{hold_line_du}. bis {wd} dann",
+        f"cool, {wd} um {hm} uhr {bereich} ist eingetragen.{hold_line_du}. freu mich auf euch",
     ])
 
 
