@@ -118,6 +118,14 @@ SKIP_SENDERS = {
         "491627557766",  # Carolin Keller, vendor not guest, Dan replies personally, added 21 Aug 2026
     ).split(",") if s.strip()
 }
+# How long the bot stays quiet in a thread after Dan or a teammate replies to a
+# guest by hand, straight in the WhatsApp or Instagram app. Dan asked for this
+# directly on 31 Aug 2026, when he is actively chatting with someone the bot
+# must not jump in on top of him. Hours, default 3, long enough to cover an
+# active back and forth conversation without permanently silencing a thread if
+# Dan gets pulled away mid conversation and never comes back to it, the bot
+# resumes on its own once this window passes.
+HUMAN_ACTIVE_PAUSE_HOURS = int(os.environ.get("HUMAN_ACTIVE_PAUSE_HOURS", "3"))
 # Ceiling on the in memory webhook dedup set below, so a long running process
 # does not slowly leak memory over months. The set only needs to catch retries
 # within roughly the same delivery window, so clearing it once it gets large is
@@ -183,6 +191,7 @@ TABLES = {
 GRAPH = "https://graph.facebook.com/" + GRAPH_VERSION
 _handled = set()
 _last_msg = {}          # sender -> most recent message id, for debounce
+_human_active_until = {}  # sender -> unix ts until which the bot stays quiet, in memory fallback only
 _conv = {}              # sender -> list of {role, content}, in memory fallback only
 _conv_lock = threading.Lock()
 _UPSTASH_ON = bool(UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN)
@@ -231,6 +240,35 @@ def _upstash(*command):
     except Exception as e:
         logger.error("Upstash %s failed: %s", command[0] if command else "?", e)
         return None
+
+
+def mark_human_active(sender: str):
+    """Called whenever Dan or a teammate replies to a guest by hand, straight in
+    the WhatsApp or Instagram app (a coexistence echo). Pauses the bot's auto
+    replies to this sender for HUMAN_ACTIVE_PAUSE_HOURS, durably via Upstash if
+    configured, so the bot does not jump back in early just because Railway
+    happened to restart mid conversation."""
+    until = time.time() + HUMAN_ACTIVE_PAUSE_HOURS * 3600
+    if _UPSTASH_ON:
+        _upstash("SET", "human_active:" + sender, str(until), "EX", HUMAN_ACTIVE_PAUSE_HOURS * 3600)
+        return
+    _human_active_until[sender] = until
+
+
+def is_human_active(sender: str) -> bool:
+    """True if Dan or a teammate replied to this guest by hand recently enough
+    that the bot should stay quiet rather than jump into a conversation he is
+    already having personally. See mark_human_active above."""
+    if _UPSTASH_ON:
+        raw = _upstash("GET", "human_active:" + sender)
+        if raw is None:
+            return False
+        try:
+            return time.time() < float(raw)
+        except (TypeError, ValueError):
+            return False
+    until = _human_active_until.get(sender)
+    return bool(until and time.time() < until)
 
 
 def conv_append(sender: str, role: str, content: str):
@@ -1017,6 +1055,7 @@ def debug():
         "conv_memory_backend": "upstash" if _UPSTASH_ON else "in_memory_ephemeral",
         "CONV_MAX_TURNS": CONV_MAX_TURNS,
         "SKIP_SENDERS_count": len(SKIP_SENDERS),
+        "HUMAN_ACTIVE_PAUSE_HOURS": HUMAN_ACTIVE_PAUSE_HOURS,
     }
 
 
@@ -1210,6 +1249,9 @@ async def whatsapp_receive(request: Request):
                 if sender in SKIP_SENDERS:
                     logger.info("WhatsApp sender %s is on SKIP_SENDERS, logged only, no auto reply, Dan replies personally", sender)
                     continue
+                if is_human_active(sender):
+                    logger.info("WhatsApp sender %s has Dan actively replying by hand, logged only, no auto reply", sender)
+                    continue
                 _last_msg[sender] = mid
                 threading.Thread(target=handle_later, args=("whatsapp", sender, text, mid), daemon=True).start()
             # Coexistence echo, a reply Dan or a teammate typed by hand straight in the
@@ -1230,6 +1272,7 @@ async def whatsapp_receive(request: Request):
                     continue
                 logger.info("WhatsApp echo (manual reply) to %s: %s", recipient, text[:120])
                 conv_append(recipient, "assistant", text)
+                mark_human_active(recipient)
     return {"received": True}
 
 
@@ -1253,11 +1296,25 @@ async def instagram_receive(request: Request):
             message = event.get("message") or {}
             mid = message.get("mid")
             text = message.get("text", "")
-            if message.get("is_echo") or not text or not mid or _already_handled(mid):
+            if not text or not mid or _already_handled(mid):
+                continue
+            if message.get("is_echo"):
+                # Manual reply Dan or a teammate typed by hand straight in the
+                # Instagram app itself. Same treatment as the WhatsApp echo above,
+                # log it into memory and pause the bot on this thread, see
+                # mark_human_active.
+                recipient = (event.get("recipient") or {}).get("id")
+                if recipient:
+                    logger.info("Instagram echo (manual reply) to %s: %s", recipient, text[:120])
+                    conv_append(recipient, "assistant", text)
+                    mark_human_active(recipient)
                 continue
             sender = event.get("sender", {}).get("id")
             logger.info("Instagram in from %s: %s", sender, text[:120])
             conv_append(sender, "user", text)
+            if is_human_active(sender):
+                logger.info("Instagram sender %s has Dan actively replying by hand, logged only, no auto reply", sender)
+                continue
             _last_msg[sender] = mid
             threading.Thread(target=handle_later, args=("instagram", sender, text, mid), daemon=True).start()
     return {"received": True}
