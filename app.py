@@ -131,6 +131,21 @@ SKIP_SENDERS = {
 # silencing a thread, it still resets every time Dan sends another message
 # and still expires on its own if he genuinely never comes back to it.
 HUMAN_ACTIVE_PAUSE_HOURS = int(os.environ.get("HUMAN_ACTIVE_PAUSE_HOURS", "24"))
+# Stale thread watchdog, added 31 Aug 2026 after a real, quantifiable business
+# loss. Adriana (04.09, 6 people) sent her last message on 25 Aug, the bot
+# said "ich leite das an dan" and never actually called handoff, so nothing
+# ever paged Dan, and by the time the underlying bug was found and fixed on
+# 31 Aug and Dan personally wrote back, six days had passed and she had
+# already made other plans, a booking lost outright. The two prompt/code
+# fixes made the same day close THIS specific failure shape, but Dan's ask
+# was broader than one bug, "we cant have this happen," meaning no single
+# guest message should ever be able to sit unanswered for days again,
+# regardless of why, a model mistake nobody anticipated yet, an API outage,
+# a human pause that outlived the guest's patience, anything. This is the
+# general safety net under all of the specific fixes, not a replacement for
+# them. See run_stale_thread_watchdog below for exactly what it checks.
+STALE_THREAD_SLA_HOURS = int(os.environ.get("STALE_THREAD_SLA_HOURS", "6"))
+STALE_THREAD_CHECK_INTERVAL_SECONDS = int(os.environ.get("STALE_THREAD_CHECK_INTERVAL_SECONDS", str(30 * 60)))
 # Ceiling on the in memory webhook dedup set below, so a long running process
 # does not slowly leak memory over months. The set only needs to catch retries
 # within roughly the same delivery window, so clearing it once it gets large is
@@ -214,6 +229,8 @@ _last_msg = {}          # sender -> most recent message id, for debounce
 _human_active_until = {}  # sender -> unix ts until which the bot stays quiet, in memory fallback only
 _conv = {}              # sender -> list of {role, content}, in memory fallback only
 _conv_lock = threading.Lock()
+_conv_active_senders_local = set()  # every sender conv_append has ever touched, in memory fallback only
+_stale_alerted_local = {}           # sender -> unix ts of the last stale thread alert, in memory fallback only
 _UPSTASH_ON = bool(UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN)
 # Serializes the check then book sequence across every channel and every guest.
 # Without this, two guests messaging around the same moment could both pass the
@@ -293,17 +310,29 @@ def is_human_active(sender: str) -> bool:
 
 def conv_append(sender: str, role: str, content: str):
     """Record one turn of a guest thread, durably if Upstash is configured,
-    otherwise in this process's memory only (wiped on next restart)."""
+    otherwise in this process's memory only (wiped on next restart). Every
+    turn now also carries a timestamp and registers the sender in a tracked
+    set, both added 31 Aug 2026 so run_stale_thread_watchdog (below) can find
+    a real guest message that never got answered by anyone, bot or human,
+    see the block comment on that function for why this exists. A reply
+    turn (role assistant) also clears any earlier stale alert for this
+    sender, since someone has now clearly answered."""
+    entry = {"role": role, "content": content, "ts": time.time()}
     if _UPSTASH_ON:
         key = "conv:" + sender
-        entry = json.dumps({"role": role, "content": content})
-        _upstash("RPUSH", key, entry)
+        _upstash("RPUSH", key, json.dumps(entry))
         _upstash("LTRIM", key, -CONV_MAX_TURNS, -1)
+        _upstash("SADD", "conv_active_senders", sender)
+        if role == "assistant":
+            _upstash("DEL", "stale_alerted:" + sender)
         return
     with _conv_lock:
         h = _conv.setdefault(sender, [])
-        h.append({"role": role, "content": content})
+        h.append(entry)
         del h[:-CONV_MAX_TURNS]
+    _conv_active_senders_local.add(sender)
+    if role == "assistant":
+        _stale_alerted_local.pop(sender, None)
 
 
 def conv_history(sender: str):
@@ -323,6 +352,75 @@ def conv_history(sender: str):
         return out
     with _conv_lock:
         return list(_conv.get(sender, []))
+
+
+def _conv_active_senders():
+    if _UPSTASH_ON:
+        return _upstash("SMEMBERS", "conv_active_senders") or []
+    return list(_conv_active_senders_local)
+
+
+def run_stale_thread_watchdog():
+    """The general safety net behind Dan's "we cant have this happen" after
+    the Adriana loss, see the block comment on STALE_THREAD_SLA_HOURS above.
+    Checks every tracked sender's conv history, if the LAST turn is still
+    role user (nobody, bot or Dan, has said anything back since) and it has
+    sat there longer than STALE_THREAD_SLA_HOURS, alerts Dan once. This
+    naturally covers every real failure shape without needing to predict
+    each one: a genuine reply that silently never sent, a handoff Dan has
+    not gotten to yet, a SKIP_SENDERS or human-active pause where Dan meant
+    to answer personally and it slipped his mind, all of it looks the same
+    from here, an unanswered user turn sitting too long. A real SKIP
+    (spam/marketing) is deliberately marked resolved right where it is
+    classified in handle()/handle_email() (an empty assistant turn) so it
+    never falsely trips this, that is the one case where silence is
+    correct by design. Runs on the same periodic loop pattern as the other
+    background jobs in this file, alerts once per staleness via
+    stale_alerted, which clears automatically the moment anyone actually
+    replies, see conv_append above."""
+    now = time.time()
+    for sender in _conv_active_senders():
+        try:
+            history = conv_history(sender)
+            if not history:
+                continue
+            last = history[-1]
+            if last.get("role") != "user":
+                continue
+            ts = last.get("ts")
+            if not ts:
+                continue  # entry predates this field, cannot judge age, skip rather than guess
+            age_h = (now - float(ts)) / 3600
+            if age_h < STALE_THREAD_SLA_HOURS:
+                continue
+            if _UPSTASH_ON:
+                if _upstash("GET", "stale_alerted:" + sender):
+                    continue
+            elif sender in _stale_alerted_local:
+                continue
+            channel_guess = "email" if sender.startswith("email:") else "whatsapp"
+            alert_dan(
+                "a guest message has gone unanswered past the SLA, please check this thread yourself",
+                channel_guess, sender, last.get("content", ""),
+                f"No reply from us in about {age_h:.1f} hours. Could be a real bug, a handoff you "
+                f"have not gotten to yet, or a paused thread that slipped your mind, this needs your "
+                f"eyes regardless of which.",
+            )
+            if _UPSTASH_ON:
+                _upstash("SET", "stale_alerted:" + sender, "1", "EX", 7 * 24 * 3600)
+            else:
+                _stale_alerted_local[sender] = now
+        except Exception as e:
+            logger.error("run_stale_thread_watchdog failed for %s: %s", sender, e)
+
+
+def stale_thread_watchdog_loop():
+    while True:
+        try:
+            run_stale_thread_watchdog()
+        except Exception as e:
+            logger.error("stale_thread_watchdog_loop error: %s", e)
+        time.sleep(STALE_THREAD_CHECK_INTERVAL_SECONDS)
 
 
 def bar_time_context():
@@ -1359,6 +1457,8 @@ def debug():
         "PENDING_HOLD_CHASE_AFTER_HOURS": PENDING_HOLD_CHASE_AFTER_HOURS,
         "PENDING_HOLD_ESCALATE_AFTER_HOURS": PENDING_HOLD_ESCALATE_AFTER_HOURS,
         "pending_holds_open": len(_pending_hold_all_senders()),
+        "STALE_THREAD_SLA_HOURS": STALE_THREAD_SLA_HOURS,
+        "conv_tracked_senders": len(_conv_active_senders()),
     }
 
 
@@ -1498,6 +1598,9 @@ def _startup_subscribe():
         threading.Thread(target=pending_hold_followup_loop, daemon=True).start()
     else:
         logger.info("Startup: pending hold follow up loop off (booking/calendar not configured)")
+    logger.info("Startup: starting stale thread watchdog every %s s, SLA %s h",
+                STALE_THREAD_CHECK_INTERVAL_SECONDS, STALE_THREAD_SLA_HOURS)
+    threading.Thread(target=stale_thread_watchdog_loop, daemon=True).start()
 
 
 def challenge(request: Request):
@@ -1684,6 +1787,9 @@ def handle(channel: str, sender: str, text: str):
     elif action == "skip":
         logger.info("Classified as spam/non guest, no reply to sender, FYI to Dan")
         notify_dan_skip(channel, sender, text)
+        # Marks this turn resolved for run_stale_thread_watchdog, silence here
+        # is correct by design, this must never look like an unanswered guest.
+        conv_append(sender, "assistant", "")
         return
     elif action == "handoff":
         # Always silent to the guest now, including a just-qualified GROUPS
@@ -2270,6 +2376,9 @@ def handle_email(svc, msg_id):
     elif action == "skip":
         logger.info("email classified spam/non guest, no reply to sender, FYI to Dan, from %s", from_addr)
         notify_dan_skip("email", from_addr, text)
+        # Marks this turn resolved for run_stale_thread_watchdog, silence here
+        # is correct by design, this must never look like an unanswered guest.
+        conv_append(sender_key, "assistant", "")
         mark_handled()
         return
     elif action == "handoff":
@@ -2359,6 +2468,47 @@ def poll_email_route():
     try:
         n = poll_gmail_once()
         return {"ok": True, "looked_at": n}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/backfill_conv_active_senders")
+def backfill_conv_active_senders_route():
+    """One time migration, run once after this feature first deploys. The
+    conv_active_senders set only starts filling in from new conv_append
+    calls going forward, so every conv:* thread that already existed before
+    today would be invisible to the watchdog until its next message. This
+    finds every existing conv:* key via Upstash KEYS (fine for a dataset
+    this small, would not scale to a large multi tenant deployment) and
+    registers each one, so the watchdog can immediately catch whatever was
+    already stale, not just new staleness from today onward. Safe to call
+    again later, SADD is idempotent."""
+    if not _UPSTASH_ON:
+        return {"error": "Upstash not configured, nothing to backfill, in memory senders are already tracked live"}
+    try:
+        keys = _upstash("KEYS", "conv:*") or []
+        added = 0
+        for k in keys:
+            sender = k[len("conv:"):]
+            if sender:
+                _upstash("SADD", "conv_active_senders", sender)
+                added += 1
+        return {"ok": True, "found": len(keys), "registered": added}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/run_stale_thread_watchdog")
+def run_stale_thread_watchdog_route():
+    """Force one stale thread sweep right now instead of waiting for the next
+    STALE_THREAD_CHECK_INTERVAL_SECONDS tick, safe to open in a browser any
+    time, this only reads conv history and alerts Dan, it never sends
+    anything to a guest. Useful right after deploying this feature to
+    confirm it actually catches whatever is genuinely stale today."""
+    try:
+        before = len(_conv_active_senders())
+        run_stale_thread_watchdog()
+        return {"ok": True, "tracked_senders": before}
     except Exception as e:
         return {"error": str(e)}
 
