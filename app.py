@@ -121,11 +121,16 @@ SKIP_SENDERS = {
 # How long the bot stays quiet in a thread after Dan or a teammate replies to a
 # guest by hand, straight in the WhatsApp or Instagram app. Dan asked for this
 # directly on 31 Aug 2026, when he is actively chatting with someone the bot
-# must not jump in on top of him. Hours, default 3, long enough to cover an
-# active back and forth conversation without permanently silencing a thread if
-# Dan gets pulled away mid conversation and never comes back to it, the bot
-# resumes on its own once this window passes.
-HUMAN_ACTIVE_PAUSE_HOURS = int(os.environ.get("HUMAN_ACTIVE_PAUSE_HOURS", "3"))
+# must not jump in on top of him. Originally defaulted to 3 hours, raised to
+# 24 the same day after it actually failed in practice, a real thread with
+# Michael, Dan sent a message by hand at 16:06, Michael replied at 19:57
+# (3h51m later, a completely normal pace for someone checking WhatsApp once
+# that evening), the 3 hour window had already expired by then so the bot
+# auto replied in a conversation Dan was still personally having. 24 hours
+# covers a realistic same day back and forth pace without permanently
+# silencing a thread, it still resets every time Dan sends another message
+# and still expires on its own if he genuinely never comes back to it.
+HUMAN_ACTIVE_PAUSE_HOURS = int(os.environ.get("HUMAN_ACTIVE_PAUSE_HOURS", "24"))
 # Ceiling on the in memory webhook dedup set below, so a long running process
 # does not slowly leak memory over months. The set only needs to catch retries
 # within roughly the same delivery window, so clearing it once it gets large is
