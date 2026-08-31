@@ -510,47 +510,119 @@ def _seat_new_party(existing_parties, new_party, tables):
     return new_table
 
 
-# TENTATIVE HOLD, added 31 Aug 2026. Dan caught a real gap, a guest (Jan, a
-# 20.11 birthday inquiry) was told "der 20.11. bleibt bis dahin fuer dich
-# blockiert" but GROUPS AND EVENTS never auto books anything, only a real
-# HANDOFF does, and this inquiry never reached one before he backed out days
-# later. Checked the calendar directly, confirmed nothing was ever there. The
-# promise was just a sentence, not backed by anything, and if he had come back
-# weeks later there would have been zero trace of the conversation anywhere Dan
-# could see. This creates a clearly marked, not yet confirmed placeholder the
-# moment the bot has a date and a rough headcount for an event inquiry, kept in
-# sync with an Upstash (or in memory fallback) sender -> event id map so a
-# later turn updates the same placeholder instead of creating duplicates.
-# Never a real booking, Dan still closes every event personally, this only
-# makes an open inquiry visible so two guests are never both told the same
-# date is theirs, and so a stale inquiry does not just vanish without a trace.
-_pending_hold_local = {}  # sender -> event id, in memory fallback only
+# TENTATIVE HOLD, added 31 Aug 2026, extended same day. Dan caught a real gap,
+# a guest (Jan, a 20.11 birthday inquiry) was told "der 20.11. bleibt bis dahin
+# fuer dich blockiert" but GROUPS AND EVENTS never auto books anything, only a
+# real HANDOFF does, and this inquiry never reached one before he backed out
+# days later. Checked the calendar directly, confirmed nothing was ever there.
+# The promise was just a sentence, not backed by anything, and if he had come
+# back weeks later there would have been zero trace of the conversation
+# anywhere Dan could see. This creates a clearly marked, not yet confirmed
+# placeholder the moment the bot has a date and a rough headcount for an event
+# inquiry. Dan then asked for three more things the same day, all built here.
+# One, a placeholder is only ever created when the sender is a real WhatsApp
+# phone number, never for Instagram, Messenger, or email inquiries, since the
+# whole point is Dan or the bot being able to actually reach that guest again,
+# a placeholder nobody can call or message back is worse than none. Two, if a
+# second inquiry comes in for a date that already has someone else's tentative
+# hold, Dan gets alerted about the collision so he can decide whether to chase
+# the first guest, never something the bot volunteers to the second guest,
+# that would leak one guest's private inquiry to a stranger. Three, a hold
+# that goes quiet gets a single gentle WhatsApp nudge after
+# PENDING_HOLD_CHASE_AFTER_HOURS, and if that also goes unanswered Dan gets
+# alerted once after PENDING_HOLD_ESCALATE_AFTER_HOURS more so a date is never
+# just sat on indefinitely for a guest who vanished. Storage is a small JSON
+# record per sender (event id, created timestamp, whether nudged, whether
+# escalated) kept in Upstash when configured, with an in memory fallback like
+# every other piece of state in this file, plus a set of every sender with an
+# open hold so the periodic chase job can find them all without scanning the
+# whole calendar. Never a real booking, Dan still closes every event
+# personally, all of this is best effort, any failure here is logged and
+# swallowed, it must never block the guest's actual reply from going out.
+PENDING_HOLD_CHASE_AFTER_HOURS = int(os.environ.get("PENDING_HOLD_CHASE_AFTER_HOURS", "48"))
+PENDING_HOLD_ESCALATE_AFTER_HOURS = int(os.environ.get("PENDING_HOLD_ESCALATE_AFTER_HOURS", "48"))
+PENDING_HOLD_CHECK_INTERVAL_SECONDS = int(os.environ.get("PENDING_HOLD_CHECK_INTERVAL_SECONDS", str(3 * 3600)))
+_pending_hold_local = {}       # sender -> record dict, in memory fallback only
+_pending_hold_local_all = set()  # senders with an open hold, in memory fallback only
+_WHATSAPP_NUMBER_RE = re.compile(r"^\d{8,15}$")
+
+
+def _is_whatsapp_number(sender: str) -> bool:
+    """True only for a plain WhatsApp phone number, digits only, the same
+    shape as SKIP_SENDERS and DAN_ALERT_WHATSAPP use. False for an Instagram
+    or Messenger scoped id, or an email: prefixed sender key."""
+    return bool(_WHATSAPP_NUMBER_RE.match(sender or ""))
 
 
 def _pending_hold_get(sender: str):
     if _UPSTASH_ON:
-        return _upstash("GET", "pending_hold:" + sender)
+        raw = _upstash("GET", "pending_hold:" + sender)
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except Exception:
+            return None
     return _pending_hold_local.get(sender)
 
 
-def _pending_hold_set(sender: str, event_id: str):
+def _pending_hold_set(sender: str, record: dict):
     if _UPSTASH_ON:
-        _upstash("SET", "pending_hold:" + sender, event_id)
+        _upstash("SET", "pending_hold:" + sender, json.dumps(record))
+        _upstash("SADD", "pending_holds_all", sender)
         return
-    _pending_hold_local[sender] = event_id
+    _pending_hold_local[sender] = record
+    _pending_hold_local_all.add(sender)
 
 
 def _pending_hold_clear(sender: str):
     if _UPSTASH_ON:
         _upstash("DEL", "pending_hold:" + sender)
+        _upstash("SREM", "pending_holds_all", sender)
         return
     _pending_hold_local.pop(sender, None)
+    _pending_hold_local_all.discard(sender)
+
+
+def _pending_hold_all_senders():
+    if _UPSTASH_ON:
+        return _upstash("SMEMBERS", "pending_holds_all") or []
+    return list(_pending_hold_local_all)
+
+
+def _find_other_tentative_hold(svc, date_iso: str, exclude_sender: str):
+    """Any OTHER sender's tentative placeholder already on this date, so a
+    second inquiry for the same date can trigger a Dan alert instead of
+    silently sitting alongside it unnoticed. Returns the event dict or None."""
+    try:
+        lo = datetime.fromisoformat(date_iso).replace(tzinfo=BAR_TZ, hour=0, minute=0, second=0, microsecond=0)
+        hi = lo + timedelta(days=1)
+        items = svc.events().list(
+            calendarId=RESERVIERUNGEN_CALENDAR_ID,
+            timeMin=lo.isoformat(), timeMax=hi.isoformat(),
+            singleEvents=True,
+        ).execute().get("items", [])
+        for ev in items:
+            desc = ev.get("description", "") or ""
+            if "noch nicht bestaetigt" not in desc.lower():
+                continue
+            m = re.search(r"WhatsApp\s+(\d+)", desc)
+            if m and m.group(1) != exclude_sender:
+                return ev
+        return None
+    except Exception as e:
+        logger.warning("Collision check failed for %s: %s", date_iso, e)
+        return None
 
 
 def upsert_pending_hold(sender: str, name: str, party: int, date_iso: str, occasion: str = ""):
     """Create or refresh the tentative placeholder for one guest's open event
     inquiry. Best effort by design, any failure here is logged and swallowed,
-    this must never block the guest's actual reply from going out."""
+    this must never block the guest's actual reply from going out. Only ever
+    acts for a real WhatsApp phone number, see the block comment above."""
+    if not _is_whatsapp_number(sender):
+        logger.info("Skipping tentative hold for %s, not a WhatsApp phone number, cannot reliably reach them again", sender)
+        return
     if not (BOOKING_ENABLED and GOOGLE_REFRESH_TOKEN and RESERVIERUNGEN_CALENDAR_ID):
         return
     try:
@@ -573,17 +645,31 @@ def upsert_pending_hold(sender: str, name: str, party: int, date_iso: str, occas
             "start": {"date": date_iso},
             "end": {"date": date_iso},
         }
-        existing_id = _pending_hold_get(sender)
-        if existing_id:
+        existing = _pending_hold_get(sender)
+        now = time.time()
+        if existing and existing.get("event_id"):
             try:
-                svc.events().update(calendarId=RESERVIERUNGEN_CALENDAR_ID, eventId=existing_id, body=body).execute()
+                svc.events().update(calendarId=RESERVIERUNGEN_CALENDAR_ID, eventId=existing["event_id"], body=body).execute()
+                # Fresh detail from the guest resets the staleness clock and
+                # any earlier nudge, they are clearly still engaged right now.
+                existing.update({"ts": now, "date": date_iso, "nudged_at": None, "escalated": False})
+                _pending_hold_set(sender, existing)
                 logger.info("Pending hold updated for %s: %s", sender, summary)
                 return
             except Exception as e:
                 logger.warning("Pending hold update failed for %s (id %s), creating a new one instead: %s",
-                                sender, existing_id, e)
+                                sender, existing.get("event_id"), e)
+        collision = _find_other_tentative_hold(svc, date_iso, sender)
+        if collision:
+            alert_dan(
+                "two event inquiries for the same date, decide who gets it",
+                "whatsapp", sender,
+                f"New inquiry from {sender} for {date_iso}, but this date already has a tentative "
+                f"hold: \"{collision.get('summary', '')}\". Worth reaching out to the first guest to "
+                f"ask if they have decided before this one goes further.",
+            )
         ev = svc.events().insert(calendarId=RESERVIERUNGEN_CALENDAR_ID, body=body).execute()
-        _pending_hold_set(sender, ev.get("id"))
+        _pending_hold_set(sender, {"event_id": ev.get("id"), "date": date_iso, "ts": now, "nudged_at": None, "escalated": False})
         logger.info("Pending hold created for %s: %s", sender, summary)
     except Exception as e:
         logger.error("upsert_pending_hold failed for %s: %s", sender, e)
@@ -594,18 +680,73 @@ def remove_pending_hold(sender: str):
     backs out of an inquiry that never reached a real handoff. Safe to do
     automatically, this was only ever the bot's own not yet confirmed marker,
     never a real booking, those stay Daniel only to remove."""
-    existing_id = _pending_hold_get(sender)
-    if not existing_id:
+    existing = _pending_hold_get(sender)
+    if not existing or not existing.get("event_id"):
         return
     if not (BOOKING_ENABLED and GOOGLE_REFRESH_TOKEN and RESERVIERUNGEN_CALENDAR_ID):
         return
     try:
         svc = _calendar_service()
-        svc.events().delete(calendarId=RESERVIERUNGEN_CALENDAR_ID, eventId=existing_id).execute()
+        svc.events().delete(calendarId=RESERVIERUNGEN_CALENDAR_ID, eventId=existing["event_id"]).execute()
         logger.info("Pending hold removed for %s", sender)
     except Exception as e:
-        logger.warning("Pending hold delete failed for %s (id %s): %s", sender, existing_id, e)
+        logger.warning("Pending hold delete failed for %s (id %s): %s", sender, existing.get("event_id"), e)
     _pending_hold_clear(sender)
+
+
+_PENDING_HOLD_NUDGES = [
+    "Hey, kurze Frage von uns, konntet ihr euch schon entscheiden wegen dem Termin bei uns? Falls ihr noch ueberlegt ist das voellig ok, wollten nur kurz nachhaken.",
+    "Hallo nochmal, wollten nur kurz nachfragen ob es bei euch schon was Neues gibt zu eurer Feier bei uns. Meld dich einfach wenn du mehr weisst.",
+    "Hey, kurzer Reminder von uns, falls ihr euch schon entschieden habt wegen dem Datum sag gerne kurz Bescheid, sonst ist auch alles gut.",
+]
+
+
+def run_pending_hold_followups():
+    """Runs periodically, see pending_hold_followup_loop below. Nudges a guest
+    once if their tentative hold has gone quiet, then alerts Dan once if that
+    nudge also goes unanswered, so a date is never just sat on forever for a
+    guest who went silent. Respects SKIP_SENDERS and is_human_active exactly
+    like every other outbound message in this file."""
+    now = time.time()
+    for sender in _pending_hold_all_senders():
+        try:
+            record = _pending_hold_get(sender)
+            if not record:
+                continue
+            age_h = (now - float(record.get("ts", now))) / 3600
+            if sender in SKIP_SENDERS or is_human_active(sender):
+                continue
+            if not record.get("nudged_at") and age_h >= PENDING_HOLD_CHASE_AFTER_HOURS:
+                msg = random.choice(_PENDING_HOLD_NUDGES)
+                if send_whatsapp(sender, msg):
+                    conv_append(sender, "assistant", msg)
+                    record["nudged_at"] = now
+                    _pending_hold_set(sender, record)
+                    logger.info("Pending hold nudge sent to %s", sender)
+                continue
+            nudged_at = record.get("nudged_at")
+            if nudged_at and not record.get("escalated"):
+                since_nudge_h = (now - float(nudged_at)) / 3600
+                if since_nudge_h >= PENDING_HOLD_ESCALATE_AFTER_HOURS:
+                    alert_dan(
+                        "tentative event hold has gone quiet even after a follow up",
+                        "whatsapp", sender,
+                        f"Date {record.get('date')}, no response since the reminder, your call whether "
+                        f"to keep holding it or free it up for someone else.",
+                    )
+                    record["escalated"] = True
+                    _pending_hold_set(sender, record)
+        except Exception as e:
+            logger.error("run_pending_hold_followups failed for %s: %s", sender, e)
+
+
+def pending_hold_followup_loop():
+    while True:
+        try:
+            run_pending_hold_followups()
+        except Exception as e:
+            logger.error("pending_hold_followup_loop error: %s", e)
+        time.sleep(PENDING_HOLD_CHECK_INTERVAL_SECONDS)
 
 
 def find_free_table(date_iso: str, start_dt: datetime, party: int, area: str):
@@ -1204,6 +1345,9 @@ def debug():
         "CONV_MAX_TURNS": CONV_MAX_TURNS,
         "SKIP_SENDERS_count": len(SKIP_SENDERS),
         "HUMAN_ACTIVE_PAUSE_HOURS": HUMAN_ACTIVE_PAUSE_HOURS,
+        "PENDING_HOLD_CHASE_AFTER_HOURS": PENDING_HOLD_CHASE_AFTER_HOURS,
+        "PENDING_HOLD_ESCALATE_AFTER_HOURS": PENDING_HOLD_ESCALATE_AFTER_HOURS,
+        "pending_holds_open": len(_pending_hold_all_senders()),
     }
 
 
@@ -1338,6 +1482,11 @@ def _startup_subscribe():
         threading.Thread(target=poll_gmail_loop, daemon=True).start()
     else:
         logger.info("Startup: Gmail lane off (no GMAIL_REFRESH_TOKEN or EMAIL_ENABLED false)")
+    if BOOKING_ENABLED and GOOGLE_REFRESH_TOKEN and RESERVIERUNGEN_CALENDAR_ID:
+        logger.info("Startup: starting pending hold follow up loop every %s s", PENDING_HOLD_CHECK_INTERVAL_SECONDS)
+        threading.Thread(target=pending_hold_followup_loop, daemon=True).start()
+    else:
+        logger.info("Startup: pending hold follow up loop off (booking/calendar not configured)")
 
 
 def challenge(request: Request):
