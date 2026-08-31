@@ -176,6 +176,21 @@ EMAIL_HANDLED_LABEL = os.environ.get("EMAIL_HANDLED_LABEL", "Concierge-Beantwort
 _EMAIL_START_MS = int(time.time() * 1000)
 _gmail_label_cache = {}
 
+# Post visit check in. A warm, no strings attached WhatsApp follow up the day
+# after a bot booked table reservation, added 31 Aug 2026 at Dan's request.
+# Deliberately NOT a review ask, see [[project_brunnenbar_cloud_concierge]],
+# Google's April 2026 Maps policy update bans conditioning a review request on
+# expected sentiment (review gating), so this stays a plain relationship touch,
+# any review growth has to come from a separate, identically worded ask sent to
+# everyone, not built yet. Runs once a day as a background loop, same pattern
+# as the Gmail poll loop, looking at bot booked reservations (never Dan's own
+# manual GROUPS AND EVENTS bookings, those already get his personal follow up)
+# from the previous calendar day, Europe/Berlin. Only sends where the stored
+# contact is a clean WhatsApp phone number, respects SKIP_SENDERS and
+# is_human_active exactly like every other outbound message in this file.
+POST_VISIT_CHECKIN_ENABLED = os.environ.get("POST_VISIT_CHECKIN_ENABLED", "true").lower() == "true"
+POST_VISIT_CHECKIN_HOUR = int(os.environ.get("POST_VISIT_CHECKIN_HOUR", "11"))
+
 # The bookable tables from the floor plan, name maps to seats and area. Outside
 # is the 3XX tables, inside is the real tables. Bar stools and single seats are
 # left for walk ins. Edit this to change what the bot can book.
@@ -495,6 +510,104 @@ def _seat_new_party(existing_parties, new_party, tables):
     return new_table
 
 
+# TENTATIVE HOLD, added 31 Aug 2026. Dan caught a real gap, a guest (Jan, a
+# 20.11 birthday inquiry) was told "der 20.11. bleibt bis dahin fuer dich
+# blockiert" but GROUPS AND EVENTS never auto books anything, only a real
+# HANDOFF does, and this inquiry never reached one before he backed out days
+# later. Checked the calendar directly, confirmed nothing was ever there. The
+# promise was just a sentence, not backed by anything, and if he had come back
+# weeks later there would have been zero trace of the conversation anywhere Dan
+# could see. This creates a clearly marked, not yet confirmed placeholder the
+# moment the bot has a date and a rough headcount for an event inquiry, kept in
+# sync with an Upstash (or in memory fallback) sender -> event id map so a
+# later turn updates the same placeholder instead of creating duplicates.
+# Never a real booking, Dan still closes every event personally, this only
+# makes an open inquiry visible so two guests are never both told the same
+# date is theirs, and so a stale inquiry does not just vanish without a trace.
+_pending_hold_local = {}  # sender -> event id, in memory fallback only
+
+
+def _pending_hold_get(sender: str):
+    if _UPSTASH_ON:
+        return _upstash("GET", "pending_hold:" + sender)
+    return _pending_hold_local.get(sender)
+
+
+def _pending_hold_set(sender: str, event_id: str):
+    if _UPSTASH_ON:
+        _upstash("SET", "pending_hold:" + sender, event_id)
+        return
+    _pending_hold_local[sender] = event_id
+
+
+def _pending_hold_clear(sender: str):
+    if _UPSTASH_ON:
+        _upstash("DEL", "pending_hold:" + sender)
+        return
+    _pending_hold_local.pop(sender, None)
+
+
+def upsert_pending_hold(sender: str, name: str, party: int, date_iso: str, occasion: str = ""):
+    """Create or refresh the tentative placeholder for one guest's open event
+    inquiry. Best effort by design, any failure here is logged and swallowed,
+    this must never block the guest's actual reply from going out."""
+    if not (BOOKING_ENABLED and GOOGLE_REFRESH_TOKEN and RESERVIERUNGEN_CALENDAR_ID):
+        return
+    try:
+        svc = _calendar_service()
+        anlass = occasion or "Feier"
+        summary = f"{name} - ca {party} Personen - {anlass} - ANFRAGE (noch nicht bestaetigt)"
+        desc = (
+            f"Name: {name}\n"
+            f"Telefon/Contact: WhatsApp {sender}\n"
+            f"Ungefaehre Personenzahl: {party}\n"
+            f"Anlass: {anlass}\n"
+            f"Status: Anfrage laeuft, noch NICHT bestaetigt. Automatisch vom Concierge als "
+            f"Platzhalter angelegt sobald Datum und ungefaehre Personenzahl bekannt waren. "
+            f"Bitte final bestaetigen sobald Dan die Anfrage abschliesst, oder loeschen falls "
+            f"sie nicht zustande kommt."
+        )
+        body = {
+            "summary": summary,
+            "description": desc,
+            "start": {"date": date_iso},
+            "end": {"date": date_iso},
+        }
+        existing_id = _pending_hold_get(sender)
+        if existing_id:
+            try:
+                svc.events().update(calendarId=RESERVIERUNGEN_CALENDAR_ID, eventId=existing_id, body=body).execute()
+                logger.info("Pending hold updated for %s: %s", sender, summary)
+                return
+            except Exception as e:
+                logger.warning("Pending hold update failed for %s (id %s), creating a new one instead: %s",
+                                sender, existing_id, e)
+        ev = svc.events().insert(calendarId=RESERVIERUNGEN_CALENDAR_ID, body=body).execute()
+        _pending_hold_set(sender, ev.get("id"))
+        logger.info("Pending hold created for %s: %s", sender, summary)
+    except Exception as e:
+        logger.error("upsert_pending_hold failed for %s: %s", sender, e)
+
+
+def remove_pending_hold(sender: str):
+    """Delete a bot created tentative placeholder once a guest explicitly
+    backs out of an inquiry that never reached a real handoff. Safe to do
+    automatically, this was only ever the bot's own not yet confirmed marker,
+    never a real booking, those stay Daniel only to remove."""
+    existing_id = _pending_hold_get(sender)
+    if not existing_id:
+        return
+    if not (BOOKING_ENABLED and GOOGLE_REFRESH_TOKEN and RESERVIERUNGEN_CALENDAR_ID):
+        return
+    try:
+        svc = _calendar_service()
+        svc.events().delete(calendarId=RESERVIERUNGEN_CALENDAR_ID, eventId=existing_id).execute()
+        logger.info("Pending hold removed for %s", sender)
+    except Exception as e:
+        logger.warning("Pending hold delete failed for %s (id %s): %s", sender, existing_id, e)
+    _pending_hold_clear(sender)
+
+
 def find_free_table(date_iso: str, start_dt: datetime, party: int, area: str):
     """The table the new party would get in the requested area and 3 hour turn,
     or None if the area cannot seat everyone, so it never overbooks. The turn is
@@ -508,7 +621,7 @@ def find_free_table(date_iso: str, start_dt: datetime, party: int, area: str):
     return _seat_new_party(overlapping, party, _area_tables(area))
 
 
-def create_reservation(name, contact, party, area, start_dt, occasion, table, note=""):
+def create_reservation(name, contact, party, area, start_dt, occasion, table, lang="de", note=""):
     svc = _calendar_service()
     end_dt = start_dt + timedelta(hours=TURN_HOURS)
     anlass = occasion or "Schöner Abend"
@@ -523,6 +636,7 @@ def create_reservation(name, contact, party, area, start_dt, occasion, table, no
         f"Anzahl Personen: {party}\n"
         f"Besonderer Anlass: {anlass}\n"
         f"Reservierter Bereich: {area}\n"
+        f"Sprache: {lang}\n"
         f"Zahlung: keine Info\n"
         f"Musik: keine Info\n"
         f"Essen: keine Info\n"
@@ -680,7 +794,7 @@ If the newest message is only a brief acknowledgement or a closing remark and is
 If it is spam, a cold sales pitch, a marketing, collaboration, press, sponsoring or supplier message, or an automated delivery or app notification, call send_reply action skip, no message needed. This is just noise, Dan does not need to be paged for it.
 If a message is clearly not about the bar at all but is still written by a real person with a real need, for example a staff member asking about their pay, hours, or a schedule, or anything that reads like an internal or business matter rather than a guest one, this is NOT spam and must never be action skip, a real person is waiting on an answer. Treat it exactly like a policy question, call send_reply action handoff with reason set to a short reason, for example staff member asking about May pay, so Dan actually sees it and can follow up, most likely outside this channel.
 If it is a real guest asking about prices or Mindestumsatz beyond the guidance here, or a real policy question you are genuinely unsure about, do not guess and do not go silent. Call send_reply action handoff with reason set to a short few word reason for Dan in English, for example asking exact Mindestumsatz for a 40 person event. But do NOT use handoff just because a guest is being casual or off topic, only for a real question you cannot safely answer yourself.
-If a guest wants to cancel an existing reservation or event outright, do not leave them hanging with silence, acknowledge it briefly the way Dan would. Call send_reply action cancel_request, message set to one short sentence, for example alles gut und danke fuers Bescheid geben, bis zum naechsten mal. Do NOT explain that you will handle it or take care of it, Dan does not narrate next steps in a short acknowledgment like this, just close it out warmly and briefly. You still cannot actually remove anything from the calendar yourself, there is no tool for it, Dan does that after seeing the alert, so keep the message brief and generic, never invent details about the booking you were not told. Only use cancel_request for something that was actually confirmed or booked, a real table or an event Dan already handed an Angebot for. If a GROUPS AND EVENTS inquiry is still mid conversation and the guest backs out before it ever qualified or reached a handoff, for example still deciding on an area, or checking with their group, nothing was ever booked and there is nothing on any calendar for Dan to remove, that is a plain reply, not cancel_request, still warm and brief, something like alles gut und danke fuers Bescheid geben, vielleicht ein andermal, just without alerting Dan about a cancellation that was never real.
+If a guest wants to cancel an existing reservation or event outright, do not leave them hanging with silence, acknowledge it briefly the way Dan would. Call send_reply action cancel_request, message set to one short sentence, for example alles gut und danke fuers Bescheid geben, bis zum naechsten mal. Do NOT explain that you will handle it or take care of it, Dan does not narrate next steps in a short acknowledgment like this, just close it out warmly and briefly. You still cannot actually remove anything from the calendar yourself, there is no tool for it, Dan does that after seeing the alert, so keep the message brief and generic, never invent details about the booking you were not told. Only use cancel_request for something that was actually confirmed or booked, a real table or an event Dan already handed an Angebot for. If a GROUPS AND EVENTS inquiry is still mid conversation and the guest backs out before it ever qualified or reached a handoff, for example still deciding on an area, or checking with their group, or telling you plans changed and it will not happen, nothing was ever a real confirmed booking and there is nothing for Dan to personally remove, that is a plain reply, not cancel_request, still warm and brief, something like alles gut und danke fuers Bescheid geben, vielleicht ein andermal, just without alerting Dan about a cancellation that was never real. If this thread ever had a date and headcount known for that inquiry, it very likely has a TENTATIVE HOLD placeholder on the calendar from earlier in the conversation, set release_event_hold to true in this same reply so that placeholder actually gets removed, it was only ever the bot's own not yet confirmed marker, safe to clear automatically, unlike a real booking this needs no Dan approval to take down.
 If a guest wants to move or reschedule an existing reservation or event to a different time or date, that is a handoff, exactly like a policy question, reason set to reschedule request, since that needs Dan to actually check real availability for the new time, not something to promise on your own.
 If a guest directly asks to speak to a real person, to Dan, or says something like this is not helping, that is also a handoff, reason set to guest wants to speak to a person.
 If a message suggests someone is in immediate danger right now, a medical emergency, a fire, or a fight, do not try to help conversationally. Call send_reply action escalate_emergency, message set to a clear simple line telling them to call 112 right now, or the bar directly at 0821 47019035, nothing else, no small talk.
@@ -719,6 +833,8 @@ GROUPS AND EVENTS, seven people or more, or any birthday, party or private booki
 Before asking anything in Step one or Step two, actually scan the full conversation history for this sender for an occasion, a name, or a "have you been here before" answer that already came up earlier in the same thread, even days earlier, even in a completely different message than the one you are answering now. A guest who jumps straight to "I want to book the hinterer Bereich for 25 people on the 18th" without any of the earlier small talk has very often already told you the occasion, their name, or that they have visited before, days or weeks ago, in the very same thread you are looking at right now. Skip a step entirely and move straight to the next one if history already answers it, do not run through the full script fresh just because this particular message reads like an opener. This is the single most common way READ THE WHOLE THREAD FIRST gets missed, a real returning guest gets asked their own birthday's occasion, their own name, or whether they have been here before, all things they already told this same thread earlier.
 
 Step one, the basics. Get the occasion, the date, roughly what time, how many people, and the name of whoever is organising it. A WhatsApp or Instagram display name is not reliable enough to hand to Dan on its own, always ask for it directly, warmly, folded in naturally rather than as an interrogation, for example wie darf ich dich denn nennen or unter welchem namen darf ich das notieren. Do not consider Step one finished, and do not move on to explaining the space in Step three, until you actually have a name, not just a guess from the chat profile.
+
+TENTATIVE HOLD. The moment you have both a real date and a rough headcount for a GROUPS AND EVENTS inquiry, even if a name or occasion is still missing, call send_reply action reply as normal but also fill in event_hold with the date, party, name (use Gast if you truly do not have one yet), and occasion if known. This actually places a clearly marked, not yet confirmed placeholder on the calendar, so if you tell a guest a date is frei or reserved for them that is now true, never say a date is blocked or held without also calling event_hold in that same turn, an unbacked promise like that is exactly the kind of mistake that got caught before, Dan found a guest who was told a date was blocked when nothing was ever actually on the calendar. Call event_hold again any later turn the headcount, date, or occasion changes, it always updates the same placeholder rather than creating a second one, you never need to worry about duplicates. This is never a real booking and never replaces the eventual HANDOFF once the inquiry actually qualifies, Dan still closes every event personally, this only makes an open inquiry visible so two guests never both think the same date is theirs.
 
 Step two, ask if they have been to BrunnenBar before, warmly. This is about warmth and tone, not a reason to skip Step three, having stopped by for drinks before does not mean a guest knows how the private event setup works, always explain the two areas in Step three regardless of their answer here.
 
@@ -824,7 +940,13 @@ SEND_REPLY_TOOL = {
         "rules above. Use action escalate_emergency for immediate danger, message field "
         "as described in the ESCALATE_EMERGENCY rules above. Use action "
         "escalate_complaint for an unhappy or hostile guest, message field as described "
-        "in the ESCALATE_COMPLAINT rules above."
+        "in the ESCALATE_COMPLAINT rules above. On action reply, also fill in event_hold "
+        "whenever a GROUPS AND EVENTS inquiry newly has both a date and a rough headcount, or "
+        "either one changes later, see the TENTATIVE HOLD rules above, this places or updates a "
+        "clearly marked not yet confirmed placeholder on the calendar so a promise like the date "
+        "being frei or held is actually backed by something. On action reply, set "
+        "release_event_hold to true instead when a guest explicitly backs out of a GROUPS AND "
+        "EVENTS inquiry that never reached handoff, to remove that placeholder again."
     ),
     "input_schema": {
         "type": "object",
@@ -856,6 +978,30 @@ SEND_REPLY_TOOL = {
                     "far, name, occasion, date, time, headcount, area, and any of the "
                     "step five answers already given, since this is the only context "
                     "Dan gets to act on."
+                ),
+            },
+            "event_hold": {
+                "type": "object",
+                "description": (
+                    "Only on action reply, only for a GROUPS AND EVENTS inquiry, see the "
+                    "TENTATIVE HOLD rules above. Fill this in the moment you have both a date "
+                    "and a rough headcount, and again whenever either changes later in the "
+                    "same thread, so a promise that a date is frei or held is actually true."
+                ),
+                "properties": {
+                    "date": {"type": "string", "description": "YYYY-MM-DD, resolved from the AKTUELLER ZEITPUNKT line"},
+                    "party": {"type": "integer", "description": "Rough headcount, best current estimate"},
+                    "name": {"type": "string", "description": "The organiser's name, or Gast if truly not known yet"},
+                    "occasion": {"type": "string", "description": "The Anlass, or an empty string if not yet known"},
+                },
+                "required": ["date", "party"],
+            },
+            "release_event_hold": {
+                "type": "boolean",
+                "description": (
+                    "Only on action reply. Set true when a guest explicitly backs out of a "
+                    "GROUPS AND EVENTS inquiry that never reached handoff, to remove the "
+                    "TENTATIVE HOLD placeholder from earlier in this thread, if one exists."
                 ),
             },
         },
@@ -1520,7 +1666,31 @@ def claude_decide(sender: str, text: str):
                 action = (inp.get("action") or "").strip().lower()
                 message = (inp.get("message") or "").strip()
                 reason = (inp.get("reason") or "").strip()
-                if action in ("reply", "cancel_request", "escalate_emergency", "escalate_complaint"):
+                if action == "reply":
+                    # TENTATIVE HOLD side effects, see the comment on
+                    # upsert_pending_hold above. Best effort and wrapped so a
+                    # calendar hiccup can never block the guest's actual
+                    # reply from going out, that always takes priority.
+                    try:
+                        if inp.get("release_event_hold"):
+                            remove_pending_hold(sender)
+                        else:
+                            hold = inp.get("event_hold")
+                            if isinstance(hold, dict):
+                                date_iso = str(hold.get("date") or "").strip()
+                                party = int(hold.get("party") or 0)
+                                if date_iso and party:
+                                    upsert_pending_hold(
+                                        sender,
+                                        (hold.get("name") or "").strip() or "Gast",
+                                        party,
+                                        date_iso,
+                                        (hold.get("occasion") or "").strip(),
+                                    )
+                    except Exception as e:
+                        logger.error("event_hold side effect failed for %s: %s", sender, e)
+                    return (action, message, lang)
+                if action in ("cancel_request", "escalate_emergency", "escalate_complaint"):
                     return (action, message, lang)
                 if action == "handoff":
                     return ("handoff", {"reason": reason or "no reason given", "message": message}, lang)
