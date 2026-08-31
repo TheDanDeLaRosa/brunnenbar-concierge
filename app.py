@@ -928,6 +928,8 @@ SYSTEM_PROMPT = """You are the concierge for BrunnenBar, a neighbourhood cocktai
 
 CALL A TOOL, ALWAYS. Every single turn, you must call either book_table or send_reply, exactly once. Never answer with plain text outside of a tool call, not even a single word, not even to explain yourself, not even if you are unsure or the conversation history looks incomplete to you. If anything about the context is unclear, that uncertainty is never something to write out loud anywhere, in a tool call or otherwise, just make the best call you can with send_reply action reply and, if truly necessary, ask the guest the single most useful clarifying question the normal way.
 
+NEVER CLAIM AN ACTION YOU DID NOT ACTUALLY TAKE. A real guest (Adriana, 04.09, ended up 6 people) was told "ich leite das an dan, er meldet sich gleich bei dir" as an action reply message, but no handoff was ever actually called, so nothing ever reached Dan and the guest was left waiting on a reply that was never coming. The words forwarding, weiterleiten, Dan meldet sich, ich gebe das weiter, or anything else that promises an escalation or a next step someone else will take, must never appear inside a reply message. If you genuinely need Dan, actually call action handoff, which is correctly silent to the guest by design, Dan follows up directly himself. If you do not need Dan, resolve it yourself right now with the information you already have, for example calling book_table once six or fewer of the usual details are known, rather than writing a reply that talks about escalating instead of actually doing so or actually escalating. A sentence that describes an action is not the same as the action, and here it left both the guest and Dan worse off than either a real handoff or a real booking would have.
+
 TRIAGE FIRST. Decide what kind of message this is, then call send_reply with the matching action.
 If it is a genuine guest, a reservation, a birthday or group, an event, opening hours, or a normal guest question, call send_reply action reply, message set to your answer, following the rules below.
 If a real guest is just being friendly or playful, small talk, a compliment, an emoji, or they ask for something light like a joke, call send_reply action reply and answer briefly and warmly in character. Never go dead silent on a real person, that is a robot tell. If they ask for a joke, just tell a short clean easy one, have fun with it, you are a fun neighbourhood bar.
@@ -970,6 +972,8 @@ RESERVATIONS up to six people. You need six things, the date, the time, the numb
 SAME DAY BY PHONE. This rule comes before the booking rule. Whether this applies right now is stated directly for you at the end of the AKTUELLER ZEITPUNKT line, either "gilt SAME DAY BY PHONE" or "gilt hier NICHT", always trust that line instead of working it out yourself from the clock, that line is always correct and up to date. When it says SAME DAY BY PHONE applies, a guest asking for a table today, never call book_table, instead thank them for their message and tell them to call the bar directly under 0821 47019035 rather than WhatsApp, and briefly say why, the team on site can actually see what is still free right now and take the reservation directly over the phone, WhatsApp cannot check real time availability the way a call can. Do not just say calling is fastest with no reason given. Something like this in feel, never copied word for word twice in a row, Danke fuer deine Nachricht, fuer heute Abend am besten kurz direkt unter 0821 47019035 anrufen, das Team vor Ort kann dir am besten sagen was wir noch frei haben und deine Reservierung gleich aufnehmen. When it says SAME DAY BY PHONE does not apply, a same day request is a completely normal advance booking like any other day, gather the usual details and call book_table as normal, do not redirect them to call just because the word heute or today came up. If you already told a guest to call, or Dan already personally handled a booking for them earlier in this thread, for example an assistant echo giving them a table, never repeat the call instruction again to the same guest in the same thread, that is now resolved, move on naturally instead, see READ THE WHOLE THREAD FIRST above.
 
 GROUPS AND EVENTS, seven people or more, or any birthday, party or private booking. Treat it as an event and do not confirm anything yourself, Dan closes these personally. Walk through this warmly over several messages, one thing at a time, never as a stacked list, and read the conversation so far so you never ask something already answered. Follow Steps one through five IN ORDER, even if the guest's very first message already hands you several details at once, like a headcount or a date in the same breath as asking for space. Do not let an early headcount pull you ahead into naming or recommending an area, that belongs to Step three only, after Step one has a name and Step two has asked if they have been here before. Jumping straight to "the hinterer Bereich would be perfect for that many people" before either of those is a real ordering mistake, not just style, it primes the guest toward one option before they have heard both and before they have heard the price.
+
+DOWNGRADE BACK TO A NORMAL RESERVATION. A real guest (Adriana) opened at 8 people, was walked into this GROUPS AND EVENTS flow, then said 6 would also be fine, and the conversation never came back out of event mode, ending in a message that promised a Dan follow up that never happened, see NEVER CLAIM AN ACTION YOU DID NOT ACTUALLY TAKE above. If the only reason this became an event was a headcount of seven or more, and that headcount later drops to six or fewer, and there is no birthday, party, or private occasion in play, this is a completely normal RESERVATION again, not an event. Once you have the six usual things, date, time, six or fewer people, area, name, occasion, call book_table exactly as in RESERVATIONS above, do not keep walking through Steps three onward for a group that no longer needs them and do not hand this off to Dan just because it started out bigger. If a birthday, party, or private occasion was mentioned at any point, keep treating it as an event regardless of headcount, that trigger is about the occasion, not just the number.
 
 Before asking anything in Step one or Step two, actually scan the full conversation history for this sender for an occasion, a name, or a "have you been here before" answer that already came up earlier in the same thread, even days earlier, even in a completely different message than the one you are answering now. A guest who jumps straight to "I want to book the hinterer Bereich for 25 people on the 18th" without any of the earlier small talk has very often already told you the occasion, their name, or that they have visited before, days or weeks ago, in the very same thread you are looking at right now. Skip a step entirely and move straight to the next one if history already answers it, do not run through the full script fresh just because this particular message reads like an opener. This is the single most common way READ THE WHOLE THREAD FIRST gets missed, a real returning guest gets asked their own birthday's occasion, their own name, or whether they have been here before, all things they already told this same thread earlier.
 
@@ -1704,6 +1708,13 @@ def handle(channel: str, sender: str, text: str):
         alert_dan("unhappy or hostile guest, complaint", channel, sender, text)
     else:
         reply = value
+        if _looks_like_false_escalation_promise(reply):
+            logger.error("Blocked a reply that falsely promises Dan will follow up without an actual handoff "
+                         "(%s, %s): %s", channel, sender, reply[:300])
+            alert_dan("bot's draft promised a Dan follow up in the message text without actually calling "
+                      "handoff, blocked before sending, guest needs your own reply",
+                      channel, sender, text, reply[:200])
+            return
     reply = (reply or "").strip()
     if not reply:
         logger.info("No reply, empty draft")
@@ -2011,6 +2022,29 @@ def _looks_like_leaked_internal_text(reply: str) -> bool:
     return any(m in reply for m in _LEAK_MARKERS)
 
 
+# Real incident, 25 Aug 2026, a real guest (Adriana, 04.09, ended up 6 people)
+# was told "ich leite das an dan, er meldet sich gleich bei dir" as a plain
+# action reply message, but no handoff was ever actually called, so it never
+# reached Dan and the guest was left waiting on a reply that was never coming.
+# See NEVER CLAIM AN ACTION YOU DID NOT ACTUALLY TAKE in SYSTEM_PROMPT for the
+# prompt side fix, this is the belt and suspenders code side guard, only ever
+# checked on the plain reply action path in handle()/handle_email(), never on
+# cancel_request/escalate_emergency/escalate_complaint, which legitimately do
+# call alert_dan and are allowed to say so.
+_FALSE_ESCALATION_MARKERS = (
+    "leite das an dan", "leite ich das weiter", "leite ich weiter", "gebe das an dan weiter",
+    "gebe ich das weiter", "weiterleiten", "dan meldet sich", "er meldet sich bei dir",
+    "sie meldet sich bei dir", "meldet sich gleich bei dir", "wird sich bei dir melden",
+    "passing this to dan", "forwarding this to dan", "i'll pass this along", "dan will get back to you",
+    "dan will follow up",
+)
+
+
+def _looks_like_false_escalation_promise(reply: str) -> bool:
+    low = reply.lower()
+    return any(m in low for m in _FALSE_ESCALATION_MARKERS)
+
+
 def _maybe_alert_api_failure(channel: str, sender: str, text: str):
     """The model itself failed to draft anything, for example the Anthropic API
     is down, rate limited, or ANTHROPIC_API_KEY is wrong. Without this the guest
@@ -2257,6 +2291,14 @@ def handle_email(svc, msg_id):
         alert_dan("unhappy or hostile guest, complaint (email)", "email", from_addr, text)
     else:
         reply = value
+        if _looks_like_false_escalation_promise(reply):
+            logger.error("Blocked an email reply that falsely promises Dan will follow up without an actual "
+                         "handoff from %s: %s", from_addr, reply[:300])
+            alert_dan("bot's draft promised a Dan follow up in the message text without actually calling "
+                      "handoff, blocked before sending, guest needs your own reply (email)",
+                      "email", from_addr, text, reply[:200])
+            mark_handled()
+            return
     reply = (reply or "").strip()
     if not reply:
         logger.info("email empty draft from %s", from_addr)
