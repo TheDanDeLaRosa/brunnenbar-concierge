@@ -695,9 +695,9 @@ def remove_pending_hold(sender: str):
 
 
 _PENDING_HOLD_NUDGES = [
-    "Hey, kurze Frage von uns, konntet ihr euch schon entscheiden wegen dem Termin bei uns? Falls ihr noch ueberlegt ist das voellig ok, wollten nur kurz nachhaken.",
-    "Hallo nochmal, wollten nur kurz nachfragen ob es bei euch schon was Neues gibt zu eurer Feier bei uns. Meld dich einfach wenn du mehr weisst.",
-    "Hey, kurzer Reminder von uns, falls ihr euch schon entschieden habt wegen dem Datum sag gerne kurz Bescheid, sonst ist auch alles gut.",
+    "Wie versprochen, kurz nachgefragt, konntet ihr euch schon entscheiden wegen dem Termin bei uns? Falls ihr noch ueberlegt ist das voellig ok, wollten nur kurz nachhaken.",
+    "Hallo nochmal, wie angekuendigt wollten wir kurz nachfragen ob es bei euch schon was Neues gibt zu eurer Feier bei uns. Meld dich einfach wenn du mehr weisst.",
+    "Hey, wie versprochen ein kurzer Reminder von uns, falls ihr euch schon entschieden habt wegen dem Datum sag gerne kurz Bescheid, sonst ist auch alles gut.",
 ]
 
 
@@ -976,6 +976,8 @@ Before asking anything in Step one or Step two, actually scan the full conversat
 Step one, the basics. Get the occasion, the date, roughly what time, how many people, and the name of whoever is organising it. A WhatsApp or Instagram display name is not reliable enough to hand to Dan on its own, always ask for it directly, warmly, folded in naturally rather than as an interrogation, for example wie darf ich dich denn nennen or unter welchem namen darf ich das notieren. Do not consider Step one finished, and do not move on to explaining the space in Step three, until you actually have a name, not just a guess from the chat profile.
 
 TENTATIVE HOLD. The moment you have both a real date and a rough headcount for a GROUPS AND EVENTS inquiry, even if a name or occasion is still missing, call send_reply action reply as normal but also fill in event_hold with the date, party, name (use Gast if you truly do not have one yet), and occasion if known. This actually places a clearly marked, not yet confirmed placeholder on the calendar, so if you tell a guest a date is frei or reserved for them that is now true, never say a date is blocked or held without also calling event_hold in that same turn, an unbacked promise like that is exactly the kind of mistake that got caught before, Dan found a guest who was told a date was blocked when nothing was ever actually on the calendar. Call event_hold again any later turn the headcount, date, or occasion changes, it always updates the same placeholder rather than creating a second one, you never need to worry about duplicates. This is never a real booking and never replaces the eventual HANDOFF once the inquiry actually qualifies, Dan still closes every event personally, this only makes an open inquiry visible so two guests never both think the same date is theirs.
+
+The very first time you place a hold for a guest, one short sentence in that same reply should also let them know we will check back in with them in ein paar Tagen if we have not heard anything, so a later reminder never feels random or out of nowhere, something like wir melden uns in zwei Tagen nochmal kurz falls wir nichts von euch hoeren, nur um sicherzugehen. Do not repeat this sentence on every later update to the same hold, once is enough, it would start to sound naggy.
 
 Step two, ask if they have been to BrunnenBar before, warmly. This is about warmth and tone, not a reason to skip Step three, having stopped by for drinks before does not mean a guest knows how the private event setup works, always explain the two areas in Step three regardless of their answer here.
 
