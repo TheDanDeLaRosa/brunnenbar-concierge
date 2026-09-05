@@ -196,18 +196,21 @@ EMAIL_HANDLED_LABEL = os.environ.get("EMAIL_HANDLED_LABEL", "Concierge-Beantwort
 _EMAIL_START_MS = int(time.time() * 1000)
 _gmail_label_cache = {}
 
-# Post visit check in. A warm, no strings attached WhatsApp follow up the day
-# after a bot booked table reservation, added 31 Aug 2026 at Dan's request.
-# Deliberately NOT a review ask, see [[project_brunnenbar_cloud_concierge]],
-# Google's April 2026 Maps policy update bans conditioning a review request on
-# expected sentiment (review gating), so this stays a plain relationship touch,
-# any review growth has to come from a separate, identically worded ask sent to
-# everyone, not built yet. Runs once a day as a background loop, same pattern
-# as the Gmail poll loop, looking at bot booked reservations (never Dan's own
-# manual GROUPS AND EVENTS bookings, those already get his personal follow up)
-# from the previous calendar day, Europe/Berlin. Only sends where the stored
-# contact is a clean WhatsApp phone number, respects SKIP_SENDERS and
-# is_human_active exactly like every other outbound message in this file.
+# Post visit check in. DESIGNED BUT NEVER BUILT, flagged 5 Sep 2026. This
+# comment describes a warm, no strings attached WhatsApp follow up the day
+# after a bot booked table reservation, apparently scoped at Dan's request on
+# 31 Aug 2026, deliberately NOT a review ask (Google's April 2026 Maps policy
+# update bans conditioning a review request on expected sentiment). A full
+# read of this file on 5 Sep 2026 found the two constants below and this
+# design comment, but NO loop, NO function, and NO startup thread anywhere
+# that actually implements it, it is not mentioned as done in HANDOFF_STATE.md
+# either. So today, despite POST_VISIT_CHECKIN_ENABLED defaulting true, no
+# guest has ever received this message, the bot only looks like it does this.
+# Left unbuilt on purpose rather than shipped silently in this same pass,
+# since the actual guest facing wording was never drafted or approved by Dan,
+# unlike the tentative hold nudges which were. See
+# [[project_brunnenbar_cloud_concierge]], needs a real go ahead plus wording
+# review before it gets built, not just a config flag.
 POST_VISIT_CHECKIN_ENABLED = os.environ.get("POST_VISIT_CHECKIN_ENABLED", "true").lower() == "true"
 POST_VISIT_CHECKIN_HOUR = int(os.environ.get("POST_VISIT_CHECKIN_HOUR", "11"))
 
@@ -987,39 +990,39 @@ def process_booking(sender: str, data: dict, lang: str = "de", channel: str = "w
         mins = f":{start_dt.strftime('%M')}" if start_dt.minute else ""
         time_en = f"{h12}{mins} {'am' if start_dt.hour < 12 else 'pm'}"
         hold_line_en = (
-            " we hold the table for 15 minutes. if you're running later than "
+            " We hold the table for 15 minutes. If you're running later than "
             "that please call the bar directly at 0821 47019035 rather than "
-            "whatsapp and let us know and we'll hold it for you"
+            "WhatsApp and let us know and we'll hold it for you"
         )
         return random.choice([
-            f"nice, got you down for {d} at {time_en} {where}.{hold_line_en}. see you then",
-            f"done, you're in for {d} {time_en} {where}.{hold_line_en}. looking forward to it",
-            f"great, booked you {d} at {time_en} {where}.{hold_line_en}. see you then",
+            f"Nice, got you down for {d} at {time_en} {where}.{hold_line_en}. See you then",
+            f"Done, you're in for {d} {time_en} {where}.{hold_line_en}. Looking forward to it",
+            f"Great, booked you {d} at {time_en} {where}.{hold_line_en}. See you then",
         ])
     days_de = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
     bereich = "draussen" if area == "draussen" else "drinnen"
     wd = days_de[start_dt.weekday()]
     if sie:
         hold_line_sie = (
-            " wir halten den Tisch 15 Minuten. falls Sie mehr als 15 Minuten "
+            " Wir halten den Tisch 15 Minuten. Falls Sie mehr als 15 Minuten "
             "spaeter kommen rufen Sie uns bitte direkt in der Bar an unter "
             "0821 47019035 nicht ueber WhatsApp und geben uns kurz Bescheid "
             "dann halten wir ihn Ihnen"
         )
         return random.choice([
-            f"sehr gerne, ich habe Sie fuer {wd} um {hm} Uhr {bereich} eingetragen.{hold_line_sie}. bis dann",
-            f"perfekt, {wd} um {hm} Uhr {bereich} steht fuer Sie.{hold_line_sie}. wir freuen uns",
+            f"Sehr gerne, ich habe Sie fuer {wd} um {hm} Uhr {bereich} eingetragen.{hold_line_sie}. Bis dann",
+            f"Perfekt, {wd} um {hm} Uhr {bereich} steht fuer Sie.{hold_line_sie}. Wir freuen uns",
         ])
     hold_line_du = (
-        " wir halten den tisch 15 minuten. falls ihr mehr als 15 minuten "
-        "spaeter kommt ruf bitte direkt in der bar an unter 0821 47019035 "
-        "nicht ueber whatsapp und gib uns kurz bescheid dann halten wir ihn euch"
+        " Wir halten den Tisch 15 Minuten. Falls ihr mehr als 15 Minuten "
+        "spaeter kommt ruf bitte direkt in der Bar an unter 0821 47019035 "
+        "nicht ueber WhatsApp und gib uns kurz Bescheid dann halten wir ihn euch"
     )
     return random.choice([
-        f"top, hab euch fuer {wd} um {hm} uhr {bereich} eingetragen.{hold_line_du}. freu mich, bis dann",
-        f"super, {wd} {hm} uhr {bereich} steht fuer euch.{hold_line_du}. bis dann",
-        f"passt, hab euch {wd} um {hm} uhr {bereich} reserviert.{hold_line_du}. bis {wd} dann",
-        f"cool, {wd} um {hm} uhr {bereich} ist eingetragen.{hold_line_du}. freu mich auf euch",
+        f"Top, hab euch fuer {wd} um {hm} Uhr {bereich} eingetragen.{hold_line_du}. Freu mich, bis dann",
+        f"Super, {wd} {hm} Uhr {bereich} steht fuer euch.{hold_line_du}. Bis dann",
+        f"Passt, hab euch {wd} um {hm} Uhr {bereich} reserviert.{hold_line_du}. Bis {wd} dann",
+        f"Cool, {wd} um {hm} Uhr {bereich} ist eingetragen.{hold_line_du}. Freu mich auf euch",
     ])
 
 
@@ -1048,26 +1051,26 @@ def _book_or_handoff(sender: str, data: dict, lang: str, channel: str, guest_tex
 def _handoff_line(sie=False, lang="de"):
     if lang == "en":
         return random.choice([
-            "i'll pass this to dan, he'll get back to you shortly",
-            "let me hand this to dan, he'll come back to you soon",
+            "I'll pass this to Dan, he'll get back to you shortly",
+            "Let me hand this to Dan, he'll come back to you soon",
         ])
     if sie:
-        return "ich leite das direkt an Dan weiter, er meldet sich gleich bei Ihnen"
+        return "Ich leite das direkt an Dan weiter, er meldet sich gleich bei Ihnen"
     return random.choice([
-        "geb ich direkt an dan weiter, er meldet sich gleich bei dir",
-        "ich leite das an dan, er meldet sich gleich bei dir",
+        "Geb ich direkt an Dan weiter, er meldet sich gleich bei dir",
+        "Ich leite das an Dan, er meldet sich gleich bei dir",
     ])
 
 
 def _full_line(sie=False, lang="de"):
     if lang == "en":
-        return "it's pretty full at that time already, i'll pass it to dan to see if something still works"
+        return "It's pretty full at that time already, I'll pass it to Dan to see if something still works"
     if sie:
-        return ("gerade ist es leider schon recht voll, ich gebe es an Dan weiter "
+        return ("Gerade ist es leider schon recht voll, ich gebe es an Dan weiter "
                 "ob sich noch etwas machen laesst")
     return random.choice([
-        "grad ist es leider schon ziemlich voll, ich geb es an dan ob noch was geht",
-        "puh, um die zeit ist es schon recht voll, ich frag dan ob noch was frei wird",
+        "Grad ist es leider schon ziemlich voll, ich geb es an Dan ob noch was geht",
+        "Puh, um die Zeit ist es schon recht voll, ich frag Dan ob noch was frei wird",
     ])
 
 SYSTEM_PROMPT = """You are the concierge for BrunnenBar, a neighbourhood cocktail bar in Augsburg, Germany. You reply to guest messages on WhatsApp and Instagram on behalf of the owner Daniel, called Dan, as if you were Dan or his team.
@@ -1796,11 +1799,34 @@ async def messenger_receive(request: Request):
             message = event.get("message") or {}
             mid = message.get("mid")
             text = message.get("text", "")
-            if message.get("is_echo") or not text or not mid or _already_handled(mid):
+            if not mid or _already_handled(mid):
+                continue
+            if message.get("is_echo"):
+                # Manual reply Dan or a teammate typed by hand straight in the
+                # Messenger app itself. Added 5 Sep 2026, matching the WhatsApp
+                # smb_message_echoes and Instagram is_echo handling below,
+                # audit found Messenger was the one channel still silently
+                # dropping these with a bare continue and no conv_append or
+                # mark_human_active call at all, so the bot had zero memory of
+                # Dan's own manual Messenger replies and would never pause for
+                # them, same bug class as the Ben Rieger/Rina incidents just on
+                # an unaudited channel. See [[project_brunnenbar_cloud_concierge]].
+                if not text:
+                    continue
+                recipient = (event.get("recipient") or {}).get("id")
+                if recipient:
+                    logger.info("Messenger echo (manual reply) to %s: %s", recipient, text[:120])
+                    conv_append(recipient, "assistant", text)
+                    mark_human_active(recipient)
+                continue
+            if not text:
                 continue
             sender = event.get("sender", {}).get("id")
             logger.info("Messenger in from %s: %s", sender, text[:120])
             conv_append(sender, "user", text)
+            if is_human_active(sender):
+                logger.info("Messenger sender %s has Dan actively replying by hand, logged only, no auto reply", sender)
+                continue
             _last_msg[sender] = mid
             threading.Thread(target=handle_later, args=("messenger", sender, text, mid), daemon=True).start()
     return {"received": True}
