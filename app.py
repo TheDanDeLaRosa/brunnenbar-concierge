@@ -196,23 +196,34 @@ EMAIL_HANDLED_LABEL = os.environ.get("EMAIL_HANDLED_LABEL", "Concierge-Beantwort
 _EMAIL_START_MS = int(time.time() * 1000)
 _gmail_label_cache = {}
 
-# Post visit check in. DESIGNED BUT NEVER BUILT, flagged 5 Sep 2026. This
-# comment describes a warm, no strings attached WhatsApp follow up the day
-# after a bot booked table reservation, apparently scoped at Dan's request on
-# 31 Aug 2026, deliberately NOT a review ask (Google's April 2026 Maps policy
-# update bans conditioning a review request on expected sentiment). A full
-# read of this file on 5 Sep 2026 found the two constants below and this
-# design comment, but NO loop, NO function, and NO startup thread anywhere
-# that actually implements it, it is not mentioned as done in HANDOFF_STATE.md
-# either. So today, despite POST_VISIT_CHECKIN_ENABLED defaulting true, no
-# guest has ever received this message, the bot only looks like it does this.
-# Left unbuilt on purpose rather than shipped silently in this same pass,
-# since the actual guest facing wording was never drafted or approved by Dan,
-# unlike the tentative hold nudges which were. See
-# [[project_brunnenbar_cloud_concierge]], needs a real go ahead plus wording
-# review before it gets built, not just a config flag.
+# Post visit check in. Flagged as designed-but-never-built on 5 Sep 2026, then
+# actually built same day once Dan gave a direct go ahead ("you are the
+# concierge, do everything that makes guest experience optimal"). A warm, no
+# strings attached WhatsApp follow up the day after a bot booked table
+# reservation. Deliberately NOT a review ask, Google's April 2026 Maps policy
+# update bans conditioning a review request on expected sentiment, so this
+# stays a plain relationship touch, any review growth has to come from a
+# separate, identically worded ask sent to everyone, not built. Runs once a
+# day as a background loop (post_visit_checkin_loop/run_post_visit_checkins,
+# defined near create_reservation below since it needs BOOKING_ENABLED,
+# RESERVIERUNGEN_CALENDAR_ID and _is_whatsapp_number, all defined later in the
+# file), checking every POST_VISIT_CHECKIN_CHECK_INTERVAL_SECONDS whether it
+# is past POST_VISIT_CHECKIN_HOUR Europe/Berlin and yesterday has not already
+# been processed. Only ever looks at reservations create_reservation() itself
+# created, distinguished from Dan's own manual GROUPS AND EVENTS bookings by
+# the literal phrase "automatisch vom Concierge gebucht" that function always
+# writes into the description, never a guess. Only sends where the stored
+# contact is a clean WhatsApp phone number (_is_whatsapp_number, same gate as
+# the tentative hold system), respects SKIP_SENDERS and is_human_active
+# exactly like every other outbound message in this file, and never sends the
+# same reservation's check in twice (tracked per event id, Upstash backed with
+# an in memory fallback). Message text is a small fixed rotation, not a live
+# model call, same reliability reasoning as the tentative hold nudges, a batch
+# job with no guest reply to react to has no need for the model and one less
+# thing that could go wrong unattended.
 POST_VISIT_CHECKIN_ENABLED = os.environ.get("POST_VISIT_CHECKIN_ENABLED", "true").lower() == "true"
 POST_VISIT_CHECKIN_HOUR = int(os.environ.get("POST_VISIT_CHECKIN_HOUR", "11"))
+POST_VISIT_CHECKIN_CHECK_INTERVAL_SECONDS = int(os.environ.get("POST_VISIT_CHECKIN_CHECK_INTERVAL_SECONDS", str(30 * 60)))
 
 # The bookable tables from the floor plan, name maps to seats and area. Outside
 # is the 3XX tables, inside is the real tables. Bar stools and single seats are
@@ -921,6 +932,113 @@ def create_reservation(name, contact, party, area, start_dt, occasion, table, la
     return svc.events().insert(calendarId=RESERVIERUNGEN_CALENDAR_ID, body=body).execute()
 
 
+# POST VISIT CHECK IN implementation. See the block comment near
+# POST_VISIT_CHECKIN_ENABLED/HOUR near the top of this file for the full
+# design reasoning, built 5 Sep 2026. The marker string below must stay byte
+# identical to the phrase create_reservation() writes above, that equality is
+# the entire mechanism distinguishing a bot booking from one of Dan's own
+# manual calendar entries.
+_POST_VISIT_CHECKIN_MARKER = "automatisch vom Concierge gebucht"
+_post_visit_checkin_local_sent = set()      # event ids already checked in on, in memory fallback only
+_post_visit_checkin_local_last_date = None  # last calendar date (iso) this loop actually finished, in memory fallback only
+
+_POST_VISIT_CHECKIN_MESSAGES = [
+    "Hey, kurz gemeldet, danke nochmal dass ihr gestern bei uns wart, hoffe es hat euch gefallen. Falls es was gibt das wir naechstes Mal besser machen koennen, sag gerne kurz Bescheid.",
+    "Hallo nochmal, wollten uns nur kurz melden, danke dass ihr gestern da wart. Hoffe ihr hattet einen schoenen Abend bei uns, meld dich gerne falls irgendwas war.",
+    "Hey, nochmal danke fuers Vorbeikommen gestern, hoffe es war ein schoener Abend. Falls dir was aufgefallen ist wo wir besser werden koennen, immer gerne her damit.",
+]
+
+
+def _post_visit_checkin_sent(event_id: str) -> bool:
+    if _UPSTASH_ON:
+        return bool(_upstash("SISMEMBER", "post_visit_checkin_sent_events", event_id))
+    return event_id in _post_visit_checkin_local_sent
+
+
+def _post_visit_checkin_mark_sent(event_id: str):
+    if _UPSTASH_ON:
+        _upstash("SADD", "post_visit_checkin_sent_events", event_id)
+        return
+    _post_visit_checkin_local_sent.add(event_id)
+
+
+def _post_visit_checkin_last_date() -> str:
+    if _UPSTASH_ON:
+        return _upstash("GET", "post_visit_checkin_last_date") or ""
+    return _post_visit_checkin_local_last_date or ""
+
+
+def _post_visit_checkin_set_last_date(date_iso: str):
+    global _post_visit_checkin_local_last_date
+    if _UPSTASH_ON:
+        _upstash("SET", "post_visit_checkin_last_date", date_iso)
+        return
+    _post_visit_checkin_local_last_date = date_iso
+
+
+def run_post_visit_checkins():
+    """Runs periodically, see post_visit_checkin_loop below. Once per real
+    calendar day, after POST_VISIT_CHECKIN_HOUR Europe/Berlin, sends
+    yesterday's bot booked guests one warm check in each. Best effort
+    throughout, any single guest's failure is logged and swallowed, never
+    allowed to block the others or crash the loop."""
+    if not POST_VISIT_CHECKIN_ENABLED:
+        return
+    if not (BOOKING_ENABLED and GOOGLE_REFRESH_TOKEN and RESERVIERUNGEN_CALENDAR_ID):
+        return
+    now_berlin = datetime.now(BAR_TZ)
+    if now_berlin.hour < POST_VISIT_CHECKIN_HOUR:
+        return
+    yesterday = (now_berlin - timedelta(days=1)).date().isoformat()
+    if _post_visit_checkin_last_date() == yesterday:
+        return  # already ran for this calendar date
+    try:
+        svc = _calendar_service()
+        lo = datetime.fromisoformat(yesterday).replace(tzinfo=BAR_TZ)
+        hi = lo + timedelta(days=1)
+        items = svc.events().list(
+            calendarId=RESERVIERUNGEN_CALENDAR_ID,
+            timeMin=lo.isoformat(), timeMax=hi.isoformat(),
+            singleEvents=True, orderBy="startTime",
+        ).execute().get("items", [])
+    except Exception as e:
+        logger.error("post visit check in, calendar list failed for %s: %s", yesterday, e)
+        return
+    for ev in items:
+        try:
+            event_id = ev.get("id")
+            desc = ev.get("description", "") or ""
+            if _POST_VISIT_CHECKIN_MARKER not in desc:
+                continue  # Dan's own manual booking, not the bot's, leave it alone
+            if not event_id or _post_visit_checkin_sent(event_id):
+                continue
+            m = re.search(r"WhatsApp\s+(\d+)", desc)
+            contact = m.group(1) if m else ""
+            if not _is_whatsapp_number(contact):
+                _post_visit_checkin_mark_sent(event_id)  # nothing reachable, do not keep retrying
+                continue
+            if contact in SKIP_SENDERS or is_human_active(contact):
+                _post_visit_checkin_mark_sent(event_id)
+                continue
+            msg = random.choice(_POST_VISIT_CHECKIN_MESSAGES)
+            if send_whatsapp(contact, msg):
+                conv_append(contact, "assistant", msg)
+                logger.info("Post visit check in sent to %s for event %s", contact, event_id)
+            _post_visit_checkin_mark_sent(event_id)
+        except Exception as e:
+            logger.error("post visit check in failed for event %s: %s", ev.get("id"), e)
+    _post_visit_checkin_set_last_date(yesterday)
+
+
+def post_visit_checkin_loop():
+    while True:
+        try:
+            run_post_visit_checkins()
+        except Exception as e:
+            logger.error("post_visit_checkin_loop error: %s", e)
+        time.sleep(POST_VISIT_CHECKIN_CHECK_INTERVAL_SECONDS)
+
+
 def process_booking(sender: str, data: dict, lang: str = "de", channel: str = "whatsapp") -> str:
     """Given the details the model gave the tool, check the table map, book if a
     table is free, and return the guest reply in the guest's language. Never
@@ -1507,6 +1625,9 @@ def debug():
         "pending_holds_open": len(_pending_hold_all_senders()),
         "STALE_THREAD_SLA_HOURS": STALE_THREAD_SLA_HOURS,
         "conv_tracked_senders": len(_conv_active_senders()),
+        "POST_VISIT_CHECKIN_ENABLED": POST_VISIT_CHECKIN_ENABLED,
+        "POST_VISIT_CHECKIN_HOUR": POST_VISIT_CHECKIN_HOUR,
+        "post_visit_checkin_last_date": _post_visit_checkin_last_date() or None,
     }
 
 
@@ -1646,6 +1767,12 @@ def _startup_subscribe():
         threading.Thread(target=pending_hold_followup_loop, daemon=True).start()
     else:
         logger.info("Startup: pending hold follow up loop off (booking/calendar not configured)")
+    if POST_VISIT_CHECKIN_ENABLED and BOOKING_ENABLED and GOOGLE_REFRESH_TOKEN and RESERVIERUNGEN_CALENDAR_ID:
+        logger.info("Startup: starting post visit check in loop every %s s, runs after %s:00 Europe/Berlin",
+                    POST_VISIT_CHECKIN_CHECK_INTERVAL_SECONDS, POST_VISIT_CHECKIN_HOUR)
+        threading.Thread(target=post_visit_checkin_loop, daemon=True).start()
+    else:
+        logger.info("Startup: post visit check in loop off (disabled, or booking/calendar not configured)")
     logger.info("Startup: starting stale thread watchdog every %s s, SLA %s h",
                 STALE_THREAD_CHECK_INTERVAL_SECONDS, STALE_THREAD_SLA_HOURS)
     threading.Thread(target=stale_thread_watchdog_loop, daemon=True).start()
