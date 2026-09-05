@@ -279,12 +279,30 @@ def _upstash(*command):
         return None
 
 
+def _norm_phone(raw: str) -> str:
+    """Strip everything but digits from a phone-like id. Added 5 Sep 2026
+    after Dan reported the bot replying over his own manual WhatsApp reply
+    to a guest (Ben Rieger, 4 Sep 2026), root caused to mark_human_active and
+    is_human_active using different key formats for the same guest: an
+    inbound message's "from" field is digits only, but Meta's coexistence
+    echo "to" field has been seen with a leading + or other formatting, so
+    the two calls were silently writing and reading different keys and the
+    pause never took effect. Every call into mark_human_active/is_human_active
+    now normalizes first, so the same guest always resolves to the same key
+    regardless of which payload shape it came from. See
+    [[project_brunnenbar_cloud_concierge]]."""
+    return re.sub(r"\D", "", raw or "")
+
+
 def mark_human_active(sender: str):
     """Called whenever Dan or a teammate replies to a guest by hand, straight in
     the WhatsApp or Instagram app (a coexistence echo). Pauses the bot's auto
     replies to this sender for HUMAN_ACTIVE_PAUSE_HOURS, durably via Upstash if
     configured, so the bot does not jump back in early just because Railway
     happened to restart mid conversation."""
+    sender = _norm_phone(sender)
+    if not sender:
+        return
     until = time.time() + HUMAN_ACTIVE_PAUSE_HOURS * 3600
     if _UPSTASH_ON:
         _upstash("SET", "human_active:" + sender, str(until), "EX", HUMAN_ACTIVE_PAUSE_HOURS * 3600)
@@ -296,6 +314,9 @@ def is_human_active(sender: str) -> bool:
     """True if Dan or a teammate replied to this guest by hand recently enough
     that the bot should stay quiet rather than jump into a conversation he is
     already having personally. See mark_human_active above."""
+    sender = _norm_phone(sender)
+    if not sender:
+        return False
     if _UPSTASH_ON:
         raw = _upstash("GET", "human_active:" + sender)
         if raw is None:
@@ -1000,6 +1021,28 @@ def process_booking(sender: str, data: dict, lang: str = "de", channel: str = "w
         f"passt, hab euch {wd} um {hm} uhr {bereich} reserviert.{hold_line_du}. bis {wd} dann",
         f"cool, {wd} um {hm} uhr {bereich} ist eingetragen.{hold_line_du}. freu mich auf euch",
     ])
+
+
+def _book_or_handoff(sender: str, data: dict, lang: str, channel: str, guest_text: str) -> str:
+    """Wraps process_booking so the "book" action can never again send a
+    guest the "I'll pass this to Dan" line without Dan actually being
+    alerted. process_booking is written so every one of its own return paths
+    already calls alert_dan before falling back, and a full read of it on
+    5 Sep 2026 confirmed that invariant holds today, but that safety was
+    resting entirely on every future edit to process_booking remembering to
+    keep it that way, nothing enforced it. After two real incidents where
+    guests got the handoff promise and Dan says he was never alerted, belt
+    and suspenders beats trusting convention, so this fires a second,
+    redundant alert here too whenever process_booking comes back empty. A
+    duplicate ping to Dan is a nonissue, a silent miss is the whole bug. See
+    [[project_brunnenbar_cloud_concierge]]."""
+    reply = process_booking(sender, data, lang, channel)
+    if reply:
+        return reply
+    logger.warning("process_booking returned no confirmation, sending redundant alert as a backstop (%s, %s)", channel, sender)
+    alert_dan("booking could not be completed automatically, guest was told you're handling it, please follow up",
+              channel, sender, guest_text)
+    return _handoff_line(bool(data.get("sie")), lang)
 
 
 def _handoff_line(sie=False, lang="de"):
@@ -1775,6 +1818,16 @@ def handle_later(channel: str, sender: str, text: str, mid: str = None):
     if mid is not None and _last_msg.get(sender) != mid:
         logger.info("newer message from %s arrived, skipping older scheduled reply", sender)
         return
+    # Re-check here, not just at webhook intake, added 5 Sep 2026. is_human_active
+    # was true at intake time but the whole point of this function is a
+    # deliberate 35-110s delay before answering, and Dan can reply by hand
+    # to the guest at any point during that window. Without this second
+    # check the bot could still fire after Dan already handled it live,
+    # which is exactly what happened to a guest named Ben Rieger on 4 Sep
+    # 2026. See [[project_brunnenbar_cloud_concierge]].
+    if is_human_active(sender):
+        logger.info("%s sender %s went human active during the reply delay, skipping scheduled reply", channel, sender)
+        return
     handle(channel, sender, text)
 
 
@@ -1785,7 +1838,7 @@ def handle(channel: str, sender: str, text: str):
         return
     if action == "book":
         logger.info("book_table called by model: %s", value)
-        reply = process_booking(sender, value, lang, channel) or _handoff_line(bool(value.get("sie")), lang)
+        reply = _book_or_handoff(sender, value, lang, channel, text)
     elif action == "skip":
         logger.info("Classified as spam/non guest, no reply to sender, FYI to Dan")
         notify_dan_skip(channel, sender, text)
@@ -2036,17 +2089,31 @@ def _email_alert_fallback(subject: str, body: str) -> bool:
 
 
 def _deliver_to_dan(text: str, subject: str) -> bool:
-    """Shared delivery for anything meant to reach Dan, tries WhatsApp first
-    and falls back to email if that specific send fails, so a Dualhook outage
-    cannot take out both the guest reply AND the one message that was supposed
-    to tell Dan something needs him. Returns whether it reached him on either
-    channel, callers log their own success/failure with their own category."""
+    """Shared delivery for anything meant to reach Dan. CHANGED 5 Sep 2026,
+    used to try WhatsApp first and only fall back to email if that specific
+    send call raised an error. Dan confirmed on two separate real incidents
+    (Rina, Ben Rieger, both 4 Sep 2026) that zero alerts reached him on
+    either channel even though /debug shows both DAN_ALERT_WHATSAPP and
+    DAN_ALERT_EMAIL configured, meaning send_whatsapp can report success to
+    the Meta/Dualhook API (no exception raised, so the old fallback never
+    triggered) while the message never actually surfaces to Dan, most likely
+    the WhatsApp 24 hour customer service window rejecting a free form
+    message to his own number without him having messaged the bot number
+    first. So this now fires WhatsApp AND email unconditionally whenever
+    both are configured, rather than email-as-fallback-only. A duplicate
+    alert costs Dan two seconds, a missed one costs a guest. Returns whether
+    it reached him on at least one channel, callers log their own
+    success/failure with their own category. See
+    [[project_brunnenbar_cloud_concierge]]."""
     if not DAN_ALERT_WHATSAPP and not (GMAIL_REFRESH_TOKEN and DAN_ALERT_EMAIL):
         return False
-    sent = send_whatsapp(DAN_ALERT_WHATSAPP, text) if DAN_ALERT_WHATSAPP else False
-    if sent:
-        return True
-    return _email_alert_fallback(subject, text)
+    wa_sent = send_whatsapp(DAN_ALERT_WHATSAPP, text) if DAN_ALERT_WHATSAPP else False
+    email_sent = _email_alert_fallback(subject, text)
+    if not wa_sent and DAN_ALERT_WHATSAPP:
+        logger.error("Dan alert WhatsApp send did not confirm, relying on email fallback (sent=%s)", email_sent)
+    if not email_sent and GMAIL_REFRESH_TOKEN and DAN_ALERT_EMAIL:
+        logger.error("Dan alert email send did not confirm, relying on WhatsApp (sent=%s)", wa_sent)
+    return wa_sent or email_sent
 
 
 def alert_dan(category: str, channel: str, sender: str, guest_text: str, reason: str = ""):
@@ -2374,7 +2441,7 @@ def handle_email(svc, msg_id):
         return
     if action == "book":
         logger.info("book_table called by model from email: %s", value)
-        reply = process_booking(sender_key, value, lang, "email") or _handoff_line(bool(value.get("sie")), lang)
+        reply = _book_or_handoff(sender_key, value, lang, "email", text)
     elif action == "skip":
         logger.info("email classified spam/non guest, no reply to sender, FYI to Dan, from %s", from_addr)
         notify_dan_skip("email", from_addr, text)
