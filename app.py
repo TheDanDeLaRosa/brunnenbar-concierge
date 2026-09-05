@@ -146,6 +146,25 @@ HUMAN_ACTIVE_PAUSE_HOURS = int(os.environ.get("HUMAN_ACTIVE_PAUSE_HOURS", "24"))
 # them. See run_stale_thread_watchdog below for exactly what it checks.
 STALE_THREAD_SLA_HOURS = int(os.environ.get("STALE_THREAD_SLA_HOURS", "6"))
 STALE_THREAD_CHECK_INTERVAL_SECONDS = int(os.environ.get("STALE_THREAD_CHECK_INTERVAL_SECONDS", str(30 * 60)))
+# LIVE SERVICE FAST WATCHDOG, added 5 Sep 2026. A real guest (Sophie, wanted a
+# table for 2 tonight) confirmed a time at 15:11 and got nothing back, no
+# reply, no booking, no alert, Dan only found it himself at 19:38, 4h27m
+# later, by which point a same-night table request is close to worthless.
+# Root cause traced to almost certain unlucky timing, a Railway redeploy (a
+# post visit check in feature push, commit 6790d6b) landed at 15:11:19, 7
+# seconds before her message, the exact kind of window where the in-flight
+# background reply thread (see handle_later's sleep) can get killed mid-delay
+# by the process restart, daemon threads do not survive that, and there was
+# nothing watching for exactly this failure shape fast enough. The general
+# STALE_THREAD_SLA_HOURS net (6 hours by default) exists for slower multi-day
+# event inquiries, it is far too slow for a same-day booking ask, so this adds
+# a second, much tighter net that only runs while the bar is actually open
+# right now (see _bar_open_now below), when every unanswered guest message is
+# inherently time critical, catching a drop like this in minutes instead of
+# hours regardless of the underlying cause, deploy timing or anything else
+# not yet seen. See [[project_brunnenbar_cloud_concierge]].
+LIVE_SERVICE_STALE_SLA_MINUTES = int(os.environ.get("LIVE_SERVICE_STALE_SLA_MINUTES", "10"))
+LIVE_SERVICE_STALE_CHECK_INTERVAL_SECONDS = int(os.environ.get("LIVE_SERVICE_STALE_CHECK_INTERVAL_SECONDS", "180"))
 # Ceiling on the in memory webhook dedup set below, so a long running process
 # does not slowly leak memory over months. The set only needs to catch retries
 # within roughly the same delivery window, so clearing it once it gets large is
@@ -245,6 +264,7 @@ _conv = {}              # sender -> list of {role, content}, in memory fallback 
 _conv_lock = threading.Lock()
 _conv_active_senders_local = set()  # every sender conv_append has ever touched, in memory fallback only
 _stale_alerted_local = {}           # sender -> unix ts of the last stale thread alert, in memory fallback only
+_live_stale_alerted_local = {}      # sender -> unix ts of the last live-service fast alert, in memory fallback only
 _UPSTASH_ON = bool(UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN)
 # Serializes the check then book sequence across every channel and every guest.
 # Without this, two guests messaging around the same moment could both pass the
@@ -360,6 +380,7 @@ def conv_append(sender: str, role: str, content: str):
         _upstash("SADD", "conv_active_senders", sender)
         if role == "assistant":
             _upstash("DEL", "stale_alerted:" + sender)
+            _upstash("DEL", "live_stale_alerted:" + sender)
         return
     with _conv_lock:
         h = _conv.setdefault(sender, [])
@@ -368,6 +389,7 @@ def conv_append(sender: str, role: str, content: str):
     _conv_active_senders_local.add(sender)
     if role == "assistant":
         _stale_alerted_local.pop(sender, None)
+        _live_stale_alerted_local.pop(sender, None)
 
 
 def conv_history(sender: str):
@@ -458,6 +480,87 @@ def stale_thread_watchdog_loop():
         time.sleep(STALE_THREAD_CHECK_INTERVAL_SECONDS)
 
 
+def _bar_open_now() -> bool:
+    """True if BrunnenBar is open right now, Europe/Berlin. Extracted 5 Sep
+    2026 from bar_time_context's own open_now calculation below (unchanged
+    logic, just made reusable) so the live service fast watchdog can gate on
+    the same real open hours instead of duplicating or drifting from them.
+    Donnerstag 18 bis 24 Uhr, Freitag und Samstag 18 bis 2 Uhr, sonst zu, Fri
+    and Sat run past midnight so the early hours of Sat and Sun still count."""
+    now = datetime.now(ZoneInfo("Europe/Berlin"))
+    wd = now.weekday()  # Monday is 0, Sunday is 6
+    h = now.hour
+    return (
+        (wd == 3 and h >= 18)               # Donnerstag 18 bis 24
+        or (wd == 4 and h >= 18)            # Freitag ab 18
+        or (wd == 5 and (h < 2 or h >= 18)) # Samstag, Freitagnacht bis 2 und ab 18
+        or (wd == 6 and h < 2)              # Sonntag, Samstagnacht bis 2
+    )
+
+
+def run_live_service_stale_watchdog():
+    """Fast, tight companion to run_stale_thread_watchdog above, added 5 Sep
+    2026 after a real guest (Sophie, table for 2 tonight) confirmed a time at
+    15:11 and got nothing back for 4h27m, until Dan found it himself. Traced
+    to almost certain unlucky timing with a Railway redeploy landing 7 seconds
+    before her message, killing the in-flight background reply thread, see
+    the block comment on LIVE_SERVICE_STALE_SLA_MINUTES above for the full
+    story. The general watchdog's 6 hour SLA is calibrated for slower, multi
+    day event inquiries and would not have caught this until 21:11, useless
+    for a same night table. This only runs while _bar_open_now() is true,
+    when every unanswered guest message is inherently urgent, and alerts Dan
+    within LIVE_SERVICE_STALE_SLA_MINUTES instead of hours, on a separate
+    alert flag from the general watchdog so the two never suppress each
+    other. Same "do not try to guess the failure shape, an unanswered user
+    turn sitting too long is enough" reasoning as the general watchdog."""
+    if not _bar_open_now():
+        return
+    now = time.time()
+    sla_seconds = LIVE_SERVICE_STALE_SLA_MINUTES * 60
+    for sender in _conv_active_senders():
+        try:
+            history = conv_history(sender)
+            if not history:
+                continue
+            last = history[-1]
+            if last.get("role") != "user":
+                continue
+            ts = last.get("ts")
+            if not ts:
+                continue  # entry predates this field, cannot judge age, skip rather than guess
+            age_s = now - float(ts)
+            if age_s < sla_seconds:
+                continue
+            if _UPSTASH_ON:
+                if _upstash("GET", "live_stale_alerted:" + sender):
+                    continue
+            elif sender in _live_stale_alerted_local:
+                continue
+            channel_guess = "email" if sender.startswith("email:") else "whatsapp"
+            alert_dan(
+                "URGENT, the bar is open right now and a guest message has sat unanswered past "
+                f"{LIVE_SERVICE_STALE_SLA_MINUTES} minutes, please check this thread yourself right now",
+                channel_guess, sender, last.get("content", ""),
+                f"No reply from us in about {age_s / 60:.0f} minutes, during live service every "
+                f"unanswered message is time sensitive, this needs your eyes now not later.",
+            )
+            if _UPSTASH_ON:
+                _upstash("SET", "live_stale_alerted:" + sender, "1", "EX", 24 * 3600)
+            else:
+                _live_stale_alerted_local[sender] = now
+        except Exception as e:
+            logger.error("run_live_service_stale_watchdog failed for %s: %s", sender, e)
+
+
+def live_service_stale_watchdog_loop():
+    while True:
+        try:
+            run_live_service_stale_watchdog()
+        except Exception as e:
+            logger.error("live_service_stale_watchdog_loop error: %s", e)
+        time.sleep(LIVE_SERVICE_STALE_CHECK_INTERVAL_SECONDS)
+
+
 def bar_time_context():
     """A German sentence stating the real current day, date and time in Augsburg
     and whether the bar is open right now, so the model never guesses the weekday.
@@ -467,12 +570,7 @@ def bar_time_context():
     wd = now.weekday()  # Monday is 0, Sunday is 6
     h = now.hour
     days = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
-    open_now = (
-        (wd == 3 and h >= 18)               # Donnerstag 18 bis 24
-        or (wd == 4 and h >= 18)            # Freitag ab 18
-        or (wd == 5 and (h < 2 or h >= 18)) # Samstag, Freitagnacht bis 2 und ab 18
-        or (wd == 6 and h < 2)              # Sonntag, Samstagnacht bis 2
-    )
+    open_now = _bar_open_now()
     if wd == 3:
         today = "Heute (Donnerstag) hat die Bar von 18 bis 24 Uhr offen."
     elif wd == 4:
@@ -1628,6 +1726,8 @@ def debug():
         "POST_VISIT_CHECKIN_ENABLED": POST_VISIT_CHECKIN_ENABLED,
         "POST_VISIT_CHECKIN_HOUR": POST_VISIT_CHECKIN_HOUR,
         "post_visit_checkin_last_date": _post_visit_checkin_last_date() or None,
+        "LIVE_SERVICE_STALE_SLA_MINUTES": LIVE_SERVICE_STALE_SLA_MINUTES,
+        "bar_open_now": _bar_open_now(),
     }
 
 
@@ -1776,6 +1876,9 @@ def _startup_subscribe():
     logger.info("Startup: starting stale thread watchdog every %s s, SLA %s h",
                 STALE_THREAD_CHECK_INTERVAL_SECONDS, STALE_THREAD_SLA_HOURS)
     threading.Thread(target=stale_thread_watchdog_loop, daemon=True).start()
+    logger.info("Startup: starting live service fast watchdog every %s s, SLA %s min while the bar is open",
+                LIVE_SERVICE_STALE_CHECK_INTERVAL_SECONDS, LIVE_SERVICE_STALE_SLA_MINUTES)
+    threading.Thread(target=live_service_stale_watchdog_loop, daemon=True).start()
 
 
 def challenge(request: Request):
