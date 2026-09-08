@@ -1636,7 +1636,11 @@ def oauth_gmail_start():
 
 
 @app.get("/oauth/gmail/callback", response_class=HTMLResponse)
-def oauth_gmail_callback(code: str = "", error: str = ""):
+def oauth_gmail_callback(code: str = "", error: str = "", state: str = ""):
+    # state=="calendar" means this code came from /oauth/calendar/start, so the token
+    # is calendar scoped and belongs in GOOGLE_REFRESH_TOKEN. Otherwise it is the Gmail flow.
+    is_calendar = (state == "calendar")
+    start_path = "/oauth/calendar/start" if is_calendar else "/oauth/gmail/start"
     if error:
         return HTMLResponse(f"<p>OAuth error: {error}</p>", status_code=400)
     if not code:
@@ -1662,20 +1666,53 @@ def oauth_gmail_callback(code: str = "", error: str = ""):
         return HTMLResponse(
             "<p>No refresh token was returned. This happens if you already granted "
             "access before. Revoke it at myaccount.google.com under Data and privacy, "
-            "Third party access, then open /oauth/gmail/start again.</p>",
+            f"Third party access, then open {start_path} again.</p>",
             status_code=500,
         )
+    var_name = "GOOGLE_REFRESH_TOKEN" if is_calendar else "GMAIL_REFRESH_TOKEN"
+    heading = "Calendar refresh token ready" if is_calendar else "Gmail refresh token ready"
+    follow = (
+        "After redeploy, open <b>/debug</b> to confirm GOOGLE_REFRESH_TOKEN reads true, then "
+        "<b>/calendars</b> to confirm the Reservierungen connection."
+        if is_calendar else
+        "After redeploy, open <b>/debug</b> to confirm GMAIL_REFRESH_TOKEN reads true, then "
+        "<b>/poll_email</b> to run the first inbox check."
+    )
     html = (
         "<!doctype html><html><body style='font-family:sans-serif;max-width:640px;margin:40px auto'>"
-        "<h2>Gmail refresh token ready</h2>"
-        "<p>Copy the value below and set it in Railway as <b>GMAIL_REFRESH_TOKEN</b>, then redeploy. "
+        f"<h2>{heading}</h2>"
+        f"<p>Copy the value below and set it in Railway as <b>{var_name}</b>, then redeploy. "
         "Keep it secret, treat it like a password. This page shows it only once.</p>"
         f"<textarea readonly style='width:100%;height:120px'>{rt}</textarea>"
-        "<p>After redeploy, open <b>/debug</b> to confirm GMAIL_REFRESH_TOKEN reads true, then "
-        "<b>/poll_email</b> to run the first inbox check.</p>"
+        f"<p>{follow}</p>"
         "</body></html>"
     )
     return HTMLResponse(html)
+
+
+_CALENDAR_OAUTH_SCOPES = "https://www.googleapis.com/auth/calendar"
+
+
+@app.get("/oauth/calendar/start")
+def oauth_calendar_start():
+    """One click re-authorization for the calendar token (GOOGLE_REFRESH_TOKEN). Dan opens
+    this, signs in as the account that owns the Reservierungen calendar and allows. It reuses
+    the gmail callback, which is already a registered redirect URI, and tags the flow with
+    state=calendar so the callback tells you to paste the value into GOOGLE_REFRESH_TOKEN."""
+    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET):
+        return {"error": "GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET must be set in Railway first"}
+    import urllib.parse
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": _gmail_redirect_uri(),
+        "response_type": "code",
+        "scope": _CALENDAR_OAUTH_SCOPES,
+        "access_type": "offline",
+        "prompt": "consent",
+        "state": "calendar",
+        "login_hint": BAR_EMAIL,
+    }
+    return RedirectResponse("https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params))
 
 
 @app.get("/debug")
