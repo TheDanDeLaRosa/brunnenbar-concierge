@@ -2832,6 +2832,24 @@ SKIP_NOTIFY_DAN = os.environ.get("SKIP_NOTIFY_DAN", "true").lower() == "true"
 def notify_dan_skip(channel: str, sender: str, guest_text: str):
     if not SKIP_NOTIFY_DAN:
         return
+    if channel == "email":
+        # CHANGED 9 Sep 2026. Dan directly: "the concierge now sends me an
+        # email for every email that i recieve so i get another email every
+        # time i get a email." Every inbound email that claude_decide
+        # classifies as not guest/event related (newsletters, receipts,
+        # other business mail, anything not a concierge activity) was firing
+        # this FYI, and _deliver_to_dan sends it as WhatsApp AND email
+        # unconditionally, so one real email produced a second email. Dan
+        # already sees the original in his inbox, a skip FYI adds nothing on
+        # this channel the way it does on WhatsApp/Instagram, where the
+        # underlying message is not otherwise visible to him. So the email
+        # channel's skip FYI is silenced here, WhatsApp/Instagram skip FYIs
+        # and every genuine concierge alert (real handoff, booking, cancel,
+        # emergency, complaint) on ANY channel including email are untouched,
+        # this only removes the noisy "just so you know I ignored this"
+        # message. See [[project_brunnenbar_cloud_concierge]].
+        logger.info("email skip FYI silenced for %s (channel=email, not a concierge activity)", sender)
+        return
     snippet = (guest_text or "").strip().replace("\n", " ")
     if len(snippet) > 200:
         snippet = snippet[:200] + "..."
