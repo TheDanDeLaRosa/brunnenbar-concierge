@@ -1302,6 +1302,8 @@ CALL A TOOL, ALWAYS. Every single turn, you must call either book_table or send_
 
 NEVER CLAIM AN ACTION YOU DID NOT ACTUALLY TAKE. A real guest (Adriana, 04.09, ended up 6 people) was told "ich leite das an dan, er meldet sich gleich bei dir" as an action reply message, but no handoff was ever actually called, so nothing ever reached Dan and the guest was left waiting on a reply that was never coming. The words forwarding, weiterleiten, Dan meldet sich, ich gebe das weiter, or anything else that promises an escalation or a next step someone else will take, must never appear inside a reply message. If you genuinely need Dan, actually call action handoff, which is correctly silent to the guest by design, Dan follows up directly himself. If you do not need Dan, resolve it yourself right now with the information you already have, for example calling book_table once six or fewer of the usual details are known, rather than writing a reply that talks about escalating instead of actually doing so or actually escalating. A sentence that describes an action is not the same as the action, and here it left both the guest and Dan worse off than either a real handoff or a real booking would have.
 
+NEVER SELF-CONFIRM A RESERVATION YOU DID NOT ACTUALLY BOOK. A real guest (Felix Schweizer, 14 people, Sat 12.09, a birthday nachfeier) asked about a table, got walked warmly through the normal questions, and was then told "Cool, dann reservier ich euch einen Tisch fuer 14 Personen am Samstag den 12.09 um 22 Uhr, wir freuen uns drauf" as a plain reply action message. book_table was never called, nothing was ever written to the calendar, and Dan was never alerted, so a guest walked away thinking they had a table for their birthday that did not exist anywhere except that one sentence. This is the same mistake as NEVER CLAIM AN ACTION YOU DID NOT ACTUALLY TAKE above, but for a booking instead of a handoff, and it is a worse version of it, because 14 people is squarely GROUPS AND EVENTS territory, seven or more, where you must never confirm anything yourself in the first place, Dan closes those personally. The only two valid endings for any reservation conversation are, book_table actually called, with its own real confirmation text, once six or fewer of the usual details are known and there is no birthday, party, or private occasion in play, or action handoff actually called once you have enough to qualify a seven or more or occasion based event, which is correctly silent to the guest, Dan follows up directly. A reply message must never itself contain a sentence that sounds like a completed or promised booking, phrases like reservier ich, ist reserviert, hab euch eingetragen, or hab euch einen Tisch, unless book_table was the actual tool called this turn to produce it.
+
 TRIAGE FIRST. Decide what kind of message this is, then call send_reply with the matching action.
 If it is a genuine guest, a reservation, a birthday or group, an event, opening hours, or a normal guest question, call send_reply action reply, message set to your answer, following the rules below.
 If a real guest is just being friendly or playful, small talk, a compliment, an emoji, or they ask for something light like a joke, call send_reply action reply and answer briefly and warmly in character. Never go dead silent on a real person, that is a robot tell. If they ask for a joke, just tell a short clean easy one, have fun with it, you are a fun neighbourhood bar.
@@ -2183,6 +2185,13 @@ def handle(channel: str, sender: str, text: str):
                       "handoff, blocked before sending, guest needs your own reply",
                       channel, sender, text, reply[:200])
             return
+        if _looks_like_false_booking_confirmation(reply):
+            logger.error("Blocked a reply that falsely confirms a reservation without an actual book_table call "
+                         "(%s, %s): %s", channel, sender, reply[:300])
+            alert_dan("bot's draft confirmed a reservation in the message text without actually booking it, "
+                      "blocked before sending, guest needs a real reply and a real table from you",
+                      channel, sender, text, reply[:200])
+            return
     reply = (reply or "").strip()
     if not reply:
         logger.info("No reply, empty draft")
@@ -2527,6 +2536,42 @@ def _looks_like_false_escalation_promise(reply: str) -> bool:
     return any(m in low for m in _FALSE_ESCALATION_MARKERS)
 
 
+# Real incident, 7 Sep 2026, a real guest (Felix Schweizer, 14 people, Sat
+# 12.09 22:00, a birthday nachfeier) messaged asking about a reservation. This
+# should have gone through GROUPS AND EVENTS (7+ people, Dan closes personally,
+# never confirmed by the bot itself) and ended in an actual HANDOFF. Instead
+# the model walked the whole qualifying conversation itself and then, on the
+# plain reply action, just wrote "Cool, dann reservier ich euch einen Tisch
+# fuer 14 Personen am Samstag den 12.09 um 22 Uhr, wir freuen uns drauf." No
+# book_table call, no handoff, no alert_dan, nothing on the calendar, checked
+# directly via GET /conversations and the Reservierungen calendar. This is a
+# new failure class, not a repeat of the Adriana false-handoff-promise
+# incident above, that guard only catches a promised HANDOFF that never
+# happened, this is a promised BOOKING that never happened, on a party size
+# that should never have reached a self-confirmed reply at all. Same belt and
+# suspenders approach as _looks_like_false_escalation_promise, a keyword check
+# on the plain reply action text, independent of whatever SYSTEM_PROMPT says
+# should happen, since the prompt already said not to do this and the model
+# did it anyway. Only ever checked on the plain reply action path in
+# handle()/handle_email(), the real "book" action goes through
+# process_booking's own templates and alert_dan safety net instead, see
+# _book_or_handoff above, so this can never false positive on an actual
+# automated booking confirmation.
+_FALSE_BOOKING_MARKERS = (
+    "dann reservier ich", "reservier ich euch", "reserviere ich euch", "reservieren wir euch",
+    "ist hiermit reserviert", "hab euch reserviert", "habe euch reserviert",
+    "hab euch eingetragen", "habe euch eingetragen", "trag euch ein", "tisch ist reserviert",
+    "tisch ist fix", "richte das dann persoenlich fuer euch", "richte das dann persönlich für euch",
+    "i've booked you", "i have booked you", "you're booked in", "booked you a table",
+    "your table is booked", "table is reserved for you",
+)
+
+
+def _looks_like_false_booking_confirmation(reply: str) -> bool:
+    low = reply.lower()
+    return any(m in low for m in _FALSE_BOOKING_MARKERS)
+
+
 def _maybe_alert_api_failure(channel: str, sender: str, text: str):
     """The model itself failed to draft anything, for example the Anthropic API
     is down, rate limited, or ANTHROPIC_API_KEY is wrong. Without this the guest
@@ -2781,6 +2826,14 @@ def handle_email(svc, msg_id):
                          "handoff from %s: %s", from_addr, reply[:300])
             alert_dan("bot's draft promised a Dan follow up in the message text without actually calling "
                       "handoff, blocked before sending, guest needs your own reply (email)",
+                      "email", from_addr, text, reply[:200])
+            mark_handled()
+            return
+        if _looks_like_false_booking_confirmation(reply):
+            logger.error("Blocked an email reply that falsely confirms a reservation without an actual "
+                         "book_table call from %s: %s", from_addr, reply[:300])
+            alert_dan("bot's draft confirmed a reservation in the message text without actually booking it, "
+                      "blocked before sending, guest needs a real reply and a real table from you (email)",
                       "email", from_addr, text, reply[:200])
             mark_handled()
             return
