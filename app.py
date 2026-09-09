@@ -736,18 +736,41 @@ def _area_tables(area):
 
 
 def _seat_new_party(existing_parties, new_party, tables):
-    """Fit every existing party plus the new one into the tables, largest first,
-    each into the smallest table that still fits. Return the table the new party
-    lands on, or None if they cannot all be seated. This is what stops overbooking."""
+    """Fit every existing party plus the new one into the tables, largest first.
+    Each party takes the smallest single table that still fits it, exactly as
+    before. CHANGED 9 Sep 2026, Dan directly: "the bot should complete all
+    reservations", so a party bigger than the biggest single table (Stam, 8)
+    no longer just fails, it now falls back to the smallest combination of
+    several free tables whose seats add up to enough, largest tables first,
+    the same way the team physically pushes tables together for a bigger
+    group. Only tables not already claimed by an earlier, bigger party in
+    this same pass are ever handed out, so this still cannot fabricate
+    capacity or overbook, a combination is only returned if the real free
+    seats add up, never a guess. Return the table or combined table name
+    (e.g. "Stam+HT3") the NEW party lands on, or None if everyone genuinely
+    cannot be seated."""
     entries = [("existing", p) for p in existing_parties] + [("new", new_party)]
     entries.sort(key=lambda x: -x[1])
     free = [[n, s] for n, s in tables]
     new_table = None
     for tag, p in entries:
         pick = next((i for i, (n, s) in enumerate(free) if s >= p), None)
-        if pick is None:
-            return None
-        name = free.pop(pick)[0]
+        if pick is not None:
+            name = free.pop(pick)[0]
+        else:
+            combo_idx = sorted(range(len(free)), key=lambda i: -free[i][1])
+            combo, total = [], 0
+            for i in combo_idx:
+                combo.append(i)
+                total += free[i][1]
+                if total >= p:
+                    break
+            if total < p:
+                return None
+            names = [free[i][0] for i in combo]
+            for i in sorted(combo, reverse=True):
+                free.pop(i)
+            name = "+".join(names)
         if tag == "new":
             new_table = name
     return new_table
@@ -992,12 +1015,120 @@ def pending_hold_followup_loop():
         time.sleep(PENDING_HOLD_CHECK_INTERVAL_SECONDS)
 
 
+# PRIVATE SPACE AUTOMATION, added 9 Sep 2026. Until now hinterer Bereich and
+# ganze Bar exklusiv bookings were never tracked by the booking engine at all,
+# find_free_table only ever knew about the numbered TABLES, a private space
+# booking lived purely in a freeform calendar title Dan wrote by hand, and
+# GROUPS AND EVENTS always ended in a HANDOFF so Dan closed every one of these
+# himself. Dan changed that directly, 9 Sep 2026: "the bot should complete all
+# reservations and only let me know when they are booked... reach out only if
+# something is strange or need extra help." Price negotiation stays Dan only
+# per this project's own CLAUDE.md (money is Daniel only), everything else
+# about actually booking the space is now automatic. Mindestumsatz is always
+# the one standard published number, 700 or 1700 Euro, never negotiated here.
+PRIVATE_SPACES = {
+    "hinterer_bereich": {"capacity": 30, "mindestumsatz": 700, "label": "Hinterer Bereich"},
+    "ganze_bar": {"capacity": 65, "mindestumsatz": 1700, "label": "Ganze Bar exklusiv"},
+}
+
+
+def _detect_space(text: str):
+    """Best effort read of which private space, if any, a calendar event is
+    for, from its title and description combined. Deliberately over
+    inclusive, catches Dan's own varied freeform wording (Hinterer Bereich,
+    Vollstaendige Bar, ganze Bar exklusiv, whole bar) rather than a single
+    exact phrase, because the failure mode this guards against is a silent
+    double booking of a real private space, not a guest wrongly being told
+    something is unavailable. When genuinely unsure this must lean toward
+    treating text as a private space booking, never the other way round."""
+    low = (text or "").lower()
+    if "hinterer bereich" in low or "hintere bereich" in low:
+        return "hinterer_bereich"
+    for phrase in ("ganze bar", "vollstaendige bar", "vollständige bar", "bar exklusiv",
+                   "exklusive bar", "whole bar", "exclusive bar", "komplette bar"):
+        if phrase in low:
+            return "ganze_bar"
+    return None
+
+
+def _private_space_events_on(date_iso: str):
+    """Every calendar event on this date tagged as a private space booking, as
+    (space, start_dt, end_dt). Skips anything Dan marked ABGESAGT (cancelled),
+    matching the convention already used on the real calendar. Used so an
+    automatic hinterer Bereich or ganze Bar booking can never double book an
+    earlier automatic booking or one of Dan's own manual entries."""
+    svc = _calendar_service()
+    day = datetime.fromisoformat(date_iso).replace(tzinfo=BAR_TZ)
+    lo = day.replace(hour=0, minute=0, second=0, microsecond=0)
+    hi = lo + timedelta(days=1)
+    items = svc.events().list(
+        calendarId=RESERVIERUNGEN_CALENDAR_ID,
+        timeMin=lo.isoformat(), timeMax=hi.isoformat(),
+        singleEvents=True, orderBy="startTime",
+    ).execute().get("items", [])
+    out = []
+    for ev in items:
+        if (ev.get("summary") or "").strip().upper().startswith("ABGESAGT"):
+            continue
+        start = ev.get("start", {}).get("dateTime")
+        end = ev.get("end", {}).get("dateTime")
+        if not start or not end:
+            continue
+        space = _detect_space((ev.get("summary", "") or "") + " " + (ev.get("description", "") or ""))
+        if space:
+            out.append((space, datetime.fromisoformat(start), datetime.fromisoformat(end)))
+    return out
+
+
+def _ganze_bar_conflict(date_iso: str, start_dt: datetime, end_dt: datetime) -> bool:
+    """True if anything at all already overlaps this window that date, a
+    normal table or another private space booking, since closing the whole
+    bar exclusively for one group means no other guests that night at all."""
+    turn = timedelta(hours=TURN_HOURS)
+    for area, party, s in reservations_on(date_iso):
+        if s < end_dt and start_dt < s + turn:
+            return True
+    for space, s, e in _private_space_events_on(date_iso):
+        if s < end_dt and start_dt < e:
+            return True
+    return False
+
+
+def find_private_space(date_iso: str, start_dt: datetime, party: int, space: str) -> bool:
+    """Whether `space` (hinterer_bereich or ganze_bar) is actually free for
+    this date and the usual 3 hour turn, and the party fits its real
+    capacity. hinterer Bereich only conflicts with another hinterer Bereich or
+    ganze Bar booking, it shares the room with normal walk in service out
+    front so it never blocks or gets blocked by ordinary table reservations.
+    ganze Bar exklusiv conflicts with literally anything else on the calendar
+    that overlaps, see _ganze_bar_conflict. Never fabricates availability."""
+    turn = timedelta(hours=TURN_HOURS)
+    end_dt = start_dt + turn
+    cap = PRIVATE_SPACES[space]["capacity"]
+    if party > cap:
+        return False
+    if space == "ganze_bar":
+        return not _ganze_bar_conflict(date_iso, start_dt, end_dt)
+    for sp, s, e in _private_space_events_on(date_iso):
+        if s < end_dt and start_dt < e:
+            return False
+    return True
+
+
 def find_free_table(date_iso: str, start_dt: datetime, party: int, area: str):
     """The table the new party would get in the requested area and 3 hour turn,
     or None if the area cannot seat everyone, so it never overbooks. The turn is
-    measured from the actual start time, a 19:30 booking holds until 22:30."""
+    measured from the actual start time, a 19:30 booking holds until 22:30.
+    CHANGED 9 Sep 2026, first checks whether the whole bar is closed
+    exclusively for someone else that slot, a ganze Bar exklusiv booking never
+    shows up as a normal drinnen/draussen reservation so this would otherwise
+    miss that conflict entirely and risk double booking a table inside an
+    exclusively closed bar."""
     turn = timedelta(hours=TURN_HOURS)
     req_end = start_dt + turn
+    for space, s, e in _private_space_events_on(date_iso):
+        if space == "ganze_bar" and s < req_end and start_dt < e:
+            return None
     overlapping = [
         p for (a, p, s) in reservations_on(date_iso)
         if a == area and s < req_end and start_dt < s + turn
@@ -1026,6 +1157,40 @@ def create_reservation(name, contact, party, area, start_dt, occasion, table, la
         f"Essen: keine Info\n"
         f"Besondere Wuensche: keine\n"
         f"Wichtige Hinweise fuer das Team: automatisch vom Concierge gebucht, Tisch {table}. "
+        f"Endzeit {end_dt.strftime('%H:%M')} ist nur eine Annahme. {note}"
+    ).strip()
+    body = {
+        "summary": summary,
+        "description": desc,
+        "start": {"dateTime": start_dt.isoformat(), "timeZone": "Europe/Berlin"},
+        "end": {"dateTime": end_dt.isoformat(), "timeZone": "Europe/Berlin"},
+    }
+    return svc.events().insert(calendarId=RESERVIERUNGEN_CALENDAR_ID, body=body).execute()
+
+
+def create_private_space_reservation(name, contact, party, space, start_dt, occasion, lang="de", note=""):
+    """Same idea as create_reservation, for hinterer_bereich or ganze_bar
+    instead of a numbered table. Added 9 Sep 2026 alongside the rest of the
+    private space automation, see the block comment above find_free_table."""
+    svc = _calendar_service()
+    end_dt = start_dt + timedelta(hours=TURN_HOURS)
+    anlass = occasion or "Schöner Abend"
+    info = PRIVATE_SPACES[space]
+    label = info["label"]
+    summary = f"{name} - {party} Personen - {anlass} - {label}"
+    desc = (
+        f"Name: {name}\n"
+        f"Telefon/Contact: WhatsApp {contact}\n"
+        f"Anzahl Personen: {party}\n"
+        f"Besonderer Anlass: {anlass}\n"
+        f"Reservierter Bereich: {label}\n"
+        f"Mindestumsatz: {info['mindestumsatz']} Euro, Standardpreis, keine Sonderkonditionen im Chat vereinbart\n"
+        f"Sprache: {lang}\n"
+        f"Zahlung: keine Info\n"
+        f"Musik: keine Info\n"
+        f"Essen: keine Info\n"
+        f"Besondere Wuensche: keine\n"
+        f"Wichtige Hinweise fuer das Team: automatisch vom Concierge gebucht, {label}. "
         f"Endzeit {end_dt.strftime('%H:%M')} ist nur eine Annahme. {note}"
     ).strip()
     body = {
@@ -1145,16 +1310,25 @@ def post_visit_checkin_loop():
 
 
 def process_booking(sender: str, data: dict, lang: str = "de", channel: str = "whatsapp") -> str:
-    """Given the details the model gave the tool, check the table map, book if a
-    table is free, and return the guest reply in the guest's language. Never
+    """Given the details the model gave the tool, check real availability, book
+    if it is free, and return the guest reply in the guest's language. Never
     overbooks, because the whole check then book sequence runs inside
     _book_lock, see the comment on that lock above. Every path where the guest
     is told Dan is handling it also actually alerts Dan, so that promise is
     never just words, see [[project_brunnenbar_cloud_concierge]] on the earlier
-    SKIP path having the same gap for the text reply side of the bot."""
+    SKIP path having the same gap for the text reply side of the bot. CHANGED
+    9 Sep 2026, now also handles hinterer_bereich and ganze_bar, not just a
+    numbered table, per Dan directly: "the bot should complete all
+    reservations and only let me know when they are booked." Every genuinely
+    successful booking here, table or private space, also fires a low key FYI
+    to Dan, see notify_dan_booked below, so he stays informed without having
+    to do anything."""
     try:
         party = int(data.get("party") or 0)
         area = "draussen" if str(data.get("area", "")).lower().startswith("drau") else "drinnen"
+        space = str(data.get("space") or "tisch").strip().lower()
+        if space not in ("tisch", "hinterer_bereich", "ganze_bar"):
+            space = "tisch"
         date_iso = str(data["date"])
         hhmm = str(data["time"])
         start_dt = datetime.fromisoformat(date_iso + "T" + hhmm).replace(tzinfo=BAR_TZ)
@@ -1166,12 +1340,69 @@ def process_booking(sender: str, data: dict, lang: str = "de", channel: str = "w
         alert_dan("booking details from the guest did not parse, needs a manual look",
                   channel, sender, json.dumps(data, ensure_ascii=False), str(e))
         return ""
-    what = f"{party} Personen, {area}, {date_iso} {hhmm}, {name}"
+    space_label = PRIVATE_SPACES.get(space, {}).get("label", "")
+    what = f"{party} Personen, {area}, {date_iso} {hhmm}, {name}" + (f" ({space_label})" if space_label else "")
     if not (BOOKING_ENABLED and GOOGLE_REFRESH_TOKEN and RESERVIERUNGEN_CALENDAR_ID):
         logger.warning("booking not configured, handing off")
         alert_dan("booking requested but calendar is not configured", channel, sender, what,
                    "BOOKING_ENABLED/GOOGLE_REFRESH_TOKEN/RESERVIERUNGEN_CALENDAR_ID, check Railway")
         return _handoff_line(sie, lang)
+
+    if space in ("hinterer_bereich", "ganze_bar"):
+        with _book_lock:
+            try:
+                free = find_private_space(date_iso, start_dt, party, space)
+            except Exception as e:
+                logger.error("private space availability check failed: %s", e)
+                alert_dan("booking availability check failed, needs a manual look", channel, sender, what, str(e))
+                return _handoff_line(sie, lang)
+            if not free:
+                logger.info("no free %s for %s %s party %s", space, date_iso, hhmm, party)
+                alert_dan(f"{space_label} is not available at the requested time or party is over its capacity, "
+                          "guest needs a manual answer", channel, sender, what)
+                return _full_line(sie, lang)
+            try:
+                create_private_space_reservation(name, sender, party, space, start_dt, occasion, lang)
+            except Exception as e:
+                logger.error("create_private_space_reservation failed: %s", e)
+                alert_dan(f"{space_label} was free but saving the booking to the calendar failed",
+                          channel, sender, what, str(e))
+                return _handoff_line(sie, lang)
+        logger.info("booked %s for %s party %s %s %s", space, name, party, date_iso, hhmm)
+        notify_dan_booked(channel, sender, f"{what}, Mindestumsatz {PRIVATE_SPACES[space]['mindestumsatz']} Euro")
+        h = start_dt.strftime("%H")
+        hm = f"{h}:{start_dt.strftime('%M')}" if start_dt.minute else h
+        days_de = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
+        wd = days_de[start_dt.weekday()]
+        mu = PRIVATE_SPACES[space]["mindestumsatz"]
+        if lang == "en":
+            days_en = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+            d = days_en[start_dt.weekday()]
+            h12 = start_dt.hour % 12 or 12
+            mins = f":{start_dt.strftime('%M')}" if start_dt.minute else ""
+            time_en = f"{h12}{mins} {'am' if start_dt.hour < 12 else 'pm'}"
+            where_en = "the back lounge" if space == "hinterer_bereich" else "the whole bar exclusively"
+            return random.choice([
+                f"You're booked in, {where_en} for {d} at {time_en}. Mindestumsatz is {mu} Euro, that just runs "
+                f"through your drinks like a normal tab. See you then",
+                f"Done, {where_en} is yours {d} at {time_en}. {mu} Euro Mindestumsatz, covered by what you drink "
+                f"anyway. Looking forward to it",
+            ])
+        where_de = "der hintere Bereich" if space == "hinterer_bereich" else "die ganze Bar exklusiv"
+        if sie:
+            return random.choice([
+                f"Sehr gerne, {where_de} ist fuer Sie eingetragen, {wd} um {hm} Uhr. Der Mindestumsatz liegt bei "
+                f"{mu} Euro und laeuft ganz normal ueber Ihre Getraenke. Wir freuen uns",
+                f"Perfekt, {where_de} steht fuer Sie, {wd} um {hm} Uhr, Mindestumsatz {mu} Euro ueber die "
+                f"Getraenke. Bis dann",
+            ])
+        return random.choice([
+            f"Cool, {where_de} ist fuer euch eingetragen, {wd} um {hm} Uhr. Mindestumsatz liegt bei {mu} Euro, "
+            f"laeuft ganz normal ueber eure Getraenke. Freu mich auf euch",
+            f"Passt, {where_de} habt ihr fuer {wd} um {hm} Uhr. {mu} Euro Mindestumsatz, laeuft ueber die "
+            f"Getraenke wie sonst auch. Bis dann",
+        ])
+
     with _book_lock:
         try:
             table = find_free_table(date_iso, start_dt, party, area)
@@ -1190,6 +1421,7 @@ def process_booking(sender: str, data: dict, lang: str = "de", channel: str = "w
             alert_dan("table was free but saving the booking to the calendar failed", channel, sender, what, str(e))
             return _handoff_line(sie, lang)
     logger.info("booked table %s for %s party %s %s %s", table, name, party, date_iso, hhmm)
+    notify_dan_booked(channel, sender, f"{what}, Tisch {table}")
     h = start_dt.strftime("%H")
     # BUG FIXED 20 Aug 2026: the German confirmation lines below used to say
     # "{h} Uhr" with only the hour, silently dropping the minutes for any
@@ -1300,9 +1532,9 @@ SYSTEM_PROMPT = """You are the concierge for BrunnenBar, a neighbourhood cocktai
 
 CALL A TOOL, ALWAYS. Every single turn, you must call either book_table or send_reply, exactly once. Never answer with plain text outside of a tool call, not even a single word, not even to explain yourself, not even if you are unsure or the conversation history looks incomplete to you. If anything about the context is unclear, that uncertainty is never something to write out loud anywhere, in a tool call or otherwise, just make the best call you can with send_reply action reply and, if truly necessary, ask the guest the single most useful clarifying question the normal way.
 
-NEVER CLAIM AN ACTION YOU DID NOT ACTUALLY TAKE. A real guest (Adriana, 04.09, ended up 6 people) was told "ich leite das an dan, er meldet sich gleich bei dir" as an action reply message, but no handoff was ever actually called, so nothing ever reached Dan and the guest was left waiting on a reply that was never coming. The words forwarding, weiterleiten, Dan meldet sich, ich gebe das weiter, or anything else that promises an escalation or a next step someone else will take, must never appear inside a reply message. If you genuinely need Dan, actually call action handoff, which is correctly silent to the guest by design, Dan follows up directly himself. If you do not need Dan, resolve it yourself right now with the information you already have, for example calling book_table once six or fewer of the usual details are known, rather than writing a reply that talks about escalating instead of actually doing so or actually escalating. A sentence that describes an action is not the same as the action, and here it left both the guest and Dan worse off than either a real handoff or a real booking would have.
+NEVER CLAIM AN ACTION YOU DID NOT ACTUALLY TAKE. A real guest (Adriana, 04.09, ended up 6 people) was told "ich leite das an dan, er meldet sich gleich bei dir" as an action reply message, but no handoff was ever actually called, so nothing ever reached Dan and the guest was left waiting on a reply that was never coming. The words forwarding, weiterleiten, Dan meldet sich, ich gebe das weiter, or anything else that promises an escalation or a next step someone else will take, must never appear inside a reply message. If you genuinely need Dan, actually call action handoff, which is correctly silent to the guest by design, Dan follows up directly himself. If you do not need Dan, resolve it yourself right now with the information you already have, for example calling book_table once the usual details are known, rather than writing a reply that talks about escalating instead of actually doing so or actually escalating. A sentence that describes an action is not the same as the action, and here it left both the guest and Dan worse off than either a real handoff or a real booking would have.
 
-NEVER SELF-CONFIRM A RESERVATION YOU DID NOT ACTUALLY BOOK. A real guest (Felix Schweizer, 14 people, Sat 12.09, a birthday nachfeier) asked about a table, got walked warmly through the normal questions, and was then told "Cool, dann reservier ich euch einen Tisch fuer 14 Personen am Samstag den 12.09 um 22 Uhr, wir freuen uns drauf" as a plain reply action message. book_table was never called, nothing was ever written to the calendar, and Dan was never alerted, so a guest walked away thinking they had a table for their birthday that did not exist anywhere except that one sentence. This is the same mistake as NEVER CLAIM AN ACTION YOU DID NOT ACTUALLY TAKE above, but for a booking instead of a handoff, and it is a worse version of it, because 14 people is squarely GROUPS AND EVENTS territory, seven or more, where you must never confirm anything yourself in the first place, Dan closes those personally. The only two valid endings for any reservation conversation are, book_table actually called, with its own real confirmation text, once six or fewer of the usual details are known and there is no birthday, party, or private occasion in play, or action handoff actually called once you have enough to qualify a seven or more or occasion based event, which is correctly silent to the guest, Dan follows up directly. A reply message must never itself contain a sentence that sounds like a completed or promised booking, phrases like reservier ich, ist reserviert, hab euch eingetragen, or hab euch einen Tisch, unless book_table was the actual tool called this turn to produce it.
+NEVER SELF-CONFIRM A RESERVATION YOU DID NOT ACTUALLY BOOK. A real guest (Felix Schweizer, 14 people, Sat 12.09, a birthday nachfeier) asked about a table, got walked warmly through the normal questions, and was then told "Cool, dann reservier ich euch einen Tisch fuer 14 Personen am Samstag den 12.09 um 22 Uhr, wir freuen uns drauf" as a plain reply action message. book_table was never called, nothing was ever written to the calendar, and Dan was never alerted, so a guest walked away thinking they had a table for their birthday that did not exist anywhere except that one sentence. This is the same mistake as NEVER CLAIM AN ACTION YOU DID NOT ACTUALLY TAKE above, but for a booking instead of a handoff. Since 9 Sep 2026 this matters even more, not less, because book_table itself now handles every reservation and event, any size, plain table or private space, so there is almost never a legitimate reason a reply should describe a booking instead of book_table actually creating one. The only valid endings for a reservation or event conversation are, book_table actually called, with its own real confirmation text, once everything needed is known, see RESERVATIONS AND EVENTS below, or action handoff actually called for one of the few real exceptions in WHEN THIS IS STILL A REAL HANDOFF, correctly silent to the guest, Dan follows up directly. A reply message must never itself contain a sentence that sounds like a completed or promised booking, phrases like reservier ich, ist reserviert, hab euch eingetragen, or hab euch einen Tisch, unless book_table was the actual tool called this turn to produce it.
 
 TRIAGE FIRST. Decide what kind of message this is, then call send_reply with the matching action.
 If it is a genuine guest, a reservation, a birthday or group, an event, opening hours, or a normal guest question, call send_reply action reply, message set to your answer, following the rules below.
@@ -1341,19 +1573,21 @@ READ THE WHOLE THREAD FIRST, EVERY SINGLE TIME. Before you write one word of a r
 
 TIME AND OPENING HOURS. For anything about whether the bar is open, or what day or time it is, rely ONLY on the AKTUELLER ZEITPUNKT line given to you and never guess the weekday. Opening hours are Donnerstag 18 bis 24 Uhr, Freitag und Samstag 18 bis 2 Uhr, sonst geschlossen. There is a Happy Hour bis 20 Uhr, mention it warmly but never quote prices. If today is a closed day, say so kindly and name the next open day.
 
-RESERVATIONS up to six people. You need six things, the date, the time, the number of people, a name, whether they would like inside or outside, and whether it is for a special occasion. Always ask about the occasion, warmly, even if they have not mentioned one, because we like to note it, and if there is none that is completely fine. If any of these is missing, ask for what is missing warmly in one short flowing message, never as a list, and do not book yet. Once you have all six, do NOT write a confirmation yourself. Instead call the book_table tool with the details. Resolve the date to YYYY-MM-DD using the AKTUELLER ZEITPUNKT line, use 24 hour time as HH:MM, area is exactly drinnen or draussen, occasion is the Anlass or an empty string, and sie is true only if you are speaking to the guest in the formal Sie form. The system then checks the real table availability, books an actual table and sends the guest the confirmation for you, so when you call book_table you do not also write any message. Only ever call book_table for parties of up to six people, never for seven or more.
+RESERVATIONS AND EVENTS, CHANGED 9 Sep 2026, Dan directly: "the bot should complete all reservations and only let me know when they are booked... reach out only if something is strange or need extra help... it should be end to end, self healing and self improving." You now complete every reservation and event yourself, plain table or a real private space, any party size, ending in an actual book_table call, not a handoff to Dan. The only reasons left to use action handoff for a reservation or event are real exceptions, listed at the end of GROUPS AND EVENTS below, never just because a party is bigger or wants a private space.
+
+RESERVATIONS. You need six things, the date, the time, the number of people, a name, whether they would like inside or outside, and whether it is for a special occasion. Always ask about the occasion, warmly, even if they have not mentioned one, because we like to note it, and if there is none that is completely fine. If any of these is missing, ask for what is missing warmly in one short flowing message, never as a list, and do not book yet. Once you have all six, do NOT write a confirmation yourself. Instead call the book_table tool with the details, space left as tisch (the default). Resolve the date to YYYY-MM-DD using the AKTUELLER ZEITPUNKT line, use 24 hour time as HH:MM, area is exactly drinnen or draussen, occasion is the Anlass or an empty string, and sie is true only if you are speaking to the guest in the formal Sie form. The system then checks real availability, joining several normal tables together automatically for a bigger group exactly the way the team physically pushes tables together, books it and sends the guest the confirmation and Dan an FYI for you, so when you call book_table you do not also write any message. There is no more six person ceiling, call book_table for any party size that just wants a normal table, GROUPS AND EVENTS below only changes how much you gather first, never who closes it.
 
 SAME DAY BY PHONE. This rule comes before the booking rule. Whether this applies right now is stated directly for you at the end of the AKTUELLER ZEITPUNKT line, either "gilt SAME DAY BY PHONE" or "gilt hier NICHT", always trust that line instead of working it out yourself from the clock, that line is always correct and up to date. When it says SAME DAY BY PHONE applies, a guest asking for a table today, never call book_table, instead thank them for their message and tell them to call the bar directly under 0821 47019035 rather than WhatsApp, and briefly say why, the team on site can actually see what is still free right now and take the reservation directly over the phone, WhatsApp cannot check real time availability the way a call can. Do not just say calling is fastest with no reason given. Something like this in feel, never copied word for word twice in a row, Danke fuer deine Nachricht, fuer heute Abend am besten kurz direkt unter 0821 47019035 anrufen, das Team vor Ort kann dir am besten sagen was wir noch frei haben und deine Reservierung gleich aufnehmen. When it says SAME DAY BY PHONE does not apply, a same day request is a completely normal advance booking like any other day, gather the usual details and call book_table as normal, do not redirect them to call just because the word heute or today came up. If you already told a guest to call, or Dan already personally handled a booking for them earlier in this thread, for example an assistant echo giving them a table, never repeat the call instruction again to the same guest in the same thread, that is now resolved, move on naturally instead, see READ THE WHOLE THREAD FIRST above.
 
-GROUPS AND EVENTS, seven people or more, or any birthday, party or private booking. Treat it as an event and do not confirm anything yourself, Dan closes these personally. Walk through this warmly over several messages, one thing at a time, never as a stacked list, and read the conversation so far so you never ask something already answered. Follow Steps one through five IN ORDER, even if the guest's very first message already hands you several details at once, like a headcount or a date in the same breath as asking for space. Do not let an early headcount pull you ahead into naming or recommending an area, that belongs to Step three only, after Step one has a name and Step two has asked if they have been here before. Jumping straight to "the hinterer Bereich would be perfect for that many people" before either of those is a real ordering mistake, not just style, it primes the guest toward one option before they have heard both and before they have heard the price.
+GROUPS AND EVENTS, seven people or more, or any birthday, party or private booking. Still walk through this warmly over several messages, one thing at a time, never as a stacked list, and read the conversation so far so you never ask something already answered. The only thing that changed 9 Sep 2026 is who closes it, you do, ending in book_table, not Dan by default, see RESERVATIONS AND EVENTS above. How much you need to gather before calling book_table still depends on what the guest actually wants, a plain bigger table only needs the same six things as any RESERVATION, only a real private space (hinterer Bereich or ganze Bar) needs the fuller Steps three through five below. Follow Steps one through five IN ORDER, even if the guest's very first message already hands you several details at once, like a headcount or a date in the same breath as asking for space. Do not let an early headcount pull you ahead into naming or recommending an area, that belongs to Step three only, after Step one has a name and Step two has asked if they have been here before. Jumping straight to "the hinterer Bereich would be perfect for that many people" before either of those is a real ordering mistake, not just style, it primes the guest toward one option before they have heard both and before they have heard the price.
 
-DOWNGRADE BACK TO A NORMAL RESERVATION. A real guest (Adriana) opened at 8 people, was walked into this GROUPS AND EVENTS flow, then said 6 would also be fine, and the conversation never came back out of event mode, ending in a message that promised a Dan follow up that never happened, see NEVER CLAIM AN ACTION YOU DID NOT ACTUALLY TAKE above. If the only reason this became an event was a headcount of seven or more, and that headcount later drops to six or fewer, and there is no birthday, party, or private occasion in play, this is a completely normal RESERVATION again, not an event. Once you have the six usual things, date, time, six or fewer people, area, name, occasion, call book_table exactly as in RESERVATIONS above, do not keep walking through Steps three onward for a group that no longer needs them and do not hand this off to Dan just because it started out bigger. If a birthday, party, or private occasion was mentioned at any point, keep treating it as an event regardless of headcount, that trigger is about the occasion, not just the number.
+WHEN THIS IS STILL A REAL HANDOFF. A reservation or event only ever goes to action handoff now for a genuine exception, not just because it is big or private, since you close everything else yourself with book_table. That means, a guest pushes back on the Mindestumsatz price or asks for a discount or different terms, that is always Dan's call, never yours, see Step four. A party bigger than 65, the whole bar's real capacity. Anything book_table genuinely could not fulfil, the date and every space or table option you tried and offered back are actually full, and the guest does not want any of the alternatives. Or anything that feels genuinely unusual, ambiguous, or outside everything described in this prompt, when in doubt, a real handoff costs Dan two seconds, a wrongly self-confirmed booking costs a guest their evening, see NEVER SELF-CONFIRM A RESERVATION YOU DID NOT ACTUALLY BOOK above. For all of these, call send_reply action handoff, reason a full compact summary of the situation and everything already gathered, message left empty, same as any other handoff.
 
 Before asking anything in Step one or Step two, actually scan the full conversation history for this sender for an occasion, a name, or a "have you been here before" answer that already came up earlier in the same thread, even days earlier, even in a completely different message than the one you are answering now. A guest who jumps straight to "I want to book the hinterer Bereich for 25 people on the 18th" without any of the earlier small talk has very often already told you the occasion, their name, or that they have visited before, days or weeks ago, in the very same thread you are looking at right now. Skip a step entirely and move straight to the next one if history already answers it, do not run through the full script fresh just because this particular message reads like an opener. This is the single most common way READ THE WHOLE THREAD FIRST gets missed, a real returning guest gets asked their own birthday's occasion, their own name, or whether they have been here before, all things they already told this same thread earlier.
 
 Step one, the basics. Get the occasion, the date, roughly what time, how many people, and the name of whoever is organising it. A WhatsApp or Instagram display name is not reliable enough to hand to Dan on its own, always ask for it directly, warmly, folded in naturally rather than as an interrogation, for example wie darf ich dich denn nennen or unter welchem namen darf ich das notieren. Do not consider Step one finished, and do not move on to explaining the space in Step three, until you actually have a name, not just a guess from the chat profile.
 
-TENTATIVE HOLD. The moment you have both a real date and a rough headcount for a GROUPS AND EVENTS inquiry, even if a name or occasion is still missing, call send_reply action reply as normal but also fill in event_hold with the date, party, name (use Gast if you truly do not have one yet), and occasion if known. This actually places a clearly marked, not yet confirmed placeholder on the calendar, so if you tell a guest a date is frei or reserved for them that is now true, never say a date is blocked or held without also calling event_hold in that same turn, an unbacked promise like that is exactly the kind of mistake that got caught before, Dan found a guest who was told a date was blocked when nothing was ever actually on the calendar. Call event_hold again any later turn the headcount, date, or occasion changes, it always updates the same placeholder rather than creating a second one, you never need to worry about duplicates. This is never a real booking and never replaces the eventual HANDOFF once the inquiry actually qualifies, Dan still closes every event personally, this only makes an open inquiry visible so two guests never both think the same date is theirs.
+TENTATIVE HOLD. The moment you have both a real date and a rough headcount for a GROUPS AND EVENTS inquiry, even if a name or occasion is still missing, call send_reply action reply as normal but also fill in event_hold with the date, party, name (use Gast if you truly do not have one yet), and occasion if known. This actually places a clearly marked, not yet confirmed placeholder on the calendar, so if you tell a guest a date is frei or reserved for them that is now true, never say a date is blocked or held without also calling event_hold in that same turn, an unbacked promise like that is exactly the kind of mistake that got caught before, Dan found a guest who was told a date was blocked when nothing was ever actually on the calendar. Call event_hold again any later turn the headcount, date, or occasion changes, it always updates the same placeholder rather than creating a second one, you never need to worry about duplicates. This is never a real booking and never replaces the eventual book_table call once you actually have everything you need, this only makes an open inquiry visible in the meantime so two guests never both think the same date is theirs while you are still gathering details across several messages.
 
 The very first time you place a hold for a guest, one short sentence in that same reply should also let them know we will check back in with them in ein paar Tagen if we have not heard anything, so a later reminder never feels random or out of nowhere, something like wir melden uns in zwei Tagen nochmal kurz falls wir nichts von euch hoeren, nur um sicherzugehen. Do not repeat this sentence on every later update to the same hold, once is enough, it would start to sound naggy.
 
@@ -1373,7 +1607,7 @@ Only for hinterer Bereich or whole bar exclusive, find out over the rest of the 
 
 Throughout, warmly invite them to come by and see the space in person if they would like, that is always a good next step and something Dan says often.
 
-Once you have gathered what you need, this is a handoff, not a plain reply. Call send_reply action handoff with reason set to a full compact summary of everything gathered (name, occasion, date, time, headcount, area, and any Step five answers already given). Do not set a message for this case, leave it empty. Dan wants to write the actual follow up to a fully qualified event himself, in his own words, once he sees the alert, not have you send a closing line first. This still actually pings Dan the moment the event is qualified, which is the whole point, he follows up personally and directly with the guest from here, on whichever channel they wrote on.
+Once you have everything Steps one through four call for (and Step five, only for a real private space), call book_table, not send_reply, to actually finish it. Set space to hinterer_bereich or ganze_bar for a real private space the guest has chosen and accepted the Mindestumsatz for, or leave it as tisch for a plain bigger table, same as any RESERVATION, and party to the full headcount, there is no six person ceiling anymore. The system checks real availability for whichever space you asked for, books it, and sends the guest the actual confirmation itself, including the Mindestumsatz reminder for a private space, and pings Dan an FYI once it is actually booked, so you never write that confirmation yourself and Dan never has to write the follow up either unless something in WHEN THIS IS STILL A REAL HANDOFF above actually applies.
 
 HOW DAN REALLY EXPLAINS EVENTS AND PRICING, real lines from his own chats, copy this feel, never quote the older 1600 or a Trinkgeld percentage from anywhere, 700 and 1700 covering everything are the only correct current numbers.
 The two areas, die bar ist im prinzip in zwei bereiche aufgeteilt mit der hauptbar in der mitte, vorne ist der hauptbereich mit den tischen im eingangsbereich und hinten haben wir nochmal einen etwas separateren lounge bereich.
@@ -1404,18 +1638,35 @@ Every turn ends in exactly one tool call, book_table or send_reply, never both, 
 BOOK_TOOL = {
     "name": "book_table",
     "description": (
-        "Reserve a table. Only call this once you have ALL of these from the guest, the date, "
-        "the time, the number of people which must be six or fewer, the area drinnen or draussen, "
-        "the guest's name, and whether it is for a special occasion. Do NOT call it for seven or "
-        "more people, for an event, or for a same day request after 18 Uhr. Calling it books a real "
-        "table and sends the guest the confirmation, so when you call it you write no message yourself."
+        "Reserve a table or a private space. CHANGED 9 Sep 2026, Dan directly: the bot now "
+        "completes every reservation and event itself, any party size, there is no more six "
+        "person ceiling and GROUPS AND EVENTS no longer ends in a handoff by default, see WHEN "
+        "THIS IS STILL A REAL HANDOFF in the system prompt for the few real exceptions left "
+        "(price pushback, over 65 people, genuinely nothing available). Only call this once you "
+        "have ALL of these from the guest, the date, the time, the number of people, the area "
+        "drinnen or draussen, the guest's name, and whether it is for a special occasion, plus "
+        "for a private space, that the guest actually chose it and accepted the standard "
+        "Mindestumsatz. Do NOT call it for a same day request after 18 Uhr, see SAME DAY BY "
+        "PHONE. Calling it books the real table or space, sends the guest the confirmation and "
+        "Dan an FYI once it is actually booked, so when you call it you write no message yourself."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
             "name": {"type": "string", "description": "The guest's name"},
-            "party": {"type": "integer", "description": "Number of people, 1 to 6"},
+            "party": {"type": "integer", "description": "Number of people, 1 to 65"},
             "area": {"type": "string", "enum": ["drinnen", "draussen"]},
+            "space": {
+                "type": "string",
+                "enum": ["tisch", "hinterer_bereich", "ganze_bar"],
+                "description": (
+                    "tisch for a normal table, one or several pushed together, no Mindestumsatz, "
+                    "any party size, this is the default and by far the most common case. "
+                    "hinterer_bereich or ganze_bar only once the guest has actually chosen that "
+                    "private space in Step three/four and accepted the standard Mindestumsatz, "
+                    "700 or 1700 Euro. Omit or send tisch for a normal reservation."
+                ),
+            },
             "date": {"type": "string", "description": "YYYY-MM-DD, resolved from the AKTUELLER ZEITPUNKT line"},
             "time": {"type": "string", "description": "HH:MM in 24 hour time"},
             "occasion": {"type": "string", "description": "The Anlass, or an empty string if none"},
@@ -1450,16 +1701,16 @@ SEND_REPLY_TOOL = {
         "Send your actual response for this turn. You must call either this tool or "
         "book_table on every turn, never answer with plain text outside a tool call. "
         "Use action reply for a normal message to the guest. Use action skip for spam "
-        "or a clearly non guest automated message, no message needed. Use action "
-        "handoff when you cannot safely answer yourself (price/policy questions, "
-        "reschedule requests, a guest asking for a real person), give a short reason, "
-        "message is always left empty and the guest gets nothing this turn, Dan "
-        "follows up directly. This also applies to a GROUPS AND EVENTS inquiry that has "
-        "just become fully qualified (name, occasion, date, time, headcount, and the "
-        "rest of the walkthrough gathered), give a full compact summary as the reason "
-        "(this reason is the only thing Dan sees to work from, so make it complete, not "
-        "just a couple of words) but leave message empty, Dan writes the actual follow "
-        "up to the guest himself once he sees the alert. Use "
+        "or a clearly non guest automated message, no message needed. CHANGED 9 Sep "
+        "2026, use action handoff only for a real exception you genuinely cannot "
+        "resolve yourself, a fully qualified reservation or event now ends in "
+        "book_table, not handoff, see WHEN THIS IS STILL A REAL HANDOFF in the system "
+        "prompt. That leaves handoff for things like a price or Mindestumsatz "
+        "question you cannot resolve, a guest pushing back on price, a reschedule of "
+        "an existing booking, a guest asking for a real person, a party over 65, or a "
+        "date/space that is genuinely unavailable and the guest does not want any "
+        "alternative offered, give a short reason, message is always left empty and "
+        "the guest gets nothing this turn, Dan follows up directly. Use "
         "action cancel_request when a guest wants to cancel an existing booking "
         "outright, give a short message field just as described in the CANCEL_REQUEST "
         "rules above. Use action escalate_emergency for immediate danger, message field "
@@ -1486,9 +1737,8 @@ SEND_REPLY_TOOL = {
                     "The exact guest facing text to send, in the house voice rules above. "
                     "Required for reply, cancel_request, escalate_emergency, and "
                     "escalate_complaint. Leave empty for skip and always empty for handoff, "
-                    "including a just-qualified GROUPS AND EVENTS inquiry, Dan writes the "
-                    "guest follow up himself once he sees the alert, never send a closing "
-                    "line for that case. Never include any internal "
+                    "Dan writes the guest follow up himself once he sees the alert, never "
+                    "send a closing line for a handoff. Never include any internal "
                     "reasoning, explanation of your classification, or mention of tools, "
                     "markers, or missing context here, only what a guest should read."
                 ),
@@ -1496,13 +1746,13 @@ SEND_REPLY_TOOL = {
             "reason": {
                 "type": "string",
                 "description": (
-                    "For action handoff only. Usually a short few word reason for Dan in "
-                    "English, for example asking exact Mindestumsatz for a 40 person "
-                    "event. For a just-qualified GROUPS AND EVENTS handoff specifically, "
-                    "make this a full compact summary instead, everything gathered so "
-                    "far, name, occasion, date, time, headcount, area, and any of the "
-                    "step five answers already given, since this is the only context "
-                    "Dan gets to act on."
+                    "For action handoff only, a real exception, see WHEN THIS IS STILL A "
+                    "REAL HANDOFF. Give Dan enough to actually act on, not just a couple "
+                    "of words, for example a guest pushing back on the 1700 Euro whole bar "
+                    "price for a 12 person group, or the 20.11 fully booked and the guest "
+                    "does not want any of the alternatives offered, include whatever of "
+                    "name, occasion, date, time, headcount, area, and space was already "
+                    "gathered so Dan is not starting from zero."
                 ),
             },
             "event_hold": {
@@ -2483,6 +2733,23 @@ def notify_dan_skip(channel: str, sender: str, guest_text: str):
         logger.info("Dan notified (skip FYI) for %s on %s", sender, channel)
     else:
         logger.warning("Could not reach Dan with skip FYI for %s on %s (not urgent, not retried)", sender, channel)
+
+
+def notify_dan_booked(channel: str, sender: str, summary: str):
+    """Low key FYI fired the moment ANY booking actually completes, a normal
+    table or a private space, any size. Added 9 Sep 2026, Dan directly: "the
+    bot should complete all reservations and only let me know when they are
+    booked... reach out only if something is strange or need extra help."
+    Same delivery as any other Dan message (WhatsApp and email, unconditional,
+    see _deliver_to_dan), deliberately worded as information only so it never
+    reads like alert_dan's "I need you now", same separation notify_dan_skip
+    already keeps from alert_dan, for the same reason."""
+    lines = ["Concierge FYI, booked automatically, no action needed", f"Channel: {channel}", f"From: {sender}", summary]
+    text = "\n".join(lines)
+    if _deliver_to_dan(text, "BrunnenBar concierge, booking confirmed FYI"):
+        logger.info("Dan notified (booking FYI) for %s on %s", sender, channel)
+    else:
+        logger.warning("Could not reach Dan with booking FYI for %s on %s (not urgent, not retried)", sender, channel)
 
 
 # SECOND LAYER of defense, not the primary one anymore. The primary fix, as of
