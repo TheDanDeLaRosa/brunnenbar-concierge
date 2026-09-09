@@ -753,9 +753,20 @@ def _area_tables(area):
 # actually pushed together Sofa only contributes its normal 5 seats, not the
 # 8 it can be stretched to when booked alone, there just is not room to also
 # add Sofa's own extra chairs once it is pushed up against another table.
+# BIG GROUP COMBO added 9 Sep 2026, Dan directly: "for 14 people use Bar7,
+# Bar8, Bar9, HT1 and the Sofa." Stretches the HT1+Sofa lounge combo with
+# three of the bar stools right next to it for a party too big for HT1+Sofa
+# alone (12) or HT2+HT3 alone (13). This is real bar-stool seating, normally
+# left for walk ins per the TABLES comment above, only ever handed out as
+# part of this one specific combo, never offered solo, so it never eats into
+# normal walk in seating on a quiet night. See the special confirmation
+# wording for this exact combo in process_booking below, Dan wants this
+# framed to the guest as half the hinterer Bereich lounge, not just three
+# more chairs.
 TABLE_COMBOS = {
     frozenset({"HT2", "HT3"}): 13,
     frozenset({"HT1", "Sofa"}): 12,
+    frozenset({"HT1", "Sofa", "Bar7", "Bar8", "Bar9"}): 15,
 }
 
 _TABLE_FIELD_RE = re.compile(r"Tisch\s+([A-Za-z0-9+]+)")
@@ -1495,6 +1506,42 @@ def process_booking(sender: str, data: dict, lang: str = "de", channel: str = "w
     # exact reserved time, minutes included whenever they are non-zero, and
     # every template below uses hm instead of the bare hour h.
     hm = f"{h}:{start_dt.strftime('%M')}" if start_dt.minute else h
+    # BIG GROUP COMBO WORDING, added 9 Sep 2026. Dan directly: when this exact
+    # combo (HT1, Sofa, and three bar stools) is what a party actually gets,
+    # do not describe it with the generic "table X" line below, tell the
+    # guest they have half the hinterer Bereich, the lounge, a hightop, and a
+    # few seats at the bar, that is the real feel of what they are getting,
+    # not just a number of chairs.
+    if set(table.split("+")) == {"HT1", "Sofa", "Bar7", "Bar8", "Bar9"}:
+        if lang == "en":
+            days_en = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+            d = days_en[start_dt.weekday()]
+            h12 = start_dt.hour % 12 or 12
+            mins = f":{start_dt.strftime('%M')}" if start_dt.minute else ""
+            time_en = f"{h12}{mins} {'am' if start_dt.hour < 12 else 'pm'}"
+            return random.choice([
+                f"For {party} of you we'll give you half the back lounge, you've got the sofa, a hightop, "
+                f"and a few seats at the bar too, {d} at {time_en}. No minimum spend, you just pay for what "
+                f"you drink. See you then",
+                f"We're setting you up with half the back lounge for {d} at {time_en}, the sofa, a hightop, "
+                f"and a few bar seats alongside. No Mindestumsatz, just your normal tab. Looking forward to it",
+            ])
+        wd_names = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
+        wd2 = wd_names[start_dt.weekday()]
+        if sie:
+            return random.choice([
+                f"Fuer {party} Personen geben wir Ihnen die Haelfte vom hinteren Bereich, Sie haben die "
+                f"Lounge, einen Hochtisch und noch ein paar Plaetze an der Bar dazu, {wd2} um {hm} Uhr. "
+                f"Kein Mindestumsatz, es laeuft ganz normal ueber Ihre Getraenke. Wir freuen uns",
+            ])
+        return random.choice([
+            f"Fuer {party} Leute geben wir euch die Haelfte vom hinteren Bereich, ihr habt die Lounge, "
+            f"einen Hochtisch und noch ein paar Plaetze an der Bar dazu, {wd2} um {hm} Uhr. Kein "
+            f"Mindestumsatz, laeuft ganz normal ueber eure Getraenke. Freu mich auf euch",
+            f"Fuer euch {party} geben wir die Haelfte vom hinteren Bereich frei, die Lounge, ein Hochtisch "
+            f"und ein paar Barplaetze dazu, {wd2} um {hm} Uhr. Kein Mindestumsatz, ihr zahlt einfach was "
+            f"ihr trinkt. Bis dann",
+        ])
     # 15 MINUTE HOLD POLICY added 20 Aug 2026 at Dan's request. Every table
     # confirmation now says we hold it 15 minutes and, if running later than
     # that, to call the bar directly rather than WhatsApp so we can hold it.
