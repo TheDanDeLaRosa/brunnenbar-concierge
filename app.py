@@ -253,7 +253,14 @@ TABLES = {
     "309": (2, "draussen"), "310": (2, "draussen"), "311": (2, "draussen"), "312": (2, "draussen"),
     "313": (2, "draussen"),
     "Stam": (8, "drinnen"), "HT1": (7, "drinnen"), "HT2": (7, "drinnen"), "HT3": (6, "drinnen"),
-    "Sofa": (5, "drinnen"), "ST3": (4, "drinnen"), "Rnd2": (2, "drinnen"),
+    "ST3": (4, "drinnen"), "Rnd2": (2, "drinnen"),
+    # Sofa CORRECTED 9 Sep 2026, Dan directly: seats 5 normally but is an
+    # outside table (not drinnen as this used to say), and extra chairs can be
+    # added to fit 8 or 9. Using 8 here, the conservative end of what Dan gave,
+    # since find_free_table treats this as a hard capacity ceiling for booking
+    # purposes, better to undercount by one than seat a party of 9 somewhere
+    # that cannot actually fit them that night.
+    "Sofa": (8, "draussen"),
 }
 
 GRAPH = "https://graph.facebook.com/" + GRAPH_VERSION
