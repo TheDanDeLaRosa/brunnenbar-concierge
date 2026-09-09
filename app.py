@@ -254,13 +254,15 @@ TABLES = {
     "313": (2, "draussen"),
     "Stam": (8, "drinnen"), "HT1": (7, "drinnen"), "HT2": (7, "drinnen"), "HT3": (6, "drinnen"),
     "ST3": (4, "drinnen"), "Rnd2": (2, "drinnen"),
-    # Sofa CORRECTED 9 Sep 2026, Dan directly: seats 5 normally but is an
-    # outside table (not drinnen as this used to say), and extra chairs can be
-    # added to fit 8 or 9. Using 8 here, the conservative end of what Dan gave,
-    # since find_free_table treats this as a hard capacity ceiling for booking
-    # purposes, better to undercount by one than seat a party of 9 somewhere
-    # that cannot actually fit them that night.
-    "Sofa": (8, "draussen"),
+    # Sofa, seats 5 normally, extra chairs can be added to fit 8 or 9 when
+    # booked on its own, using 8 here as the conservative end of what Dan
+    # gave. CORRECTED TWICE 9 Sep 2026, first wrongly changed to draussen
+    # (Dan's "outside" comment that morning turned out to mean table 301, a
+    # separate outside sofa style seating area, not this one), then Dan
+    # confirmed directly this Sofa is drinnen, right next to HT1, matching
+    # the real floor plan. See TABLE_COMBOS below for why it does not simply
+    # add its solo capacity when pushed together with HT1.
+    "Sofa": (8, "drinnen"),
 }
 
 GRAPH = "https://graph.facebook.com/" + GRAPH_VERSION
@@ -742,31 +744,35 @@ def _area_tables(area):
 # it landed on "Stam+HT1". Dan, verbatim: "you cant push stamm and HT1
 # together since they are at different parts of the bar. HT1 and sofa (which
 # has 5 spots) or HT2 & HT3 would work." Only ever combine tables that are
-# actually adjacent, per this explicit list, never guess a combination
+# actually adjacent, per this explicit whitelist, never guess a combination
 # outside it, every other table stays single table only until Dan confirms
-# another real adjacent pair. HT1+Sofa crosses the drinnen/draussen split,
-# Sofa is technically an outside table (see TABLES above) but sits right
-# next to HT1, so a combo booking there gets logged under whichever area the
-# guest actually wanted, and _tables_in_use_on below is what keeps that safe
-# against a separate booking on the other side also wanting Sofa that night.
-TABLE_COMBOS = [
-    frozenset({"HT2", "HT3"}),
-    frozenset({"HT1", "Sofa"}),
-]
+# another real adjacent pair. Capacity is given explicitly per combo rather
+# than summing each table's own TABLES seat count, because that is NOT the
+# same number, Dan corrected this too the same day: "for felix's party you
+# said sofa and HT1. thats one 5+7 seats", meaning when HT1 and Sofa are
+# actually pushed together Sofa only contributes its normal 5 seats, not the
+# 8 it can be stretched to when booked alone, there just is not room to also
+# add Sofa's own extra chairs once it is pushed up against another table.
+TABLE_COMBOS = {
+    frozenset({"HT2", "HT3"}): 13,
+    frozenset({"HT1", "Sofa"}): 12,
+}
 
 _TABLE_FIELD_RE = re.compile(r"Tisch\s+([A-Za-z0-9+]+)")
 
 
 def _tables_in_use_on(date_iso: str, start_dt: datetime, end_dt: datetime):
     """Every individual table name mentioned in a 'Tisch X' or 'Tisch X+Y'
-    marker on any reservation that day overlapping this window, regardless
-    of area. Only needed because a real physical combo can cross the
-    drinnen/draussen split (HT1+Sofa), so a table already claimed by a combo
-    booked under one area must still block it from being handed out again
-    under the other area. Best effort text parse of the exact 'Tisch {table}'
-    marker create_reservation always writes, purely additive caution, this
-    can only ever remove a table from consideration, never free one up that
-    the normal area based counting in reservations_on already holds."""
+    marker on any reservation that day overlapping this window. Needed
+    because the abstract party size bin packing in _seat_new_party has no
+    memory of which exact named table a past reservation actually sits at,
+    it only knows totals, so on its own it could re-offer a specific table
+    like Sofa as part of a fresh combo on the same night a different, earlier
+    booking already sat someone on it solo. Best effort text parse of the
+    exact 'Tisch {table}' marker create_reservation always writes, purely
+    additive caution, this can only ever remove a table from consideration,
+    never free one up that the normal area based counting in reservations_on
+    already holds."""
     svc = _calendar_service()
     day = datetime.fromisoformat(date_iso).replace(tzinfo=BAR_TZ)
     lo = day.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -796,15 +802,15 @@ def _tables_in_use_on(date_iso: str, start_dt: datetime, end_dt: datetime):
 def _seat_new_party(existing_parties, new_party, area_tables, blocked=frozenset()):
     """Fit every existing party plus the new one, largest first. Each party
     takes the smallest single table in area_tables that still fits, unless
-    already `blocked` (claimed by a real physical combo logged under the
-    other area that day, see _tables_in_use_on). If nothing single fits, try
-    the smallest entry in TABLE_COMBOS whose tables are all still free and
-    unblocked, whichever area its members are individually listed under in
-    TABLES, since a real combo (HT1+Sofa) can cross the drinnen/draussen
-    line. Never invents a combination outside TABLE_COMBOS, this is exactly
-    the bug Dan caught (Stam+HT1, which does not physically exist). Returns
-    the table or combo name (e.g. "HT2+HT3") the NEW party lands on, or None
-    if everyone genuinely cannot be seated."""
+    already `blocked` (claimed by an earlier reservation that day, see
+    _tables_in_use_on). If nothing single fits, try the smallest entry in
+    TABLE_COMBOS whose tables are all still free and unblocked, using the
+    explicit capacity given in that dict, NOT the sum of each table's own
+    TABLES seat count, those are genuinely different numbers, see the block
+    comment above TABLE_COMBOS. Never invents a combination outside
+    TABLE_COMBOS, this is exactly the bug Dan caught (Stam+HT1, which does
+    not physically exist). Returns the table or combo name (e.g. "HT2+HT3")
+    the NEW party lands on, or None if everyone genuinely cannot be seated."""
     entries = [("existing", p) for p in existing_parties] + [("new", new_party)]
     entries.sort(key=lambda x: -x[1])
     free = {n: s for n, s in area_tables if n not in blocked}
@@ -817,14 +823,11 @@ def _seat_new_party(existing_parties, new_party, area_tables, blocked=frozenset(
             claimed.add(name)
         else:
             candidates = []
-            for combo in TABLE_COMBOS:
+            for combo, capacity in TABLE_COMBOS.items():
                 if combo & claimed or (combo & blocked):
                     continue
-                if not all(n in TABLES for n in combo):
-                    continue
-                total = sum(TABLES[n][0] for n in combo)
-                if total >= p:
-                    candidates.append((total, combo))
+                if capacity >= p:
+                    candidates.append((capacity, combo))
             if not candidates:
                 return None
             candidates.sort(key=lambda x: x[0])
