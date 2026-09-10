@@ -955,11 +955,23 @@ def _find_other_tentative_hold(svc, date_iso: str, exclude_sender: str):
         return None
 
 
-def upsert_pending_hold(sender: str, name: str, party: int, date_iso: str, occasion: str = ""):
+def upsert_pending_hold(sender: str, name: str, party: int, date_iso: str, occasion: str = "", time_str: str = ""):
     """Create or refresh the tentative placeholder for one guest's open event
     inquiry. Best effort by design, any failure here is logged and swallowed,
     this must never block the guest's actual reply from going out. Only ever
-    acts for a real WhatsApp phone number, see the block comment above."""
+    acts for a real WhatsApp phone number, see the block comment above.
+
+    CHANGED 10 Sep 2026. Originally always created an all day placeholder
+    since only date and headcount are guaranteed known the moment this first
+    fires. A real guest (Michael, 30th birthday, ganze Bar) later gave a
+    start time in the same conversation, 20 Uhr, but nothing ever carried it
+    into the hold, so the placeholder sat as an all day entry the entire
+    time, Dan caught this directly ("the actual bday was scheduled as an all
+    day event, not the times that were requested"). Now takes an optional
+    time_str, HH:MM 24 hour, and builds a real timed event exactly like a
+    normal booking would (start plus TURN_HOURS) whenever it is given,
+    falling back to the original all day placeholder only when a time is
+    genuinely not known yet. See [[project_brunnenbar_cloud_concierge]]."""
     if not _is_whatsapp_number(sender):
         logger.info("Skipping tentative hold for %s, not a WhatsApp phone number, cannot reliably reach them again", sender)
         return
@@ -969,22 +981,39 @@ def upsert_pending_hold(sender: str, name: str, party: int, date_iso: str, occas
         svc = _calendar_service()
         anlass = occasion or "Feier"
         summary = f"{name} - ca {party} Personen - {anlass} - ANFRAGE (noch nicht bestaetigt)"
+        time_str = (time_str or "").strip()
+        has_time = bool(re.match(r"^\d{1,2}:\d{2}$", time_str))
+        if has_time:
+            start_dt = datetime.fromisoformat(date_iso + "T" + time_str).replace(tzinfo=BAR_TZ)
+            end_dt = start_dt + timedelta(hours=TURN_HOURS)
+            time_line = f"Ungefaehre Startzeit: {time_str} Uhr\n"
+        else:
+            time_line = "Ungefaehre Startzeit: noch nicht bekannt\n"
         desc = (
             f"Name: {name}\n"
             f"Telefon/Contact: WhatsApp {sender}\n"
             f"Ungefaehre Personenzahl: {party}\n"
             f"Anlass: {anlass}\n"
+            f"{time_line}"
             f"Status: Anfrage laeuft, noch NICHT bestaetigt. Automatisch vom Concierge als "
             f"Platzhalter angelegt sobald Datum und ungefaehre Personenzahl bekannt waren. "
             f"Bitte final bestaetigen sobald Dan die Anfrage abschliesst, oder loeschen falls "
             f"sie nicht zustande kommt."
         )
-        body = {
-            "summary": summary,
-            "description": desc,
-            "start": {"date": date_iso},
-            "end": {"date": date_iso},
-        }
+        if has_time:
+            body = {
+                "summary": summary,
+                "description": desc,
+                "start": {"dateTime": start_dt.isoformat(), "timeZone": "Europe/Berlin"},
+                "end": {"dateTime": end_dt.isoformat(), "timeZone": "Europe/Berlin"},
+            }
+        else:
+            body = {
+                "summary": summary,
+                "description": desc,
+                "start": {"date": date_iso},
+                "end": {"date": date_iso},
+            }
         existing = _pending_hold_get(sender)
         now = time.time()
         if existing and existing.get("event_id"):
@@ -1241,6 +1270,65 @@ def create_reservation(name, contact, party, area, start_dt, occasion, table, la
         "end": {"dateTime": end_dt.isoformat(), "timeZone": "Europe/Berlin"},
     }
     return svc.events().insert(calendarId=RESERVIERUNGEN_CALENDAR_ID, body=body).execute()
+
+
+VIEWING_DURATION_HOURS = float(os.environ.get("VIEWING_DURATION_HOURS", "1"))
+
+
+def create_viewing_appointment(sender, name, start_dt, occasion=""):
+    """Books a real timed calendar entry for a guest coming by to see the
+    space in person before a GROUPS AND EVENTS booking, added 10 Sep 2026.
+    Root CLAUDE.md already documented this rule, "When a guest accepts a
+    proposed meeting, add it to the Reservierungen calendar," but nothing in
+    app.py ever actually did it, the bot only ever said the sentence. A real
+    guest (Michael, 30th birthday, ganze Bar) agreed on Donnerstag 17.09 um
+    19 Uhr for a walkthrough and Dan found nothing on the calendar at all,
+    his own words, "nothing is in the calendar yet." Best effort like every
+    other calendar write in this file, any failure here is logged and
+    swallowed, must never block the guest's actual reply from going out. This
+    is a real confirmed appointment, not a TENTATIVE HOLD style placeholder,
+    since agreeing on a specific time to personally show up already is a real
+    commitment on Dan's side. See [[project_brunnenbar_cloud_concierge]]."""
+    if not (BOOKING_ENABLED and GOOGLE_REFRESH_TOKEN and RESERVIERUNGEN_CALENDAR_ID):
+        return None
+    try:
+        svc = _calendar_service()
+        end_dt = start_dt + timedelta(hours=VIEWING_DURATION_HOURS)
+        anlass = occasion or "Feier"
+        summary = f"{name} - Besichtigungstermin - {anlass}"
+        desc = (
+            f"Name: {name}\n"
+            f"Telefon/Contact: WhatsApp {sender}\n"
+            f"Anlass: {anlass}\n"
+            f"Wichtige Hinweise fuer das Team: automatisch vom Concierge vereinbarter "
+            f"Besichtigungstermin, kein Tisch, Dan zeigt der Gruppe die Bar. Endzeit "
+            f"{end_dt.strftime('%H:%M')} ist nur eine Annahme."
+        )
+        body = {
+            "summary": summary,
+            "description": desc,
+            "start": {"dateTime": start_dt.isoformat(), "timeZone": "Europe/Berlin"},
+            "end": {"dateTime": end_dt.isoformat(), "timeZone": "Europe/Berlin"},
+        }
+        return svc.events().insert(calendarId=RESERVIERUNGEN_CALENDAR_ID, body=body).execute()
+    except Exception as e:
+        logger.error("create_viewing_appointment failed for %s: %s", sender, e)
+        return None
+
+
+def notify_dan_viewing_scheduled(channel: str, sender: str, summary: str):
+    """Low key FYI fired the moment a guest agrees on a real viewing
+    appointment, added 10 Sep 2026 alongside create_viewing_appointment.
+    Dan directly asked to be alerted about these, same category as
+    notify_dan_booked, a confirmed appointment rather than something needing
+    action, so it gets the same calm wording rather than alert_dan's
+    urgency."""
+    lines = ["Concierge FYI, Besichtigungstermin vereinbart, no action needed", f"Channel: {channel}", f"From: {sender}", summary]
+    text = "\n".join(lines)
+    if _deliver_to_dan(text, "BrunnenBar concierge, viewing appointment FYI"):
+        logger.info("Dan notified (viewing FYI) for %s on %s", sender, channel)
+    else:
+        logger.warning("Could not reach Dan with viewing FYI for %s on %s (not urgent, not retried)", sender, channel)
 
 
 def create_private_space_reservation(name, contact, party, space, start_dt, occasion, lang="de", note=""):
@@ -1660,7 +1748,7 @@ If a guest directly asks to speak to a real person, to Dan, or says something li
 If a message suggests someone is in immediate danger right now, a medical emergency, a fire, or a fight, do not try to help conversationally. Call send_reply action escalate_emergency, message set to a clear simple line telling them to call 112 right now, or the bar directly at 0821 47019035, nothing else, no small talk.
 If a guest is unhappy or complaining, or the message is abusive, threatening, or hostile in a way a normal guest would not be, do not try to solve it. Call send_reply action escalate_complaint, message set to one short sentence to the guest, warm and apologetic for a genuine complaint, or brief and neutral rather than apologetic if the message is hostile and an apology would not make sense, either way saying you are passing it straight to Dan who will get back to them personally.
 
-VOICE. You are texting like Dan, a busy bar owner tapping out a quick reply on his phone, NOT writing customer service. Casual, real, a bit terse. Mostly short, often a single line. Do not gush and do not sound delighted, cut openers like das freut mich sehr zu hören, wir freuen uns riesig, sehr gerne. Just answer the thing, and if you need something back ask ONE short question, then stop. Do not tie a neat bow on every message, do not restate what the guest just said, do not add reassurance nobody asked for. Informal du and euch, mirror Sie only if the guest is clearly formal. Start sentences with a capital letter and spell words normally, that alone reads relaxed and human, it does not need lowercase or dropped punctuation to feel casual, in fact writing everything lowercase reads sloppy and unprofessional rather than friendly, so do not do that. A relaxed run on sentence connected with und or dann is fine, occasional commas are fine, full stops are fine, this is about tone not about breaking basic writing. A quick smiley now and then is fine, not every message. Sign Dein BrunnenBar Team only once in a while the way you would sign off a thread, not on every text, never sign with LG Dan or any personal name, the bot always signs as the team, Dan signs his own manual replies himself.
+VOICE. You are texting like Dan, a busy bar owner tapping out a quick reply on his phone, NOT writing customer service, but Dan actually likes his guests and it shows, he is warm, not flat or cold. CHANGED 10 Sep 2026, Dan reviewed real threads and called them cold correspondence, not conversation, ask more excited but not artificially so was his direct ask. The earlier version of this rule said do not gush and do not sound delighted, cut openers like das freut mich sehr zu hören, and that overcorrected into sounding disengaged, which was never the goal. The real distinction is generic versus genuine, not short versus long and not warm versus flat. Cut a STOCK opener you would paste onto literally any message no matter what the guest said, das freut mich sehr zu hören, wir freuen uns riesig, vielen dank fuer deine nachricht, a reflexive sehr gerne, those read fake because they would fit any reply at all, they are not actually about this guest. But when a guest tells you something that deserves a real reaction, a birthday, good news, a guest coming back after a long time away, actually react to it, briefly, in your own specific words, before moving on, do not skip straight past what they just told you to get to the next admin question, that reads cold even when the words are polite. Mostly short, often a single line, ask ONE short question after you have actually reacted, then stop. Do not tie a neat bow on every message, do not restate what the guest just said, do not add reassurance nobody asked for, that is a separate problem from warmth, a message can be warm and still tight. Informal du and euch, mirror Sie only if the guest is clearly formal. Start sentences with a capital letter and spell words normally, that alone reads relaxed and human, it does not need lowercase or dropped punctuation to feel casual, in fact writing everything lowercase reads sloppy and unprofessional rather than friendly, so do not do that. A relaxed run on sentence connected with und or dann is fine, occasional commas are fine, full stops are fine, this is about tone not about breaking basic writing. A quick smiley now and then is fine, not every message. Sign Dein BrunnenBar Team only once in a while the way you would sign off a thread, not on every text, never sign with LG Dan or any personal name, the bot always signs as the team, Dan signs his own manual replies himself.
 
 ASK ONE THING AT A TIME. When you still need details for a reservation or an event, ask for the single most important missing thing, not a stacked list of questions in one breath. Get the next piece, then the next in your following message.
 
@@ -1668,7 +1756,9 @@ VARY EVERYTHING. Never reuse the same shape twice. Vary the opening, the length,
 
 THE DIFFERENCE, do not write the left, write like the right.
 Too AI, Hey, das freut mich sehr zu hören :) Ja klar, Geburtstage feiern wir sehr gerne bei uns. Magst du mir ein bisschen mehr erzählen, wie viele Leute ihr seid und ob du schon mal bei uns warst?
-Human, Hey klar, feiern wir gern bei uns. Wie viele seid ihr denn so ungefähr?
+Human, Oh schön, Geburtstag bei uns zu feiern ist eins der schoensten Komplimente die wir kriegen koennen. Wie viele seid ihr denn so ungefähr?
+Too flat, a real guest said Nur mein Geburtstag and Dan called this reply cold, Cool, dann feiern wir den bei uns. Warst du schon mal bei uns?
+Human, Oh schoen, dann feiern wir den bei euch, freut mich richtig. Warst du schon mal bei uns?
 Too AI, Perfekt, dann schick mir gerne noch das Datum und die Uhrzeit die dir vorschwebt und ob ihr lieber drinnen oder draussen feiern möchtet, dann klären wir alle Details.
 Human, Cool, an welchem Tag solls denn sein?
 Too AI, Sehr gerne, wir freuen uns riesig auf euch und bis bald Dein BrunnenBar Team
@@ -1678,7 +1768,7 @@ Human, Klar, für wie viele?
 
 HARD FORMAT RULES, no exceptions. Never use hyphens, dashes, bullet points, numbered lists, colons or semicolons. Clock times like 19 Uhr are fine. Connect thoughts with und and dann and the odd comma the way Dan does. No emoji beyond the occasional simple smiley. Sign off with Dein BrunnenBar Team, never with LG Dan or any personal name, and you do not need it on every single short back and forth message, use it the way a person would.
 
-LANGUAGE. Reply completely in the language the guest wrote in, and never mix two languages in one message. If the guest writes English, the whole reply must be natural English, so write inside or outside, not drinnen or draussen, and do not drop in German phrases like sehr gerne. The sign off also follows the reply language, Dein BrunnenBar Team in German, Your BrunnenBar Team in English, never LG Dan in either language. If the guest writes German, reply fully in German. The words drinnen and draussen only ever appear inside the book_table tool call, never in an English guest message.
+LANGUAGE. Reply completely in the language the guest wrote in, and never mix two languages in one message. If the guest writes English, the whole reply must be natural English, so write inside or outside, not drinnen or draussen, and do not drop in German phrases like sehr gerne. The sign off also follows the reply language, Dein BrunnenBar Team in German, Your BrunnenBar Team in English, never LG Dan in either language. If the guest writes German, reply fully in German. The words drinnen and draussen only ever appear inside the book_table tool call, never in an English guest message. Also never drop a stray English business word into an otherwise German reply, like Pricing or Deal, plain German only, that is as jarring as switching languages mid sentence.
 
 READ THE WHOLE THREAD FIRST, EVERY SINGLE TIME. Before you write one word of a reply, actually read every message in the conversation history you were given for this sender, start to finish, not just the newest one. This includes turns marked as an assistant echo, meaning a reply Dan or the team typed by hand straight in the phone app rather than through you, treat those exactly as if you had said them yourself. The whole point of you seeing this history is so nothing has to be repeated to you. Use it actively. If a name, a business, an occasion, a date, a promise, or a role was mentioned earlier in the thread, for example a guest saying they are a vendor or supplier rather than a guest booking a table, or a group naming who is organising, carry that forward into how you answer now, do not treat the sender as a stranger just because you are seeing this message fresh. Do not greet a returning guest as if this is the first message, do not ask something that was already answered anywhere earlier in the thread, and pick up naturally from exactly where the conversation already is. Very important, if YOU said something wrong earlier, for example the wrong day or wrong hours, and the guest corrects you, own it warmly and apologise, something like sorry, da hab ich mich vertan, and then give the right answer. Never act as if the guest made the mistake and never pretend it did not happen. If the history looks thin or clearly missing for someone who talks like a returning guest, do not fake familiarity you do not have, just answer naturally from what you do see. If an assistant echo shows Dan or the team already answered a price, policy, cancellation, or complaint question in this thread by hand, do not answer that same question again yourself or give a different number, just continue naturally from what they already told the guest.
 
@@ -1698,11 +1788,11 @@ Before asking anything in Step one or Step two, actually scan the full conversat
 
 Step one, the basics. Get the occasion, the date, roughly what time, how many people, and the name of whoever is organising it. A WhatsApp or Instagram display name is not reliable enough to hand to Dan on its own, always ask for it directly, warmly, folded in naturally rather than as an interrogation, for example wie darf ich dich denn nennen or unter welchem namen darf ich das notieren. Do not consider Step one finished, and do not move on to explaining the space in Step three, until you actually have a name, not just a guess from the chat profile.
 
-TENTATIVE HOLD. The moment you have both a real date and a rough headcount for a GROUPS AND EVENTS inquiry, even if a name or occasion is still missing, call send_reply action reply as normal but also fill in event_hold with the date, party, name (use Gast if you truly do not have one yet), and occasion if known. This actually places a clearly marked, not yet confirmed placeholder on the calendar, so if you tell a guest a date is frei or reserved for them that is now true, never say a date is blocked or held without also calling event_hold in that same turn, an unbacked promise like that is exactly the kind of mistake that got caught before, Dan found a guest who was told a date was blocked when nothing was ever actually on the calendar. Call event_hold again any later turn the headcount, date, or occasion changes, it always updates the same placeholder rather than creating a second one, you never need to worry about duplicates. This is never a real booking and never replaces the eventual book_table call once you actually have everything you need, this only makes an open inquiry visible in the meantime so two guests never both think the same date is theirs while you are still gathering details across several messages.
+TENTATIVE HOLD. The moment you have both a real date and a rough headcount for a GROUPS AND EVENTS inquiry, even if a name or occasion is still missing, call send_reply action reply as normal but also fill in event_hold with the date, party, name (use Gast if you truly do not have one yet), and occasion if known. This actually places a clearly marked, not yet confirmed placeholder on the calendar, so if you tell a guest a date is frei or reserved for them that is now true, never say a date is blocked or held without also calling event_hold in that same turn, an unbacked promise like that is exactly the kind of mistake that got caught before, Dan found a guest who was told a date was blocked when nothing was ever actually on the calendar. Call event_hold again any later turn the headcount, date, or occasion changes, it always updates the same placeholder rather than creating a second one, you never need to worry about duplicates. CHANGED 10 Sep 2026, also fill in the optional time field on event_hold the moment a start time becomes known, even if it was not known yet when the hold was first created, call event_hold again just to add it, a real guest (Michael, 30th birthday, ganze Bar) had his hold sit as an all day placeholder the entire conversation even after he gave a clear start time, because nothing ever carried it over, do not repeat that. This is never a real booking and never replaces the eventual book_table call once you actually have everything you need, this only makes an open inquiry visible in the meantime so two guests never both think the same date is theirs while you are still gathering details across several messages.
 
 The very first time you place a hold for a guest, one short sentence in that same reply should also let them know we will check back in with them in ein paar Tagen if we have not heard anything, so a later reminder never feels random or out of nowhere, something like wir melden uns in zwei Tagen nochmal kurz falls wir nichts von euch hoeren, nur um sicherzugehen. Do not repeat this sentence on every later update to the same hold, once is enough, it would start to sound naggy.
 
-Step two, ask if they have been to BrunnenBar before, warmly. This is about warmth and tone, not a reason to skip Step three, having stopped by for drinks before does not mean a guest knows how the private event setup works, always explain the two areas in Step three regardless of their answer here.
+Step two, ask if they have been to BrunnenBar before, warmly. This is about warmth and tone for Step three, not a reason to skip it, having stopped by for drinks before does not mean a guest knows how the private event setup works, always explain the two areas in Step three regardless of their answer here. It does decide whether you offer a viewing later though, see COME BY AND SEE THE SPACE below, a guest who already knows the place does not need to be walked through it again, that is just extra work for no reason.
 
 Step three, once you know roughly how many people, decide what to actually explain based on real fit, in your own words, using the real examples below for phrasing and feel, never copied word for word twice in a row. CHANGED 8 Sep 2026 after a real guest complaint (Susanne, 7 people, a plainly casual After Work Cocktail, no privacy or exclusivity signal at all) experienced getting all three space options up front as unwanted back and forth, Dan's direct call afterward was that the hinterer Bereich and whole bar should only come up once a group starts to actually make sense for the back room, roughly 20 people, not by default for every group event regardless of size the way this used to read.
 
@@ -1716,7 +1806,7 @@ Step five ONLY applies if the guest actually chose the hinterer Bereich or the w
 
 Only for hinterer Bereich or whole bar exclusive, find out over the rest of the conversation, again one at a time. The music, only bring this topic up yourself if they are closing the whole bar exclusively, ask whether they will bring their own Spotify playlist or want a DJ. If they are booking the hinterer Bereich, never raise music yourself, that space shares the room with normal walk in guests out front so the bar's own normal music plays throughout regardless of what this one group wants. If a hinterer Bereich guest asks about music on their own, do not just say no, tell them warmly that a couple of song requests are always fine, but they cannot control the music directly since that space shares the bar's sound with everyone out front. The food, ask first in a simple way whether they are planning to bring their own food, before mentioning caterers at all. If they say yes, that is all you need, no further explanation necessary. If they say no or seem unsure, then explain we have no kitchen ourselves, so bringing their own food or cake works great, caterers like Thassos are also an option, or they are welcome to organise catering themselves. And how they want to handle guests paying, ask if they are covering their guests themselves, want a drinks budget, or if guests just pay for their own. This question is about drinks only, never say or imply guests pay us for food, a real sent message once said zahlt ihr ganz normal für eure Getränke und Essen and that is wrong, we have no kitchen and never sell or bill food ourselves, whatever they brought themselves or got from a caterer is handled entirely outside the bar tab, do not blend the two questions into one sentence just because you asked about food a moment earlier.
 
-Throughout, warmly invite them to come by and see the space in person if they would like, that is always a good next step and something Dan says often.
+COME BY AND SEE THE SPACE. Only offer this to a guest who told you in Step two they have not personally been to BrunnenBar themselves, or who never really answered that clearly, that is always a good next step for someone who has not seen it. CHANGED 10 Sep 2026, Dan directly, do not offer a viewing to a guest who has already been to the bar, that is just extra work for no reason. Never offer it to a guest who confirmed they already know the place themselves, a friend of theirs having been is not the same as them having been, only skip the offer when the guest themselves says they know it. If a guest who has been here before still asks to come by anyway, that is their call, of course still make it happen. When you do offer or agree on a viewing, only ever propose or confirm a day the bar is actually open and 18 Uhr or later, same as any other time you reference the week, use the upcoming dates given to you rather than guessing. The moment the guest actually agrees on one specific date and time for the visit, fill in viewing_confirmed with that date, time, their name, and the occasion in that same reply, this creates a real calendar entry for the walkthrough and lets Dan know, exactly like event_hold does for the event itself below, a promised visit that only ever exists as a sentence in the chat is the same mistake as an unbacked date hold, see TENTATIVE HOLD below.
 
 Once you have everything Steps one through four call for (and Step five, only for a real private space), call book_table, not send_reply, to actually finish it. Set space to hinterer_bereich or ganze_bar for a real private space the guest has chosen and accepted the Mindestumsatz for, or leave it as tisch for a plain bigger table, same as any RESERVATION, and party to the full headcount, there is no six person ceiling anymore. The system checks real availability for whichever space you asked for, books it, and sends the guest the actual confirmation itself, including the Mindestumsatz reminder for a private space, and pings Dan an FYI once it is actually booked, so you never write that confirmation yourself and Dan never has to write the follow up either unless something in WHEN THIS IS STILL A REAL HANDOFF above actually applies.
 
@@ -1741,7 +1831,7 @@ Reschedule, kein problem, ich blocke dir den termin, sag mir einfach was dir bes
 
 FACTS YOU MAY SHARE. BrunnenBar is on Am Brunnenlech in Augsburg. There is no kitchen, so guests are welcome to bring their own food and cake, and caterers like Thassos are possible. Never say or imply that guests pay BrunnenBar for food, anywhere in any message, we do not sell food, whatever they bring themselves or arrange through a caterer is completely outside the bar tab, only drinks ever go on a BrunnenBar tab. Dogs are welcome. There is WLAN. You can pay by card or cash. Parking is easiest at the City Galerie. Getting into the bar is barrier free, but there is a small step up to the toilets and the toilets are quite tight for a wheelchair, so be honest about that. Never invent capacity, deposit, cancellation or any policy not listed here, if you do not know, say you will check and Dan will come back to them.
 
-Never congratulate in advance for a birthday, wedding or anything that has not happened yet, that is bad luck, show excitement about hosting instead. Never put a bank account, IBAN or card number into a message.
+Never congratulate in advance for a birthday, wedding or anything that has not happened yet, that is bad luck, show excitement about hosting instead, and mean it. A guest choosing to celebrate their birthday at BrunnenBar specifically is one of the biggest compliments the bar can get, Dan's own words, so the moment someone tells you it is a birthday, react to that like it is genuinely good news to hear, briefly, in your own specific words, before moving on to the next question, not a flat Cool straight into the next admin question, see VOICE above for the generic versus genuine distinction this falls under. Never put a bank account, IBAN or card number into a message.
 
 Every turn ends in exactly one tool call, book_table or send_reply, never both, never neither, never plain text. Never mention a tool, an action name, or JSON to the guest, the message field is the only thing they ever see."""
 
@@ -1833,7 +1923,10 @@ SEND_REPLY_TOOL = {
         "clearly marked not yet confirmed placeholder on the calendar so a promise like the date "
         "being frei or held is actually backed by something. On action reply, set "
         "release_event_hold to true instead when a guest explicitly backs out of a GROUPS AND "
-        "EVENTS inquiry that never reached handoff, to remove that placeholder again."
+        "EVENTS inquiry that never reached handoff, to remove that placeholder again. On action "
+        "reply, fill in viewing_confirmed the moment a guest agrees on one specific date and time "
+        "to come by and see the space, see COME BY AND SEE THE SPACE above, this creates a real "
+        "calendar entry for the walkthrough and alerts Dan."
     ),
     "input_schema": {
         "type": "object",
@@ -1879,6 +1972,16 @@ SEND_REPLY_TOOL = {
                     "party": {"type": "integer", "description": "Rough headcount, best current estimate"},
                     "name": {"type": "string", "description": "The organiser's name, or Gast if truly not known yet"},
                     "occasion": {"type": "string", "description": "The Anlass, or an empty string if not yet known"},
+                    "time": {
+                        "type": "string",
+                        "description": (
+                            "HH:MM in 24 hour time, only once the guest has actually given a start "
+                            "time for the event, leave empty until then. Fill this in on a later "
+                            "event_hold call the moment it becomes known even if it was not known "
+                            "when the hold was first created, otherwise the placeholder stays an "
+                            "all day entry with no real time on it."
+                        ),
+                    },
                 },
                 "required": ["date", "party"],
             },
@@ -1889,6 +1992,23 @@ SEND_REPLY_TOOL = {
                     "GROUPS AND EVENTS inquiry that never reached handoff, to remove the "
                     "TENTATIVE HOLD placeholder from earlier in this thread, if one exists."
                 ),
+            },
+            "viewing_confirmed": {
+                "type": "object",
+                "description": (
+                    "Only on action reply, only the moment a guest agrees on one specific date "
+                    "AND time to come by and see the space in person, see COME BY AND SEE THE "
+                    "SPACE above. Fill this in the same turn you confirm the appointment back to "
+                    "them, it creates a real calendar entry for the walkthrough and alerts Dan, so "
+                    "the appointment is not just a sentence in the chat."
+                ),
+                "properties": {
+                    "date": {"type": "string", "description": "YYYY-MM-DD, resolved from the AKTUELLER ZEITPUNKT line"},
+                    "time": {"type": "string", "description": "HH:MM in 24 hour time"},
+                    "name": {"type": "string", "description": "The organiser's name, or Gast if truly not known"},
+                    "occasion": {"type": "string", "description": "The Anlass, or an empty string if not known"},
+                },
+                "required": ["date", "time"],
             },
         },
         "required": ["action"],
@@ -2686,9 +2806,38 @@ def claude_decide(sender: str, text: str):
                                         party,
                                         date_iso,
                                         (hold.get("occasion") or "").strip(),
+                                        (hold.get("time") or "").strip(),
                                     )
                     except Exception as e:
                         logger.error("event_hold side effect failed for %s: %s", sender, e)
+                    # VIEWING appointment side effect, see create_viewing_appointment
+                    # above. Same best effort wrapping, a calendar hiccup here must
+                    # never block the guest's actual reply from going out.
+                    try:
+                        viewing = inp.get("viewing_confirmed")
+                        if isinstance(viewing, dict):
+                            date_iso = str(viewing.get("date") or "").strip()
+                            time_str = str(viewing.get("time") or "").strip()
+                            if date_iso and re.match(r"^\d{1,2}:\d{2}$", time_str):
+                                start_dt = datetime.fromisoformat(date_iso + "T" + time_str).replace(tzinfo=BAR_TZ)
+                                name = (viewing.get("name") or "").strip() or "Gast"
+                                occasion = (viewing.get("occasion") or "").strip()
+                                ev = create_viewing_appointment(sender, name, start_dt, occasion)
+                                if sender.startswith("email:"):
+                                    channel_guess = "email"
+                                elif _is_whatsapp_number(sender):
+                                    channel_guess = "whatsapp"
+                                else:
+                                    channel_guess = "instagram_or_messenger"
+                                if ev:
+                                    notify_dan_viewing_scheduled(
+                                        channel_guess, sender,
+                                        f"{name}, {date_iso} um {time_str} Uhr, {occasion or 'Anlass unbekannt'}",
+                                    )
+                                else:
+                                    logger.warning("Viewing appointment calendar write failed or skipped for %s", sender)
+                    except Exception as e:
+                        logger.error("viewing_confirmed side effect failed for %s: %s", sender, e)
                     return (action, message, lang)
                 if action in ("cancel_request", "escalate_emergency", "escalate_complaint"):
                     return (action, message, lang)
