@@ -1389,87 +1389,72 @@ def notify_dan_viewing_scheduled(channel: str, sender: str, summary: str):
         logger.warning("Could not reach Dan with viewing FYI for %s on %s (not urgent, not retried)", sender, channel)
 
 
-def _resolve_viewing_candidate(sender, name, occasion, candidate_date, candidate_time, lang="de"):
-    """CHANGED 17 Sep 2026, Dan directly: "no take ownership, you are the
-    concierge, respond back with the correct time." The viewing_requested
-    flow above was too conservative, it routed every single viewing
-    request to Dan even when the guest had already given a specific date
-    and time and the calendar was genuinely free, exactly the kind of
-    thing book_table already resolves on its own for a normal
-    reservation, see RESERVATIONS AND EVENTS in the system prompt, "the
-    bot should complete all reservations... end to end." This is the same
-    self-serve pattern applied to a viewing, a real deterministic calendar
-    check decides, not the model guessing and not a reflexive handoff to
-    Dan for something the calendar can already answer.
+def _viewing_candidate_context(candidate_date, candidate_time):
+    """REWORKED 17 Sep 2026, same evening, after Dan corrected the first
+    version of this function (_resolve_viewing_candidate, which used to
+    auto-confirm a guest's viewing time outright whenever both calendars
+    showed no conflict). Dan directly: "no always check with me. i can
+    not be ther from 18-2 three day a week." A calendar being free is not
+    the same thing as Dan actually being at the bar, his real presence
+    isn't fully captured by either calendar, so this function must NEVER
+    confirm anything to a guest or write a calendar entry on its own
+    again, see notify_dan_viewing_times_needed, Dan always makes the
+    final call now, full stop.
 
-    Only ever called when the guest gave BOTH a specific date and a
-    specific time, see viewing_requested's candidate_date/candidate_time
-    fields, never for a vague "sometime next week" preference, that still
-    goes straight to notify_dan_viewing_times_needed untouched. Snaps any
-    time before 19 Uhr up to 19 Uhr rather than rejecting the request
-    outright, the team is still setting up before then, this is exactly
-    the situation that produced the original bug (Dan confirmed a guest's
-    own 18 Uhr suggestion without anyone checking it), the fix is to keep
-    her actual day and move the time to the real earliest valid slot, not
-    to punt the whole thing to Dan. Confirms only a day the bar is
-    actually open, Donnerstag, Freitag or Samstag, and runs the same
-    _viewing_slot_conflict check against both calendars used everywhere
-    else in this feature.
+    What it still does, per Dan's immediate follow up in the same breath,
+    "the logic is good by checking the calendar but you need to check
+    with me as well... even better would be to see when there are other
+    geschaeftsmeetings and buildin a block of meetings since i will be
+    there anyway... i am often not there on saturday so we need to make
+    sure i am actually there", is turn a guest's proposed day and time
+    into useful CONTEXT for the WhatsApp that still always goes to Dan,
+    so he can say yes in one word instead of starting from a blank "what
+    time works" question. Three signals, all informational only: whether
+    the requested slot (snapped to the 19 Uhr floor if they asked
+    earlier, the team is still setting up before then) clashes with
+    anything on either calendar, whether Dan already has a Geschaeftsmeeting
+    that same day he could combine the viewing with since he will be
+    there anyway, and an explicit flag if the day is a Saturday, since
+    that is specifically the day he said he is often not around even
+    when nothing is on the calendar to say why.
 
-    Returns a dict, always with an "ok" key. When ok is True, "message" is
-    the ready to send guest facing confirmation, already written, the
-    caller uses this instead of the model's own holding line, and the
-    calendar entry has already been written via create_viewing_appointment.
-    When ok is False, "conflict" holds the clashing calendar event if
-    there was one, or None if the date/time could not even be resolved
-    (bar closed that day, bad format, booking not configured), either way
-    the caller falls back to notify_dan_viewing_times_needed and keeps the
-    model's own holding line as the guest facing message, this function
-    only ever adds confidence, it never blocks the normal fallback path."""
+    Returns a dict that is always safe to use even on total failure,
+    every key defaults to a safe empty value on any parse or API error,
+    this must never block the guest's actual reply going out. Never
+    writes anything, never confirms anything, purely read only."""
+    ctx = {
+        "valid": False, "snapped": False, "start_dt": None,
+        "conflict": None, "same_day_meetings": [], "is_saturday": False,
+    }
     try:
-        if not (BOOKING_ENABLED and GOOGLE_REFRESH_TOKEN and RESERVIERUNGEN_CALENDAR_ID):
-            return {"ok": False, "conflict": None}
         if not re.match(r"^\d{4}-\d{2}-\d{2}$", candidate_date or "") or not re.match(r"^\d{1,2}:\d{2}$", candidate_time or ""):
-            return {"ok": False, "conflict": None}
+            return ctx
         requested_dt = datetime.fromisoformat(candidate_date + "T" + candidate_time).replace(tzinfo=BAR_TZ)
-        if requested_dt.weekday() not in (3, 4, 5):  # Donnerstag, Freitag, Samstag only
-            return {"ok": False, "conflict": None}
-        snapped = requested_dt.hour < 19
-        start_dt = requested_dt.replace(hour=19, minute=0) if snapped else requested_dt
+        ctx["is_saturday"] = requested_dt.weekday() == 5  # Monday is 0, Saturday is 5
+        ctx["snapped"] = requested_dt.hour < 19
+        start_dt = requested_dt.replace(hour=19, minute=0) if ctx["snapped"] else requested_dt
+        ctx["start_dt"] = start_dt
+        ctx["valid"] = True
+        if not (GOOGLE_REFRESH_TOKEN and RESERVIERUNGEN_CALENDAR_ID):
+            return ctx
         end_dt = start_dt + timedelta(hours=VIEWING_DURATION_HOURS)
         svc = _calendar_service()
-        conflict = _viewing_slot_conflict(svc, start_dt, end_dt)
-        if conflict:
-            return {"ok": False, "conflict": conflict}
-        ev = create_viewing_appointment(sender, name, start_dt, occasion)
-        if not ev:
-            return {"ok": False, "conflict": None}
-        if sender.startswith("email:"):
-            channel_guess = "email"
-        elif _is_whatsapp_number(sender):
-            channel_guess = "whatsapp"
-        else:
-            channel_guess = "instagram_or_messenger"
-        notify_dan_viewing_scheduled(
-            channel_guess, sender,
-            f"{name}, {start_dt.strftime('%d.%m.%Y')} um {start_dt.strftime('%H:%M')} Uhr, "
-            f"{occasion or 'Anlass unbekannt'} (auto bestaetigt nach echter Kalenderpruefung)",
-        )
-        date_de = start_dt.strftime("%d.%m")
-        time_de = start_dt.strftime("%H:%M")
-        if lang == "en":
-            note = (
-                f" Heads up, our team is still setting up before 7pm, so {time_de} works instead "
-                f"of the earlier time."
-            ) if snapped else ""
-            msg = f"Perfect, {date_de} at {time_de} works, see you then!{note}"
-        else:
-            note = f" Das Team ist bis 19 Uhr noch am aufbauen, daher passt {time_de} Uhr bei uns." if snapped else ""
-            msg = f"Perfekt, {date_de} um {time_de} Uhr passt bei uns.{note} Freu mich schon!"
-        return {"ok": True, "message": msg, "date": candidate_date, "time": time_de}
+        ctx["conflict"] = _viewing_slot_conflict(svc, start_dt, end_dt)
+        if GESCHAEFTS_MEETINGS_CALENDAR_ID:
+            day_lo = requested_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+            day_hi = day_lo + timedelta(days=1)
+            items = svc.events().list(
+                calendarId=GESCHAEFTS_MEETINGS_CALENDAR_ID,
+                timeMin=day_lo.isoformat(), timeMax=day_hi.isoformat(),
+                singleEvents=True, orderBy="startTime",
+            ).execute().get("items", [])
+            ctx["same_day_meetings"] = [
+                ((ev.get("summary", "") or "Termin").strip(), (ev.get("start", {}).get("dateTime") or "")[11:16])
+                for ev in items
+            ]
     except Exception as e:
-        logger.error("_resolve_viewing_candidate failed for %s: %s", sender, e)
-        return {"ok": False, "conflict": None}
+        logger.warning("_viewing_candidate_context failed for %s %s: %s", candidate_date, candidate_time, e)
+    return ctx
 
 
 def notify_dan_viewing_times_needed(channel: str, sender: str, name: str, occasion: str, preferred: str, guest_text: str):
@@ -1981,7 +1966,9 @@ COME BY AND SEE THE SPACE. CHANGED 17 Sep 2026, Dan tightened this to three spec
 
 CHANGED AGAIN 17 Sep 2026, same day, after Dan caught the bot confirming an 18 Uhr viewing to a guest with nobody ever having checked whether he was actually free then, his own words, "you confirmed this time without ever asking me if i had time." You yourself must never assert, in the words of your own message, that a specific date and time is confirmed, you have no way to know that just from the conversation. The moment one of the three triggers above applies and the guest wants to come by, your message this turn is always a holding line, something in the feel of lass mich schauen wann das naechste woche bei uns passt, ich melde mich gleich nochmal, never a sentence that itself states a day and time are locked in.
 
-CHANGED YET AGAIN 17 Sep 2026, same day, Dan directly: "no take ownership, you are the concierge, respond back with the correct time." The version of this rule right above was too conservative, routing every single viewing request to Dan even when the guest had already given a real day and time and the calendar was genuinely free, exactly the kind of thing you already resolve on your own for a normal reservation via book_table. So, in that same holding-line reply, still fill in viewing_requested with their name and occasion, and additionally resolve candidate_date and candidate_time whenever the guest gave you both a specific day and a specific clock time, exactly as they said it, even a time you suspect is too early like 18 Uhr, do not adjust or judge it yourself, that is not your job, just resolve it the same way you resolve any other date or time field. A real calendar check then runs behind the scenes, checking both the Reservierungen and Geschäfts Meetings calendars. If that slot, or 19 Uhr on the same day if they asked for something earlier, is genuinely free, it gets confirmed straight back to the guest automatically, your holding line never actually reaches them, it gets replaced by a real confirmation, and the calendar entry is written for you, nothing further needed from you this turn. If there is a genuine conflict, or the guest only gave a vague preference with no exact day and time, THEN it falls back to pinging Dan on WhatsApp to actually supply a time, exactly like before, and your holding line is what the guest actually sees. Either way you never have to decide availability yourself, you just always give the guest a safe holding line and always resolve whatever specific day/time the guest actually gave you into the schema fields, the system decides the rest.
+CHANGED YET AGAIN 17 Sep 2026, same day, Dan first tried "no take ownership, you are the concierge, respond back with the correct time," which briefly had you auto-confirming a viewing outright whenever both calendars showed no conflict. He corrected that himself within the same message the moment he saw it in practice: "no always check with me. i can not be ther from 18-2 three day a week." A calendar being free is not the same thing as him actually being there, his real presence is not fully captured by either calendar, so this always pings Dan now, every single time, no exceptions, exactly like the version before the brief auto-confirm attempt.
+
+What Dan asked for instead, in the same breath, "the logic is good by checking the calendar but you need to check with me as well... even better would be to see when there are other geschaeftsmeetings and buildin a block of meetings since i will be there anyway... i am often not there on saturday so we need to make sure i am actually there": still fill in viewing_requested with their name and occasion, and additionally resolve candidate_date and candidate_time whenever the guest gave you both a specific day and a specific clock time, exactly as they said it, even a time you suspect is too early like 18 Uhr, do not adjust or judge it yourself, that is not your job, just resolve it the same way you resolve any other date or time field. This never confirms anything or touches the calendar, it only lets the WhatsApp Dan gets be smarter, checking both calendars for a conflict, checking whether he already has a Geschäftsmeeting that same day he could combine the viewing with since he will be there anyway, and flagging it plainly if the day is a Saturday, since that is specifically the day he said he is often not around even with nothing on the calendar to explain why. You never have to decide availability yourself, you just always give the guest a safe holding line and always resolve whatever specific day/time the guest actually gave you into the schema fields, Dan always makes the actual call.
 
 From the Dan-fallback path, Dan replies directly in the guest's own thread himself with a day (19 Uhr or later, never earlier, the team is still setting up at 18 Uhr) that actually works, that reply shows up as an assistant echo in the conversation history exactly like any other message Dan sends by hand. The next time you answer this guest, if that echo already gave one specific date and time, confirm it back to them warmly and fill in viewing_confirmed with that date, time, their name, and the occasion, this is what actually creates the real calendar entry for the walkthrough and lets Dan know it is locked in, exactly like event_hold does for the event itself below, a promised visit that only ever exists as a sentence in the chat is the same mistake as an unbacked date hold, see TENTATIVE HOLD below. Never fill in viewing_confirmed yourself for a time that came only from you or only from the guest, only ever for a time Dan himself already gave in the thread, the automatic candidate check above is the only other way a viewing time ever gets confirmed.
 
@@ -2103,11 +2090,11 @@ SEND_REPLY_TOOL = {
         "release_event_hold to true instead when a guest explicitly backs out of a GROUPS AND "
         "EVENTS inquiry that never reached handoff, to remove that placeholder again. On action "
         "reply, fill in viewing_requested the moment one of the COME BY AND SEE THE SPACE triggers "
-        "applies and the guest wants to come by, CHANGED 17 Sep 2026, extended again same day, "
-        "never assert a time is confirmed in your own message, that is always a holding line, but "
-        "do resolve candidate_date/candidate_time whenever the guest gave both, a real calendar "
-        "check behind the scenes either confirms that slot straight back to them or falls back to "
-        "asking Dan, you do not decide which. On action reply, fill in viewing_confirmed only once an assistant "
+        "applies and the guest wants to come by, REWORKED 17 Sep 2026, same evening, never assert "
+        "a time is confirmed in your own message, that is always a holding line, this always pings "
+        "Dan, no exceptions, he is not reachable through a calendar alone. Still resolve "
+        "candidate_date/candidate_time whenever the guest gave both, that only enriches the alert "
+        "Dan gets, it never decides anything on its own. On action reply, fill in viewing_confirmed only once an assistant "
         "echo in this same thread shows Dan himself already gave a specific date and time, see "
         "COME BY AND SEE THE SPACE above, this creates a real calendar entry for the walkthrough "
         "and alerts Dan it is locked in."
@@ -2180,22 +2167,21 @@ SEND_REPLY_TOOL = {
             "viewing_requested": {
                 "type": "object",
                 "description": (
-                    "CHANGED 17 Sep 2026, extended again same day. Only on action reply, the "
-                    "moment one of the three COME BY AND SEE THE SPACE triggers applies and the "
-                    "guest wants to come by. Your message field this same turn must always be a "
-                    "holding line, something like you will check and get back to them, never a "
-                    "sentence that itself asserts a time is confirmed, you do not know yet whether "
-                    "it is. Fill in candidate_date and candidate_time whenever the guest gives you "
-                    "BOTH a specific day and a specific clock time, even one you suspect is too "
-                    "early, resolve it exactly as they said it, same as any other date/time field, "
-                    "do not adjust or validate it yourself. A real calendar check then runs behind "
-                    "the scenes, if their time is free it gets confirmed straight back to them, "
-                    "nudged up to 19 Uhr automatically if they asked for earlier, and your holding "
-                    "line this turn never reaches them, it gets replaced. If there is a genuine "
-                    "conflict, or the guest only gave a vague preference with no exact day and "
-                    "time, this pings Dan on WhatsApp instead to actually supply a time, and your "
-                    "holding line is what the guest sees. Either way you never have to work out "
-                    "availability yourself, see COME BY AND SEE THE SPACE above."
+                    "REWORKED 17 Sep 2026, same evening. Only on action reply, the moment one of "
+                    "the three COME BY AND SEE THE SPACE triggers applies and the guest wants to "
+                    "come by. Your message field this same turn must always be a holding line, "
+                    "something like you will check and get back to them, never a sentence that "
+                    "itself asserts a time is confirmed, that decision is never yours to make. This "
+                    "always pings Dan on WhatsApp, no exceptions, Dan's own words, he is not "
+                    "reachable through a calendar alone, so even a slot with no calendar conflict "
+                    "still always needs him personally. Fill in candidate_date and candidate_time "
+                    "whenever the guest gives you BOTH a specific day and a specific clock time, "
+                    "even one you suspect is too early, resolve it exactly as they said it, same as "
+                    "any other date/time field, do not adjust or validate it yourself, this only "
+                    "gives Dan useful context (a calendar check, whether he already has something "
+                    "else that day, a Saturday flag) in the alert he gets, it never changes whether "
+                    "he gets asked. Your holding line is always what the guest actually sees this "
+                    "turn, see COME BY AND SEE THE SPACE above."
                 ),
                 "properties": {
                     "name": {"type": "string", "description": "The organiser's name, or Gast if truly not known"},
@@ -2207,8 +2193,7 @@ SEND_REPLY_TOOL = {
                             "words, for example naechste woche irgendwann or donnerstag abend. "
                             "Empty string if they have not said anything yet, do not guess or "
                             "invent one. Still fill this in even when candidate_date/candidate_time "
-                            "below are also set, it gives Dan context if the calendar check falls "
-                            "back to him."
+                            "below are also set, it gives Dan extra context in the alert."
                         ),
                     },
                     "candidate_date": {
@@ -2216,7 +2201,8 @@ SEND_REPLY_TOOL = {
                         "description": (
                             "YYYY-MM-DD, resolved from the AKTUELLER ZEITPUNKT line, only when the "
                             "guest gave one specific day for the visit, not a vague range. Leave "
-                            "empty if they only gave a rough preference."
+                            "empty if they only gave a rough preference. Purely informational for "
+                            "Dan's alert, never used to confirm anything automatically."
                         ),
                     },
                     "candidate_time": {
@@ -2224,8 +2210,8 @@ SEND_REPLY_TOOL = {
                         "description": (
                             "HH:MM in 24 hour time, only when the guest gave one specific clock "
                             "time alongside candidate_date. Give their actual requested time even "
-                            "if it looks too early, the system snaps it to 19 Uhr itself if needed, "
-                            "that is not your job. Leave empty if no specific time was given."
+                            "if it looks too early, this is only context for Dan, not a decision "
+                            "you or the system are making. Leave empty if no specific time was given."
                         ),
                     },
                 },
@@ -3052,18 +3038,20 @@ def claude_decide(sender: str, text: str):
                         logger.error("event_hold side effect failed for %s: %s", sender, e)
                     # VIEWING time request side effect, see
                     # notify_dan_viewing_times_needed and
-                    # _resolve_viewing_candidate above. CHANGED 17 Sep 2026,
-                    # extended again same day, Dan directly: "no take
-                    # ownership, you are the concierge, respond back with
-                    # the correct time." When the guest gave a real
-                    # candidate day and time, this now runs a real
-                    # deterministic calendar check and, if it is free,
-                    # overrides the model's holding line with an actual
-                    # confirmation and writes the calendar entry right
-                    # here, same self-serve pattern every other booking in
-                    # this file already uses. Only a genuine conflict, or a
-                    # vague preference with no exact day/time, still pings
-                    # Dan instead. Same best effort wrapping, this must
+                    # _viewing_candidate_context above. REWORKED 17 Sep
+                    # 2026, same evening, Dan directly: "no always check
+                    # with me. i can not be ther from 18-2 three day a
+                    # week." This NEVER confirms a viewing to the guest or
+                    # writes the calendar on its own anymore, every single
+                    # viewing request pings Dan, no exceptions, a free
+                    # calendar does not mean he is actually there. What it
+                    # still does, per his own follow up, is enrich that
+                    # WhatsApp with real calendar context, a conflict check
+                    # against both calendars, whether he already has a
+                    # Geschaeftsmeeting that same day he could combine this
+                    # with, and a specific flag if the day is a Saturday,
+                    # so he can say yes fast instead of starting from a
+                    # blank question. Same best effort wrapping, this must
                     # never block the guest's actual reply from going out.
                     try:
                         requested = inp.get("viewing_requested")
@@ -3073,35 +3061,44 @@ def claude_decide(sender: str, text: str):
                             req_preferred = (requested.get("preferred") or "").strip()
                             cand_date = (requested.get("candidate_date") or "").strip()
                             cand_time = (requested.get("candidate_time") or "").strip()
-                            resolved = None
-                            if cand_date and cand_time:
-                                resolved = _resolve_viewing_candidate(
-                                    sender, req_name, req_occasion, cand_date, cand_time, lang,
-                                )
-                            if resolved and resolved.get("ok"):
-                                message = resolved["message"]
+                            if sender.startswith("email:"):
+                                channel_guess = "email"
+                            elif _is_whatsapp_number(sender):
+                                channel_guess = "whatsapp"
                             else:
-                                if sender.startswith("email:"):
-                                    channel_guess = "email"
-                                elif _is_whatsapp_number(sender):
-                                    channel_guess = "whatsapp"
+                                channel_guess = "instagram_or_messenger"
+                            extra_bits = []
+                            if cand_date and cand_time:
+                                ctx = _viewing_candidate_context(cand_date, cand_time)
+                                if ctx["valid"]:
+                                    shown_time = ctx["start_dt"].strftime("%H:%M")
+                                    bit = f"asked for {cand_date} {cand_time}"
+                                    if ctx["snapped"]:
+                                        bit += f" (earliest valid per the 19 Uhr floor would be {shown_time})"
+                                    extra_bits.append(bit)
+                                    if ctx["conflict"]:
+                                        extra_bits.append(
+                                            f"clashes with \"{ctx['conflict'].get('summary', '')}\" on your calendar"
+                                        )
+                                    if ctx["same_day_meetings"]:
+                                        meetings_str = ", ".join(f"{s} at {t}" for s, t in ctx["same_day_meetings"])
+                                        extra_bits.append(
+                                            f"you already have on Geschaefts Meetings that day: {meetings_str}, "
+                                            f"might be easy to combine since you will be there anyway"
+                                        )
+                                    if ctx["is_saturday"]:
+                                        extra_bits.append(
+                                            "heads up, this is a Saturday, you said you are often not there, "
+                                            "please double check before confirming"
+                                        )
                                 else:
-                                    channel_guess = "instagram_or_messenger"
-                                extra = ""
-                                if resolved and resolved.get("conflict"):
-                                    extra = (
-                                        f"wanted {cand_date} {cand_time}, that clashes with "
-                                        f"\"{resolved['conflict'].get('summary', '')}\" on your calendar"
-                                    )
-                                elif cand_date and cand_time:
-                                    extra = f"wanted {cand_date} {cand_time}, could not auto confirm that one"
-                                combined_preferred = req_preferred
-                                if extra:
-                                    combined_preferred = (combined_preferred + ", " + extra).strip(", ")
-                                notify_dan_viewing_times_needed(
-                                    channel_guess, sender, req_name, req_occasion,
-                                    combined_preferred, message,
-                                )
+                                    extra_bits.append(f"asked for {cand_date} {cand_time}, could not parse or check that")
+                            combined_preferred = req_preferred
+                            if extra_bits:
+                                combined_preferred = (combined_preferred + ", " + "; ".join(extra_bits)).strip(", ")
+                            notify_dan_viewing_times_needed(
+                                channel_guess, sender, req_name, req_occasion, combined_preferred, message,
+                            )
                     except Exception as e:
                         logger.error("viewing_requested side effect failed for %s: %s", sender, e)
                     # VIEWING appointment side effect, see create_viewing_appointment
