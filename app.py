@@ -190,6 +190,15 @@ CONV_MAX_TURNS = int(os.environ.get("CONV_MAX_TURNS", "60"))
 
 # Reservations. Google Calendar credentials already live in Railway.
 RESERVIERUNGEN_CALENDAR_ID = os.environ.get("RESERVIERUNGEN_CALENDAR_ID", "")
+# Dan's separate business/personal meeting calendar, "BrunnenBar Geschäfts
+# Meetings". Added 17 Sep 2026 so a viewing appointment conflict check (see
+# _viewing_slot_conflict below) also catches something on THIS calendar, not
+# just Reservierungen, closing the gap flagged the same day the conflict
+# check itself was first built. Hardcoded here rather than a new Railway env
+# var, this id was already confirmed via list_calendars and is stable, no
+# reason to add a manual Railway step for something that never changes. If
+# Dan ever recreates this calendar under a new id, update the constant here.
+GESCHAEFTS_MEETINGS_CALENDAR_ID = "1296c10b65932636f77caa1bc403ea94fec27e73549309afef048b2b80d98b72@group.calendar.google.com"
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
@@ -1276,36 +1285,42 @@ VIEWING_DURATION_HOURS = float(os.environ.get("VIEWING_DURATION_HOURS", "1"))
 
 
 def _viewing_slot_conflict(svc, start_dt, end_dt):
-    """Best effort conflict check against the Reservierungen calendar before
-    a viewing appointment is written, added 17 Sep 2026. Dan directly, on a
-    real guest (Olivia) whose 18 Uhr viewing the bot just confirmed outright,
-    "you confirmed this time without ever asking me if i had time." The
-    model itself has no live calendar access and writes its confirmation
-    text in the same turn as the tool call, so this cannot block a bad
-    confirmation from ever reaching the guest, that would need a bigger
-    architecture change, not attempted here. What this DOES do is give Dan
-    real visibility fast instead of none at all, if the slot this got
-    confirmed for overlaps another calendar entry, alert him immediately so
-    he can sort it out before the appointment, same philosophy as
-    _find_other_tentative_hold's collision alert. Only checks the
-    Reservierungen calendar, Dan's separate personal or business meeting
-    calendar is not wired in here, that would need its own calendar id
-    configured in Railway, flagged, not built. Returns the first
-    conflicting event dict, or None."""
-    try:
-        items = svc.events().list(
-            calendarId=RESERVIERUNGEN_CALENDAR_ID,
-            timeMin=start_dt.isoformat(), timeMax=end_dt.isoformat(),
-            singleEvents=True,
-        ).execute().get("items", [])
-        for ev in items:
-            if "Besichtigungstermin" in (ev.get("summary", "") or ""):
-                continue
-            return ev
-        return None
-    except Exception as e:
-        logger.warning("Viewing slot conflict check failed: %s", e)
-        return None
+    """Best effort conflict check before a viewing appointment is written,
+    added 17 Sep 2026. Dan directly, on a real guest (Olivia) whose 18 Uhr
+    viewing the bot just confirmed outright, "you confirmed this time
+    without ever asking me if i had time." As of the same day this check
+    was first built, viewing appointments now only ever get a real time
+    once Dan himself has given one (see COME BY AND SEE THE SPACE and
+    viewing_requested/viewing_confirmed in the system prompt below), so
+    this check is now a second, redundant safety net rather than the only
+    thing standing between a bad guess and the guest, but it stays in
+    place, a second check costs nothing and Dan can still hand write a time
+    into a thread that happens to clash with something he forgot about.
+    CHANGED 17 Sep 2026, extended same day the check was first built to also
+    read GESCHAEFTS_MEETINGS_CALENDAR_ID, Dan's separate business/personal
+    meeting calendar, previously only Reservierungen was checked here, which
+    meant a viewing could still silently clash with a real meeting on the
+    other calendar. Checks both and returns the first conflicting event
+    found on either, favoring Reservierungen only because it is checked
+    first, not because a Geschäfts Meetings conflict matters any less.
+    Returns the first conflicting event dict, or None."""
+    calendar_ids = [RESERVIERUNGEN_CALENDAR_ID]
+    if GESCHAEFTS_MEETINGS_CALENDAR_ID:
+        calendar_ids.append(GESCHAEFTS_MEETINGS_CALENDAR_ID)
+    for cal_id in calendar_ids:
+        try:
+            items = svc.events().list(
+                calendarId=cal_id,
+                timeMin=start_dt.isoformat(), timeMax=end_dt.isoformat(),
+                singleEvents=True,
+            ).execute().get("items", [])
+            for ev in items:
+                if "Besichtigungstermin" in (ev.get("summary", "") or ""):
+                    continue
+                return ev
+        except Exception as e:
+            logger.warning("Viewing slot conflict check failed for calendar %s: %s", cal_id, e)
+    return None
 
 
 def create_viewing_appointment(sender, name, start_dt, occasion=""):
@@ -1372,6 +1387,34 @@ def notify_dan_viewing_scheduled(channel: str, sender: str, summary: str):
         logger.info("Dan notified (viewing FYI) for %s on %s", sender, channel)
     else:
         logger.warning("Could not reach Dan with viewing FYI for %s on %s (not urgent, not retried)", sender, channel)
+
+
+def notify_dan_viewing_times_needed(channel: str, sender: str, name: str, occasion: str, preferred: str, guest_text: str):
+    """Fired the moment a guest wants to come by and see the space, added
+    17 Sep 2026 replacing the old flow where the bot picked a time itself
+    and confirmed it outright. Dan directly, after catching a real 18 Uhr
+    viewing the bot had confirmed without ever asking him first, "you
+    confirmed this time without ever asking me if i had time... make sure
+    you confirm the time first with a let me check when would work next
+    week or something, then whatsapp me to ask for times." This is that
+    WhatsApp. Uses alert_dan rather than the calmer notify_dan_viewing_scheduled
+    FYI wording, because unlike a scheduled viewing this genuinely needs
+    Dan to act, he has to actually give a time back, nothing here creates a
+    calendar entry, that only happens later via viewing_confirmed once Dan
+    has replied with a real time in the thread himself, see
+    create_viewing_appointment and COME BY AND SEE THE SPACE in the system
+    prompt."""
+    reason = f"wants to come by and see the space, needs times from you"
+    if preferred:
+        reason += f", they mentioned: {preferred}"
+    if occasion:
+        reason += f" ({occasion})"
+    alert_dan(
+        f"viewing request, {name}", channel, sender, guest_text,
+        reason + ". Reply straight to them in the guest thread itself with a day/time from "
+        "19 Uhr on that works, not to this alert, the bot reads that and locks in the real "
+        "calendar entry the next time it answers them.",
+    )
 
 
 def create_private_space_reservation(name, contact, party, space, start_dt, occasion, lang="de", note=""):
@@ -1849,7 +1892,9 @@ Step five ONLY applies if the guest actually chose the hinterer Bereich or the w
 
 Only for hinterer Bereich or whole bar exclusive, find out over the rest of the conversation, again one at a time. The music, only bring this topic up yourself if they are closing the whole bar exclusively, ask whether they will bring their own Spotify playlist or want a DJ. If they are booking the hinterer Bereich, never raise music yourself, that space shares the room with normal walk in guests out front so the bar's own normal music plays throughout regardless of what this one group wants. If a hinterer Bereich guest asks about music on their own, do not just say no, tell them warmly that a couple of song requests are always fine, but they cannot control the music directly since that space shares the bar's sound with everyone out front. The food, ask first in a simple way whether they are planning to bring their own food, before mentioning caterers at all. If they say yes, that is all you need, no further explanation necessary. If they say no or seem unsure, then explain we have no kitchen ourselves, so bringing their own food or cake works great, caterers like Thassos are also an option, or they are welcome to organise catering themselves. And how they want to handle guests paying, ask if they are covering their guests themselves, want a drinks budget, or if guests just pay for their own. This question is about drinks only, never say or imply guests pay us for food, a real sent message once said zahlt ihr ganz normal für eure Getränke und Essen and that is wrong, we have no kitchen and never sell or bill food ourselves, whatever they brought themselves or got from a caterer is handled entirely outside the bar tab, do not blend the two questions into one sentence just because you asked about food a moment earlier.
 
-COME BY AND SEE THE SPACE. CHANGED 17 Sep 2026, Dan tightened this to three specific situations, never a routine step you offer just because a group qualified for GROUPS AND EVENTS. One, the guest actually has open questions about the space or how it works that seeing it in person would genuinely help answer, not something you can already answer here yourself. Two, a guest who has gone quiet on an open inquiry, a reason to reach back out to them, not something to bring up while the conversation is still actively moving forward on its own. Three, a guest who has never personally been to BrunnenBar themselves, a friend of theirs having been is not the same as them having been, AND who is actually reserving hinterer Bereich or ganze Bar, a real private space, not a plain bigger table. Outside these three, do not bring it up. A real guest (Olivia, 30th, ganze Bar) already said she wanted to reserve, and the bot still offered a viewing right after, Dan called that overselling, you already sold it, offering a viewing once someone has said yes to reserving can only make them reconsider something that was already decided, never do that, that is a fourth situation to actively avoid, not a fourth trigger. If a guest who has been here before still asks to come by anyway, or asks after already saying yes, that is their call, of course still make it happen, this rule is about you never volunteering it in those cases, not about refusing a guest who wants it. When you do offer or agree on a viewing, only ever propose or confirm a day the bar is actually open and 19 Uhr or later, never earlier, the team is still setting up at 18 Uhr and cannot host a walkthrough then, same as any other time you reference the week, use the upcoming dates given to you rather than guessing. The moment the guest actually agrees on one specific date and time for the visit, fill in viewing_confirmed with that date, time, their name, and the occasion in that same reply, this creates a real calendar entry for the walkthrough and lets Dan know, exactly like event_hold does for the event itself below, a promised visit that only ever exists as a sentence in the chat is the same mistake as an unbacked date hold, see TENTATIVE HOLD below.
+COME BY AND SEE THE SPACE. CHANGED 17 Sep 2026, Dan tightened this to three specific situations, never a routine step you offer just because a group qualified for GROUPS AND EVENTS. One, the guest actually has open questions about the space or how it works that seeing it in person would genuinely help answer, not something you can already answer here yourself. Two, a guest who has gone quiet on an open inquiry, a reason to reach back out to them, not something to bring up while the conversation is still actively moving forward on its own. Three, a guest who has never personally been to BrunnenBar themselves, a friend of theirs having been is not the same as them having been, AND who is actually reserving hinterer Bereich or ganze Bar, a real private space, not a plain bigger table. Outside these three, do not bring it up. A real guest (Olivia, 30th, ganze Bar) already said she wanted to reserve, and the bot still offered a viewing right after, Dan called that overselling, you already sold it, offering a viewing once someone has said yes to reserving can only make them reconsider something that was already decided, never do that, that is a fourth situation to actively avoid, not a fourth trigger. If a guest who has been here before still asks to come by anyway, or asks after already saying yes, that is their call, of course still make it happen, this rule is about you never volunteering it in those cases, not about refusing a guest who wants it.
+
+CHANGED AGAIN 17 Sep 2026, same day, after Dan caught the bot confirming an 18 Uhr viewing to a guest with nobody ever having checked whether he was actually free then, his own words, "you confirmed this time without ever asking me if i had time." You do not have real visibility into Dan's calendar, so you must never propose, negotiate, or accept a specific date or time for a viewing yourself, not even one that sounds obviously safe. The moment one of the three triggers above applies and the guest wants to come by, your message this turn is only a holding line, something in the feel of lass mich schauen wann das naechste woche bei uns passt, ich melde mich gleich nochmal, never a concrete day or time, even if the guest offers one first, still do not confirm it back to them yet. In that same reply, fill in viewing_requested with their name, the occasion, and whatever day or time preference they already mentioned, if any, this pings Dan on WhatsApp to actually give you real times, it does not touch the calendar. From here Dan replies directly in the guest's own thread himself with a day (19 Uhr or later, never earlier, the team is still setting up at 18 Uhr) that actually works, that reply shows up as an assistant echo in the conversation history exactly like any other message Dan sends by hand. The next time you answer this guest, if that echo already gave one specific date and time, confirm it back to them warmly and fill in viewing_confirmed with that date, time, their name, and the occasion, this is what actually creates the real calendar entry for the walkthrough and lets Dan know it is locked in, exactly like event_hold does for the event itself below, a promised visit that only ever exists as a sentence in the chat is the same mistake as an unbacked date hold, see TENTATIVE HOLD below. Never fill in viewing_confirmed for a time that came from you or from the guest alone, only ever for a time Dan himself already gave in the thread.
 
 Once you have everything Steps one through four call for (and Step five, only for a real private space), call book_table, not send_reply, to actually finish it. Set space to hinterer_bereich or ganze_bar for a real private space the guest has chosen and accepted the Mindestumsatz for, or leave it as tisch for a plain bigger table, same as any RESERVATION, and party to the full headcount, there is no six person ceiling anymore. The system checks real availability for whichever space you asked for, books it, and sends the guest the actual confirmation itself, including the Mindestumsatz reminder for a private space, and pings Dan an FYI once it is actually booked, so you never write that confirmation yourself and Dan never has to write the follow up either unless something in WHEN THIS IS STILL A REAL HANDOFF above actually applies.
 
@@ -1863,6 +1908,7 @@ Music for the hinterer Bereich, only Spotify, wie stehts mit der musik, bringt i
 Music for the whole bar, DJ is possible here, wie stehts mit der musik, bringt ihr ne eigene spotify playlist mit oder hättet ihr gern nen dj.
 Guest payment options, abrechnen können wir ganz flexibel, entweder alles auf eine rechnung, ein getränkebudget oder jeder zahlt selbst.
 Come by invite, sehr gerne kommst du vorher mal vorbei, dann zeige ich dir alles in ruhe und wir gehen die details zusammen durch.
+Come by, holding a time rather than picking one yourself, added 17 Sep 2026, lass mich schauen wann das naechste woche bei uns passt, ich meld mich gleich nochmal bei dir.
 
 HOW DAN REALLY WRITES, real lines from his own chats, copy this feel, these are only voice anchors so never quote the prices from here.
 Reservation confirm, hallo Stephi sehr gerne, ich reservier dir einen tisch für 3 am donnerstag den 27.8 um 19 uhr draußen, wir freuen uns auf euch.
@@ -1967,9 +2013,13 @@ SEND_REPLY_TOOL = {
         "being frei or held is actually backed by something. On action reply, set "
         "release_event_hold to true instead when a guest explicitly backs out of a GROUPS AND "
         "EVENTS inquiry that never reached handoff, to remove that placeholder again. On action "
-        "reply, fill in viewing_confirmed the moment a guest agrees on one specific date and time "
-        "to come by and see the space, see COME BY AND SEE THE SPACE above, this creates a real "
-        "calendar entry for the walkthrough and alerts Dan."
+        "reply, fill in viewing_requested the moment one of the COME BY AND SEE THE SPACE triggers "
+        "applies and the guest wants to come by, CHANGED 17 Sep 2026, never propose or accept a "
+        "specific time yourself for this, your message is only a holding line, this pings Dan to "
+        "actually give times. On action reply, fill in viewing_confirmed only once an assistant "
+        "echo in this same thread shows Dan himself already gave a specific date and time, see "
+        "COME BY AND SEE THE SPACE above, this creates a real calendar entry for the walkthrough "
+        "and alerts Dan it is locked in."
     ),
     "input_schema": {
         "type": "object",
@@ -2036,14 +2086,42 @@ SEND_REPLY_TOOL = {
                     "TENTATIVE HOLD placeholder from earlier in this thread, if one exists."
                 ),
             },
+            "viewing_requested": {
+                "type": "object",
+                "description": (
+                    "CHANGED 17 Sep 2026. Only on action reply, the moment one of the three COME "
+                    "BY AND SEE THE SPACE triggers applies and the guest wants to come by. Your "
+                    "message field this same turn must only be a holding line, something like you "
+                    "will check what works and get back to them, NEVER a specific date or time you "
+                    "or the guest proposed, that is now always Dan's call, not yours, see COME BY "
+                    "AND SEE THE SPACE above. This pings Dan on WhatsApp to actually supply times, "
+                    "it does not touch the calendar."
+                ),
+                "properties": {
+                    "name": {"type": "string", "description": "The organiser's name, or Gast if truly not known"},
+                    "occasion": {"type": "string", "description": "The Anlass, or an empty string if not known"},
+                    "preferred": {
+                        "type": "string",
+                        "description": (
+                            "Whatever day or time preference the guest already gave, in their own "
+                            "words, for example naechste woche irgendwann or donnerstag abend. "
+                            "Empty string if they have not said anything yet, do not guess or "
+                            "invent one."
+                        ),
+                    },
+                },
+                "required": ["name"],
+            },
             "viewing_confirmed": {
                 "type": "object",
                 "description": (
-                    "Only on action reply, only the moment a guest agrees on one specific date "
-                    "AND time to come by and see the space in person, see COME BY AND SEE THE "
-                    "SPACE above. Fill this in the same turn you confirm the appointment back to "
-                    "them, it creates a real calendar entry for the walkthrough and alerts Dan, so "
-                    "the appointment is not just a sentence in the chat."
+                    "CHANGED 17 Sep 2026, only on action reply, and only once an assistant echo "
+                    "earlier in this same thread shows Dan HIMSELF already gave one specific date "
+                    "AND time for the viewing, after a viewing_requested alert. Never fill this in "
+                    "from a time you or the guest proposed on your own, that is exactly the mistake "
+                    "this replaced, see COME BY AND SEE THE SPACE above. Fill this in the turn you "
+                    "confirm Dan's time back to the guest, it creates a real calendar entry for the "
+                    "walkthrough and lets Dan know it is locked in."
                 ),
                 "properties": {
                     "date": {"type": "string", "description": "YYYY-MM-DD, resolved from the AKTUELLER ZEITPUNKT line"},
@@ -2853,9 +2931,35 @@ def claude_decide(sender: str, text: str):
                                     )
                     except Exception as e:
                         logger.error("event_hold side effect failed for %s: %s", sender, e)
+                    # VIEWING time request side effect, see
+                    # notify_dan_viewing_times_needed above. CHANGED 17 Sep
+                    # 2026, this now runs BEFORE any calendar write, the bot
+                    # itself never proposes or locks in a time anymore, it
+                    # only pings Dan to supply one. Same best effort
+                    # wrapping, this must never block the guest's actual
+                    # reply from going out.
+                    try:
+                        requested = inp.get("viewing_requested")
+                        if isinstance(requested, dict):
+                            req_name = (requested.get("name") or "").strip() or "Gast"
+                            req_occasion = (requested.get("occasion") or "").strip()
+                            req_preferred = (requested.get("preferred") or "").strip()
+                            if sender.startswith("email:"):
+                                channel_guess = "email"
+                            elif _is_whatsapp_number(sender):
+                                channel_guess = "whatsapp"
+                            else:
+                                channel_guess = "instagram_or_messenger"
+                            notify_dan_viewing_times_needed(
+                                channel_guess, sender, req_name, req_occasion, req_preferred, message,
+                            )
+                    except Exception as e:
+                        logger.error("viewing_requested side effect failed for %s: %s", sender, e)
                     # VIEWING appointment side effect, see create_viewing_appointment
-                    # above. Same best effort wrapping, a calendar hiccup here must
-                    # never block the guest's actual reply from going out.
+                    # above. Only ever fires once Dan himself has given a real time
+                    # in the thread, see viewing_confirmed's schema description.
+                    # Same best effort wrapping, a calendar hiccup here must never
+                    # block the guest's actual reply from going out.
                     try:
                         viewing = inp.get("viewing_confirmed")
                         if isinstance(viewing, dict):
