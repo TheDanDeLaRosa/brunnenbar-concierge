@@ -1166,6 +1166,29 @@ PRIVATE_SPACES = {
     "ganze_bar": {"capacity": 65, "mindestumsatz": 1700, "label": "Ganze Bar exklusiv"},
 }
 
+# BUGFIX 18 Sep 2026, a real incident, a table for 5 was booked onto HT3 for
+# a Friday night even though the whole hinterer Bereich was already reserved
+# exclusively for a private party that same night, Dan directly: "they
+# reserved table HT3 for even though the full back room is reserved for a
+# party." Root cause, find_free_table below only ever checked a hinterer
+# Bereich booking against ANOTHER hinterer Bereich or ganze Bar booking, on
+# the stated assumption that the space "shares the room with normal walk in
+# service out front" and never blocks an ordinary table. That is true for
+# the front of the bar, it is not true for HT1, HT2, HT3 and Sofa, which per
+# the real Tischplan and TABLE_COMBOS above (see the "half of the backroom"
+# framing on the HT1+Sofa and HT2+HT3 combos) are the actual physical tables
+# that make up the hinterer Bereich lounge itself, not separate front tables
+# that merely share the room. Booking one of these normally while the whole
+# space is reserved for someone else seats a stranger inside another guest's
+# private party. Stam is explicitly NOT here, Dan confirmed it sits in a
+# different part of the bar entirely, see reference_brunnenbar_table_layout.
+# ST3 and Rnd2 are also left out for now, no confirmed evidence either way
+# that they sit physically inside the back lounge rather than the front,
+# flagged back to Dan to confirm rather than guessed, same principle as
+# TABLE_COMBOS above, a wrong physical assumption here seats a real guest on
+# top of a real private party.
+HINTERER_BEREICH_TABLES = {"HT1", "HT2", "HT3", "Sofa"}
+
 
 def _detect_space(text: str):
     """Best effort read of which private space, if any, a calendar event is
@@ -1232,11 +1255,15 @@ def _ganze_bar_conflict(date_iso: str, start_dt: datetime, end_dt: datetime) -> 
 def find_private_space(date_iso: str, start_dt: datetime, party: int, space: str) -> bool:
     """Whether `space` (hinterer_bereich or ganze_bar) is actually free for
     this date and the usual 3 hour turn, and the party fits its real
-    capacity. hinterer Bereich only conflicts with another hinterer Bereich or
-    ganze Bar booking, it shares the room with normal walk in service out
-    front so it never blocks or gets blocked by ordinary table reservations.
-    ganze Bar exklusiv conflicts with literally anything else on the calendar
-    that overlaps, see _ganze_bar_conflict. Never fabricates availability."""
+    capacity. hinterer Bereich here only conflicts with another hinterer
+    Bereich or ganze Bar booking, this function is just about whether the
+    SPACE itself is free to sell as a private booking, not about whether any
+    individual numbered table is free, see HINTERER_BEREICH_TABLES and
+    find_free_table below for the correction to the opposite direction, a
+    normal table booking landing inside an already private hinterer Bereich,
+    that was a real bug, this function was never the source of it. ganze Bar
+    exklusiv conflicts with literally anything else on the calendar that
+    overlaps, see _ganze_bar_conflict. Never fabricates availability."""
     turn = timedelta(hours=TURN_HOURS)
     end_dt = start_dt + turn
     cap = PRIVATE_SPACES[space]["capacity"]
@@ -1258,17 +1285,27 @@ def find_free_table(date_iso: str, start_dt: datetime, party: int, area: str):
     exclusively for someone else that slot, a ganze Bar exklusiv booking never
     shows up as a normal drinnen/draussen reservation so this would otherwise
     miss that conflict entirely and risk double booking a table inside an
-    exclusively closed bar."""
+    exclusively closed bar. BUGFIX 18 Sep 2026, a real incident, table HT3 got
+    booked onto a normal reservation the same night the whole hinterer Bereich
+    was already reserved for a private party, see the block comment above
+    HINTERER_BEREICH_TABLES. A hinterer Bereich booking now also blocks that
+    specific set of physical tables, same mechanism _tables_in_use_on already
+    uses for a same-day table already claimed, so nothing outside that block
+    comment's uncertainty (ST3, Rnd2) needed to change here."""
     turn = timedelta(hours=TURN_HOURS)
     req_end = start_dt + turn
+    blocked = set(_tables_in_use_on(date_iso, start_dt, req_end))
     for space, s, e in _private_space_events_on(date_iso):
-        if space == "ganze_bar" and s < req_end and start_dt < e:
+        if not (s < req_end and start_dt < e):
+            continue
+        if space == "ganze_bar":
             return None
+        if space == "hinterer_bereich":
+            blocked |= HINTERER_BEREICH_TABLES
     overlapping = [
         p for (a, p, s) in reservations_on(date_iso)
         if a == area and s < req_end and start_dt < s + turn
     ]
-    blocked = _tables_in_use_on(date_iso, start_dt, req_end)
     return _seat_new_party(overlapping, party, _area_tables(area), blocked)
 
 
@@ -1919,7 +1956,7 @@ If the newest message is only a brief acknowledgement or a closing remark and is
 If it is spam, a cold sales pitch, a marketing, collaboration, press, sponsoring or supplier message, or an automated delivery or app notification, call send_reply action skip, no message needed. This is just noise, Dan does not need to be paged for it.
 If a message is clearly not about the bar at all but is still written by a real person with a real need, for example a staff member asking about their pay, hours, or a schedule, or anything that reads like an internal or business matter rather than a guest one, this is NOT spam and must never be action skip, a real person is waiting on an answer. Treat it exactly like a policy question, call send_reply action handoff with reason set to a short reason, for example staff member asking about May pay, so Dan actually sees it and can follow up, most likely outside this channel.
 
-ADDED 17 Sep 2026, a real incident, a real person (Benita, reached out about possible shifts) opened with "Servus Denny, Benita hier vom Telefonat gestern" addressing Daniel by his own nickname Denny and referencing a real phone call he had personally had with her the day before. You have no way to know what was actually said on that call, but you replied anyway with a generic front desk greeting, Hallo Benita, schön dass du dich meldest, was kann ich für dich tun, and she called it out within hours, Ich nehme mal an das dies eine automatische Nachricht ist. That reply cost Daniel credibility with someone he was personally trying to bring on, it read exactly like the bot it was. Whenever a message opens by greeting Daniel personally by name or a nickname you recognize as his (Denny, Dan, Daniel) AND references a specific prior personal contact with him, a call, a meeting, an interview, something already discussed, phrases like vom Telefonat gestern, wie besprochen, vom Gespräch neulich, or similar, treat this exactly like the staff member case above, call send_reply action handoff, reason noting they referenced a prior call or meeting with Daniel by name, message left empty as always for a handoff. Never reply with a warm generic greeting here even though it feels like the safe, friendly default, a real guest earns that, someone continuing a conversation Daniel already personally started does not, they need Daniel himself picking it up exactly where he left it, not the bot guessing at where that is.
+ADDED 17 Sep 2026, a real incident, a real person (Benita, reached out about possible shifts) opened with "Servus Denny, Benita hier vom Telefonat gestern" addressing Daniel by his own nickname Denny and referencing a real phone call he had personally had with her the day before. You have no way to know what was actually said on that call, but you replied anyway with a generic front desk greeting, Hallo Benita, schön dass du dich meldest, was kann ich für dich tun, and she called it out within hours, Ich nehme mal an das dies eine automatische Nachricht ist. That reply cost Daniel credibility with someone he was personally trying to bring on, it read exactly like the bot it was. BROADENED 18 Sep 2026, a second real incident, a real person (Christina Felber, 30th birthday, circa 45 people, 24.10.2026) opened with "Hallo, Hier ist Christina von gestern. Sorry dass ich mich erst jetzt melde, ich hab's frueher nicht geschafft. Hier nochmal die Eckdaten," then a complete, fully qualifiable event inquiry, date, name, occasion, headcount, time, drinnen plus ganze Location. Daniel confirmed the two of them really had already spoken. This one never greeted Daniel by name at all, so the original version of this rule, which required a name or nickname greeting together with a reference to a prior contact, did not fire, and you answered with a fast, complete sounding acknowledgement anyway, Perfekt ist aufgeschrieben, Lg Dan, signed in Daniel's own voice a minute after her message, exactly the automated-over-the-top read Daniel is trying to prevent. The greeting-by-name was never the real signal, it was just how it happened to show up in the first incident. The real signal, in either case, is a message that frames itself as a RECAP or follow up of something already discussed with Daniel personally, not as new information being handed to the concierge for the first time, whether or not his name or nickname appears at all. Phrases like vom Telefonat gestern, wie besprochen, vom Gespräch neulich, von gestern, hier nochmal die Eckdaten or hier nochmal die Daten, wie ich dir schon gesagt habe, or an opening apology for a delayed follow up to something already promised or agreed, are all this same signal. This only applies to the FIRST message of a new thread carrying this signal, read the conversation history first, if this same sender's thread already has earlier turns here then whatever they are continuing is a conversation with you, not evidence of an out of band personal exchange with Daniel, and normal handling applies. When the signal IS present on a genuinely new thread, treat it exactly like the staff member case above, call send_reply action handoff, reason noting they referenced a prior personal exchange with Daniel, message left empty as always for a handoff, even when the message reads as a complete, easily qualifiable event or reservation inquiry you could otherwise answer yourself. A complete looking set of Eckdaten is not permission to acknowledge it automatically the moment the guest themselves frames those Eckdaten as something already gone over with Daniel, only he actually knows what was said, promised, or agreed in that earlier conversation, a confident sounding automatic ist aufgeschrieben risks contradicting or duplicating something he already told them himself. Never reply with a warm generic greeting or acknowledgement here even though it feels like the safe, friendly default, a real guest earns that, someone continuing a conversation Daniel already personally started does not, they need Daniel himself picking it up exactly where he left it, not the bot guessing at where that is.
 If it is a real guest asking about prices or Mindestumsatz beyond the guidance here, or a real policy question you are genuinely unsure about, do not guess and do not go silent. Call send_reply action handoff with reason set to a short few word reason for Dan in English, for example asking exact Mindestumsatz for a 40 person event. But do NOT use handoff just because a guest is being casual or off topic, only for a real question you cannot safely answer yourself.
 If a guest wants to cancel an existing reservation or event outright, do not leave them hanging with silence, acknowledge it briefly the way Dan would. Call send_reply action cancel_request, message set to one short sentence, for example alles gut und danke fuers Bescheid geben, bis zum naechsten mal. Do NOT explain that you will handle it or take care of it, Dan does not narrate next steps in a short acknowledgment like this, just close it out warmly and briefly. You still cannot actually remove anything from the calendar yourself, there is no tool for it, Dan does that after seeing the alert, so keep the message brief and generic, never invent details about the booking you were not told. Only use cancel_request for something that was actually confirmed or booked, a real table or an event Dan already handed an Angebot for. If a GROUPS AND EVENTS inquiry is still mid conversation and the guest backs out before it ever qualified or reached a handoff, for example still deciding on an area, or checking with their group, or telling you plans changed and it will not happen, nothing was ever a real confirmed booking and there is nothing for Dan to personally remove, that is a plain reply, not cancel_request, still warm and brief, something like alles gut und danke fuers Bescheid geben, vielleicht ein andermal, just without alerting Dan about a cancellation that was never real. If this thread ever had a date and headcount known for that inquiry, it very likely has a TENTATIVE HOLD placeholder on the calendar from earlier in the conversation, set release_event_hold to true in this same reply so that placeholder actually gets removed, it was only ever the bot's own not yet confirmed marker, safe to clear automatically, unlike a real booking this needs no Dan approval to take down.
 If a guest wants to move or reschedule an existing reservation or event to a different time or date, that is a handoff, exactly like a policy question, reason set to reschedule request, since that needs Dan to actually check real availability for the new time, not something to promise on your own.
