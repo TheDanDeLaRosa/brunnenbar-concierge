@@ -92,13 +92,20 @@ REPLY_DELAY_MAX = int(os.environ.get("REPLY_DELAY_MAX", "110"))
 # guest), it pings this number immediately with why, so a handoff is never silent.
 # Never fires on plain spam SKIP, that would just be noise.
 DAN_ALERT_WHATSAPP = os.environ.get("DAN_ALERT_WHATSAPP", "4915125499245")
-# Backup alert path. If the WhatsApp alert above fails to send, for example the
-# Dualhook connection itself is down, that is exactly the moment Dan most needs
-# to hear about it, and WhatsApp cannot tell him. Email runs on wholly separate
-# infrastructure (Gmail API, not Meta), so it is unlikely to fail at the same
-# time. Only used as a fallback, and only if GMAIL_REFRESH_TOKEN is already
-# configured for the email lane. Optional, no address means no email fallback.
-DAN_ALERT_EMAIL = os.environ.get("DAN_ALERT_EMAIL", "")
+# REMOVED 18 Sep 2026. Every Dan-facing notification (alert_dan, notify_dan_skip,
+# notify_dan_booked, and everything else routed through _deliver_to_dan) used to
+# also fire an email to DAN_ALERT_EMAIL, unconditionally alongside WhatsApp, ever
+# since the 5 Sep 2026 change below made email a redundant second channel rather
+# than a true fallback. Dan directly: "can we kill the Concierge emails? it sends
+# so much crap that is unnecessary. Lets move to the whatsapp notification if it
+# needs my attention." WhatsApp (DAN_ALERT_WHATSAPP) is now the only channel for
+# every concierge notification to Dan, see _deliver_to_dan. This reopens the exact
+# gap the 5 Sep change closed (Rina and Ben Rieger, 4 Sep 2026, WhatsApp reported
+# success to the Meta/Dualhook API but never actually reached Dan, most likely the
+# 24 hour customer service window on a free form message to a number that had not
+# messaged the bot first), a genuine risk being accepted on Dan's own explicit
+# call, not one this file is silently reintroducing. See
+# [[project_brunnenbar_cloud_concierge]].
 # How often the bot is allowed to alert Dan about the model itself failing to
 # draft a reply at all, for example the Anthropic API being down or the key
 # being invalid. Without a cooldown, an extended outage would page Dan on every
@@ -2468,7 +2475,6 @@ def debug():
         "TURN_HOURS": TURN_HOURS,
         "bookable_tables": len(TABLES),
         "DAN_ALERT_WHATSAPP": bool(DAN_ALERT_WHATSAPP),
-        "DAN_ALERT_EMAIL": bool(DAN_ALERT_EMAIL),
         "SKIP_NOTIFY_DAN": SKIP_NOTIFY_DAN,
         "API_FAILURE_ALERT_COOLDOWN": API_FAILURE_ALERT_COOLDOWN,
         "HANDLED_MAX": HANDLED_MAX,
@@ -3183,57 +3189,27 @@ def send_whatsapp(to: str, text: str) -> bool:
         return False
 
 
-def _email_alert_fallback(subject: str, body: str) -> bool:
-    """Send Dan an alert by email instead of WhatsApp. Only used when the
-    WhatsApp alert itself failed to send, since that is exactly the situation
-    where WhatsApp cannot be trusted to reach him. Runs on the Gmail lane,
-    wholly separate infrastructure from Meta/Dualhook, so it is unlikely to be
-    down at the same time. Silently does nothing if email is not configured or
-    DAN_ALERT_EMAIL is not set, callers already log the overall failure."""
-    if not (GMAIL_REFRESH_TOKEN and DAN_ALERT_EMAIL):
-        return False
-    try:
-        import base64
-        from email.mime.text import MIMEText
-        svc = _gmail_service()
-        mime = MIMEText(body, "plain", "utf-8")
-        mime["To"] = DAN_ALERT_EMAIL
-        mime["From"] = BAR_EMAIL
-        mime["Subject"] = subject
-        raw = base64.urlsafe_b64encode(mime.as_bytes()).decode()
-        svc.users().messages().send(userId="me", body={"raw": raw}).execute()
-        return True
-    except Exception as e:
-        logger.error("email alert fallback failed: %s", e)
-        return False
-
-
 def _deliver_to_dan(text: str, subject: str) -> bool:
-    """Shared delivery for anything meant to reach Dan. CHANGED 5 Sep 2026,
-    used to try WhatsApp first and only fall back to email if that specific
-    send call raised an error. Dan confirmed on two separate real incidents
-    (Rina, Ben Rieger, both 4 Sep 2026) that zero alerts reached him on
-    either channel even though /debug shows both DAN_ALERT_WHATSAPP and
-    DAN_ALERT_EMAIL configured, meaning send_whatsapp can report success to
-    the Meta/Dualhook API (no exception raised, so the old fallback never
-    triggered) while the message never actually surfaces to Dan, most likely
-    the WhatsApp 24 hour customer service window rejecting a free form
-    message to his own number without him having messaged the bot number
-    first. So this now fires WhatsApp AND email unconditionally whenever
-    both are configured, rather than email-as-fallback-only. A duplicate
-    alert costs Dan two seconds, a missed one costs a guest. Returns whether
-    it reached him on at least one channel, callers log their own
-    success/failure with their own category. See
+    """Shared delivery for anything meant to reach Dan. WhatsApp only, since
+    18 Sep 2026, Dan directly: "can we kill the Concierge emails? it sends so
+    much crap that is unnecessary. Lets move to the whatsapp notification if
+    it needs my attention." Before this it fired WhatsApp AND email
+    unconditionally (5 Sep 2026 change, itself a response to WhatsApp
+    silently failing to reach him on two real incidents, Rina and Ben Rieger,
+    4 Sep 2026, even though the Meta/Dualhook API reported success). That
+    risk is real and this change reopens it on Dan's own explicit call, not
+    silently, see the comment above DAN_ALERT_WHATSAPP's old email
+    counterpart for the incident detail. `subject` is kept as a parameter for
+    now rather than removed, so a future email (or other channel) fallback
+    can be reintroduced here alone if WhatsApp ever proves unreliable again,
+    without touching any of this function's callers. See
     [[project_brunnenbar_cloud_concierge]]."""
-    if not DAN_ALERT_WHATSAPP and not (GMAIL_REFRESH_TOKEN and DAN_ALERT_EMAIL):
+    if not DAN_ALERT_WHATSAPP:
         return False
-    wa_sent = send_whatsapp(DAN_ALERT_WHATSAPP, text) if DAN_ALERT_WHATSAPP else False
-    email_sent = _email_alert_fallback(subject, text)
-    if not wa_sent and DAN_ALERT_WHATSAPP:
-        logger.error("Dan alert WhatsApp send did not confirm, relying on email fallback (sent=%s)", email_sent)
-    if not email_sent and GMAIL_REFRESH_TOKEN and DAN_ALERT_EMAIL:
-        logger.error("Dan alert email send did not confirm, relying on WhatsApp (sent=%s)", wa_sent)
-    return wa_sent or email_sent
+    wa_sent = send_whatsapp(DAN_ALERT_WHATSAPP, text)
+    if not wa_sent:
+        logger.error("Dan alert WhatsApp send did not confirm, no other channel configured (subject=%s)", subject)
+    return wa_sent
 
 
 def alert_dan(category: str, channel: str, sender: str, guest_text: str, reason: str = ""):
@@ -3244,8 +3220,8 @@ def alert_dan(category: str, channel: str, sender: str, guest_text: str, reason:
     on every plain spam SKIP, see notify_dan_skip below, kept as a separate,
     differently worded function on purpose so an "I need you now" alert never
     reads the same as a "just so you know" one."""
-    if not DAN_ALERT_WHATSAPP and not (GMAIL_REFRESH_TOKEN and DAN_ALERT_EMAIL):
-        logger.warning("No Dan alert channel configured (DAN_ALERT_WHATSAPP or DAN_ALERT_EMAIL), cannot alert Dan")
+    if not DAN_ALERT_WHATSAPP:
+        logger.warning("No Dan alert channel configured (DAN_ALERT_WHATSAPP), cannot alert Dan")
         return
     snippet = (guest_text or "").strip().replace("\n", " ")
     if len(snippet) > 300:
@@ -3259,8 +3235,7 @@ def alert_dan(category: str, channel: str, sender: str, guest_text: str, reason:
         logger.info("Dan alerted (%s) for %s on %s", category, sender, channel)
     else:
         logger.error(
-            "Dan alert FAILED on every configured channel (%s) for %s on %s, "
-            "check DAN_ALERT_WHATSAPP and DAN_ALERT_EMAIL/GMAIL_REFRESH_TOKEN in Railway",
+            "Dan alert FAILED (%s) for %s on %s, check DAN_ALERT_WHATSAPP in Railway",
             category, sender, channel,
         )
 
@@ -3268,7 +3243,7 @@ def alert_dan(category: str, channel: str, sender: str, guest_text: str, reason:
 # Dan asked, after the leaked-reasoning incident above, whether the bot should
 # also tell him whenever it skips a message as spam, so he can catch a real
 # guest getting misclassified. Deliberately a SEPARATE, lower key notification
-# from alert_dan, same delivery (WhatsApp then email fallback) but worded as
+# from alert_dan, same delivery (WhatsApp, see _deliver_to_dan) but worded as
 # an FYI rather than "needs you", since a real spam/marketing message needs no
 # action from him at all, this is purely for his own spot checking. If spam
 # volume turns out to be high enough that this becomes noisy, the fix is to
@@ -3317,8 +3292,8 @@ def notify_dan_booked(channel: str, sender: str, summary: str):
     table or a private space, any size. Added 9 Sep 2026, Dan directly: "the
     bot should complete all reservations and only let me know when they are
     booked... reach out only if something is strange or need extra help."
-    Same delivery as any other Dan message (WhatsApp and email, unconditional,
-    see _deliver_to_dan), deliberately worded as information only so it never
+    Same delivery as any other Dan message (WhatsApp only, see
+    _deliver_to_dan), deliberately worded as information only so it never
     reads like alert_dan's "I need you now", same separation notify_dan_skip
     already keeps from alert_dan, for the same reason."""
     lines = ["Concierge FYI, booked automatically, no action needed", f"Channel: {channel}", f"From: {sender}", summary]
