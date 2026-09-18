@@ -92,20 +92,32 @@ REPLY_DELAY_MAX = int(os.environ.get("REPLY_DELAY_MAX", "110"))
 # guest), it pings this number immediately with why, so a handoff is never silent.
 # Never fires on plain spam SKIP, that would just be noise.
 DAN_ALERT_WHATSAPP = os.environ.get("DAN_ALERT_WHATSAPP", "4915125499245")
-# REMOVED 18 Sep 2026. Every Dan-facing notification (alert_dan, notify_dan_skip,
-# notify_dan_booked, and everything else routed through _deliver_to_dan) used to
-# also fire an email to DAN_ALERT_EMAIL, unconditionally alongside WhatsApp, ever
-# since the 5 Sep 2026 change below made email a redundant second channel rather
-# than a true fallback. Dan directly: "can we kill the Concierge emails? it sends
-# so much crap that is unnecessary. Lets move to the whatsapp notification if it
-# needs my attention." WhatsApp (DAN_ALERT_WHATSAPP) is now the only channel for
-# every concierge notification to Dan, see _deliver_to_dan. This reopens the exact
-# gap the 5 Sep change closed (Rina and Ben Rieger, 4 Sep 2026, WhatsApp reported
-# success to the Meta/Dualhook API but never actually reached Dan, most likely the
-# 24 hour customer service window on a free form message to a number that had not
-# messaged the bot first), a genuine risk being accepted on Dan's own explicit
-# call, not one this file is silently reintroducing. See
-# [[project_brunnenbar_cloud_concierge]].
+# CHANGED 18 Sep 2026, twice the same day. Every Dan-facing notification
+# (alert_dan, notify_dan_skip, notify_dan_booked, and everything else routed
+# through _deliver_to_dan) used to also fire an email to DAN_ALERT_EMAIL,
+# unconditionally alongside WhatsApp, ever since the 5 Sep 2026 change below
+# made email a redundant second channel rather than a true fallback. Dan
+# directly: "can we kill the Concierge emails? it sends so much crap that is
+# unnecessary. Lets move to the whatsapp notification if it needs my
+# attention." First cut was to remove email delivery entirely, WhatsApp only.
+# Flagged back to Dan in the same turn that this reopens the exact gap the 5
+# Sep change closed (Rina and Ben Rieger, 4 Sep 2026, WhatsApp reported
+# success to the Meta/Dualhook API but never actually reached Dan, most
+# likely the 24 hour customer service window on a free form message to a
+# number that had not messaged the bot first), with a daily digest offered as
+# a middle ground, one email a day instead of one per alert. Dan's reply:
+# "switch to a daily digest then." WhatsApp (DAN_ALERT_WHATSAPP) stays the
+# real time channel for every notification exactly as before, unchanged by
+# this. Email is back, but only as one batched summary a day of everything
+# that was queued, sent by run_dan_alert_digest/dan_alert_digest_loop further
+# down this file, near run_post_visit_checkins which it deliberately mirrors
+# the shape of (once past DAN_ALERT_DIGEST_HOUR Europe/Berlin, at most once
+# per calendar day, Upstash backed with an in memory fallback). See
+# [[project_brunnenbar_concierge_dan_alert_channel_2026-09]].
+DAN_ALERT_EMAIL = os.environ.get("DAN_ALERT_EMAIL", "")
+DAN_ALERT_DIGEST_ENABLED = os.environ.get("DAN_ALERT_DIGEST_ENABLED", "true").lower() == "true"
+DAN_ALERT_DIGEST_HOUR = int(os.environ.get("DAN_ALERT_DIGEST_HOUR", "8"))
+DAN_ALERT_DIGEST_CHECK_INTERVAL_SECONDS = int(os.environ.get("DAN_ALERT_DIGEST_CHECK_INTERVAL_SECONDS", str(30 * 60)))
 # How often the bot is allowed to alert Dan about the model itself failing to
 # draft a reply at all, for example the Anthropic API being down or the key
 # being invalid. Without a cooldown, an extended outage would page Dan on every
@@ -2475,6 +2487,13 @@ def debug():
         "TURN_HOURS": TURN_HOURS,
         "bookable_tables": len(TABLES),
         "DAN_ALERT_WHATSAPP": bool(DAN_ALERT_WHATSAPP),
+        "DAN_ALERT_EMAIL": bool(DAN_ALERT_EMAIL),
+        "DAN_ALERT_DIGEST_ENABLED": DAN_ALERT_DIGEST_ENABLED,
+        "DAN_ALERT_DIGEST_HOUR": DAN_ALERT_DIGEST_HOUR,
+        "dan_alert_digest_last_date": _dan_digest_last_date() or None,
+        "dan_alert_digest_pending": (
+            _upstash("LLEN", "dan_alert_digest_log") if _UPSTASH_ON else len(_dan_digest_local_log)
+        ),
         "SKIP_NOTIFY_DAN": SKIP_NOTIFY_DAN,
         "API_FAILURE_ALERT_COOLDOWN": API_FAILURE_ALERT_COOLDOWN,
         "HANDLED_MAX": HANDLED_MAX,
@@ -2640,6 +2659,12 @@ def _startup_subscribe():
         threading.Thread(target=post_visit_checkin_loop, daemon=True).start()
     else:
         logger.info("Startup: post visit check in loop off (disabled, or booking/calendar not configured)")
+    if DAN_ALERT_DIGEST_ENABLED and GMAIL_REFRESH_TOKEN and DAN_ALERT_EMAIL:
+        logger.info("Startup: starting dan alert digest loop every %s s, sends after %s:00 Europe/Berlin",
+                    DAN_ALERT_DIGEST_CHECK_INTERVAL_SECONDS, DAN_ALERT_DIGEST_HOUR)
+        threading.Thread(target=dan_alert_digest_loop, daemon=True).start()
+    else:
+        logger.info("Startup: dan alert digest loop off (disabled, or DAN_ALERT_EMAIL/GMAIL_REFRESH_TOKEN not configured)")
     logger.info("Startup: starting stale thread watchdog every %s s, SLA %s h",
                 STALE_THREAD_CHECK_INTERVAL_SECONDS, STALE_THREAD_SLA_HOURS)
     threading.Thread(target=stale_thread_watchdog_loop, daemon=True).start()
@@ -3189,26 +3214,102 @@ def send_whatsapp(to: str, text: str) -> bool:
         return False
 
 
+_dan_digest_local_log = []          # list of {"ts", "subject", "text"}, in memory fallback only
+_dan_digest_local_lock = threading.Lock()
+_dan_digest_local_last_date = None  # last calendar date (iso) the digest actually sent, in memory fallback only
+_DAN_DIGEST_MAX_ENTRIES = 500       # defensive cap only, a healthy digest drains to zero every day, this just
+                                     # guards against unbounded growth if email stays broken for a long stretch
+
+
+def _dan_digest_queue(subject: str, text: str):
+    """Append one Dan notification to today's digest queue. Best effort and
+    silent on any failure, this rides alongside the real time WhatsApp send
+    in _deliver_to_dan and must never be the reason a Dan alert fails or
+    slows down. Durable via Upstash if configured, otherwise this process's
+    memory only, same tradeoff as every other in memory fallback in this
+    file. No-op entirely if the digest is not configured or turned off, so
+    there is zero extra cost when DAN_ALERT_EMAIL is unset."""
+    if not (DAN_ALERT_DIGEST_ENABLED and GMAIL_REFRESH_TOKEN and DAN_ALERT_EMAIL):
+        return
+    entry = {"ts": time.time(), "subject": subject, "text": text}
+    try:
+        if _UPSTASH_ON:
+            key = "dan_alert_digest_log"
+            _upstash("RPUSH", key, json.dumps(entry))
+            _upstash("LTRIM", key, -_DAN_DIGEST_MAX_ENTRIES, -1)
+            return
+        with _dan_digest_local_lock:
+            _dan_digest_local_log.append(entry)
+            del _dan_digest_local_log[:-_DAN_DIGEST_MAX_ENTRIES]
+    except Exception as e:
+        logger.error("dan alert digest queue failed, the whatsapp alert itself still went out: %s", e)
+
+
+def _dan_digest_read_and_clear():
+    """Pull every queued entry and empty the queue in the same pass. See
+    run_dan_alert_digest for what happens if the email send itself then
+    fails, the entries are not simply lost."""
+    if _UPSTASH_ON:
+        raw = _upstash("LRANGE", "dan_alert_digest_log", 0, -1) or []
+        out = []
+        for item in raw:
+            try:
+                out.append(json.loads(item))
+            except Exception:
+                logger.warning("Skipping unparseable dan alert digest entry")
+        _upstash("DEL", "dan_alert_digest_log")
+        return out
+    with _dan_digest_local_lock:
+        out = list(_dan_digest_local_log)
+        _dan_digest_local_log.clear()
+    return out
+
+
+def _dan_digest_requeue(entries):
+    """Put entries back on the queue, used only when the digest email itself
+    failed to send, so a genuine outage never silently drops what was
+    queued, it just rolls into the next retry."""
+    if not entries:
+        return
+    if _UPSTASH_ON:
+        for e in entries:
+            _upstash("RPUSH", "dan_alert_digest_log", json.dumps(e))
+        return
+    with _dan_digest_local_lock:
+        _dan_digest_local_log[0:0] = entries
+
+
+def _dan_digest_last_date() -> str:
+    if _UPSTASH_ON:
+        return _upstash("GET", "dan_alert_digest_last_date") or ""
+    return _dan_digest_local_last_date or ""
+
+
+def _dan_digest_set_last_date(date_iso: str):
+    global _dan_digest_local_last_date
+    if _UPSTASH_ON:
+        _upstash("SET", "dan_alert_digest_last_date", date_iso)
+        return
+    _dan_digest_local_last_date = date_iso
+
+
 def _deliver_to_dan(text: str, subject: str) -> bool:
-    """Shared delivery for anything meant to reach Dan. WhatsApp only, since
-    18 Sep 2026, Dan directly: "can we kill the Concierge emails? it sends so
-    much crap that is unnecessary. Lets move to the whatsapp notification if
-    it needs my attention." Before this it fired WhatsApp AND email
-    unconditionally (5 Sep 2026 change, itself a response to WhatsApp
-    silently failing to reach him on two real incidents, Rina and Ben Rieger,
-    4 Sep 2026, even though the Meta/Dualhook API reported success). That
-    risk is real and this change reopens it on Dan's own explicit call, not
-    silently, see the comment above DAN_ALERT_WHATSAPP's old email
-    counterpart for the incident detail. `subject` is kept as a parameter for
-    now rather than removed, so a future email (or other channel) fallback
-    can be reintroduced here alone if WhatsApp ever proves unreliable again,
-    without touching any of this function's callers. See
-    [[project_brunnenbar_cloud_concierge]]."""
+    """Shared delivery for anything meant to reach Dan. WhatsApp is the real
+    time channel for every call, unchanged since the 18 Sep 2026 morning
+    change, see the long comment above DAN_ALERT_EMAIL for the full history
+    (5 Sep redundant email, 18 Sep morning killed email outright, 18 Sep
+    afternoon brought it back as a once a day digest on Dan's own request).
+    Also queues the same text for the next daily email digest, best effort,
+    see _dan_digest_queue, which never affects this function's return value
+    or blocks on Redis/Gmail. Returns whether WhatsApp itself confirmed,
+    callers log their own success/failure with their own category, exactly
+    as before. See [[project_brunnenbar_concierge_dan_alert_channel_2026-09]]."""
     if not DAN_ALERT_WHATSAPP:
         return False
     wa_sent = send_whatsapp(DAN_ALERT_WHATSAPP, text)
     if not wa_sent:
-        logger.error("Dan alert WhatsApp send did not confirm, no other channel configured (subject=%s)", subject)
+        logger.error("Dan alert WhatsApp send did not confirm (subject=%s)", subject)
+    _dan_digest_queue(subject, text)
     return wa_sent
 
 
@@ -3292,16 +3393,77 @@ def notify_dan_booked(channel: str, sender: str, summary: str):
     table or a private space, any size. Added 9 Sep 2026, Dan directly: "the
     bot should complete all reservations and only let me know when they are
     booked... reach out only if something is strange or need extra help."
-    Same delivery as any other Dan message (WhatsApp only, see
-    _deliver_to_dan), deliberately worded as information only so it never
-    reads like alert_dan's "I need you now", same separation notify_dan_skip
-    already keeps from alert_dan, for the same reason."""
+    Same delivery as any other Dan message (WhatsApp in real time plus the
+    daily email digest queue, see _deliver_to_dan), deliberately worded as
+    information only so it never reads like alert_dan's "I need you now",
+    same separation notify_dan_skip already keeps from alert_dan, for the
+    same reason."""
     lines = ["Concierge FYI, booked automatically, no action needed", f"Channel: {channel}", f"From: {sender}", summary]
     text = "\n".join(lines)
     if _deliver_to_dan(text, "BrunnenBar concierge, booking confirmed FYI"):
         logger.info("Dan notified (booking FYI) for %s on %s", sender, channel)
     else:
         logger.warning("Could not reach Dan with booking FYI for %s on %s (not urgent, not retried)", sender, channel)
+
+
+def run_dan_alert_digest():
+    """Runs periodically, see dan_alert_digest_loop below. Once per real
+    calendar day, after DAN_ALERT_DIGEST_HOUR Europe/Berlin, emails Dan one
+    summary of every notification _deliver_to_dan queued since the last
+    digest, then empties the queue. Added 18 Sep 2026, Dan directly: "switch
+    to a daily digest then," after email-per-alert was killed the same
+    morning for being too much volume, see the long comment above
+    DAN_ALERT_EMAIL. On a quiet day with nothing queued this still marks
+    today as done but sends no email, matching what Dan actually asked for,
+    at most one email a day, never padding out an empty digest to look
+    useful. On a genuine send failure the queued entries are put back and
+    today is deliberately NOT marked done, so the next loop tick inside the
+    same day retries rather than silently losing a day's worth of alerts
+    until tomorrow."""
+    if not (DAN_ALERT_DIGEST_ENABLED and GMAIL_REFRESH_TOKEN and DAN_ALERT_EMAIL):
+        return
+    now_berlin = datetime.now(BAR_TZ)
+    if now_berlin.hour < DAN_ALERT_DIGEST_HOUR:
+        return
+    today = now_berlin.date().isoformat()
+    if _dan_digest_last_date() == today:
+        return  # already sent, or confirmed empty, for today
+    entries = _dan_digest_read_and_clear()
+    if not entries:
+        _dan_digest_set_last_date(today)
+        return
+    entries.sort(key=lambda e: e.get("ts", 0))
+    lines = [f"BrunnenBar concierge daily digest, {len(entries)} notification(s) since the last one.", ""]
+    for e in entries:
+        ts = datetime.fromtimestamp(e.get("ts", time.time()), BAR_TZ).strftime("%d.%m %H:%M")
+        lines.append(f"--- {ts} ---")
+        lines.append((e.get("text") or "").strip())
+        lines.append("")
+    body = "\n".join(lines).strip()
+    try:
+        import base64
+        from email.mime.text import MIMEText
+        svc = _gmail_service()
+        mime = MIMEText(body, "plain", "utf-8")
+        mime["To"] = DAN_ALERT_EMAIL
+        mime["From"] = BAR_EMAIL
+        mime["Subject"] = f"BrunnenBar concierge daily digest, {len(entries)} item(s)"
+        raw = base64.urlsafe_b64encode(mime.as_bytes()).decode()
+        svc.users().messages().send(userId="me", body={"raw": raw}).execute()
+        logger.info("Dan alert digest sent, %d entries", len(entries))
+        _dan_digest_set_last_date(today)
+    except Exception as e:
+        logger.error("Dan alert digest send failed, requeueing %d entries for retry: %s", len(entries), e)
+        _dan_digest_requeue(entries)
+
+
+def dan_alert_digest_loop():
+    while True:
+        try:
+            run_dan_alert_digest()
+        except Exception as e:
+            logger.error("dan_alert_digest_loop error: %s", e)
+        time.sleep(DAN_ALERT_DIGEST_CHECK_INTERVAL_SECONDS)
 
 
 # SECOND LAYER of defense, not the primary one anymore. The primary fix, as of
