@@ -1180,13 +1180,18 @@ PRIVATE_SPACES = {
 # that make up the hinterer Bereich lounge itself, not separate front tables
 # that merely share the room. Booking one of these normally while the whole
 # space is reserved for someone else seats a stranger inside another guest's
-# private party. Stam is explicitly NOT here, Dan confirmed it sits in a
-# different part of the bar entirely, see reference_brunnenbar_table_layout.
-# ST3 and Rnd2 are also left out for now, no confirmed evidence either way
-# that they sit physically inside the back lounge rather than the front,
-# flagged back to Dan to confirm rather than guessed, same principle as
-# TABLE_COMBOS above, a wrong physical assumption here seats a real guest on
-# top of a real private party.
+# private party. CONFIRMED 18 Sep 2026, same day, Dan sent the actual floor
+# plan screenshots for all three areas. Back room: HT1, HT2, HT3, Sofa, Auto,
+# Bar7, Bar8, Bar9. Up front, not the back room: ST1, ST2, Rnd2, Stam, ST3,
+# Bar1 through Bar6. Outside (301-313) matches TABLES exactly as already
+# coded, no change there. This resolves the open question this comment used
+# to carry about ST3 and Rnd2, both confirmed up front, correctly excluded
+# below. Auto and Bar7/8/9 are also physically in the back room but are not
+# in the bookable TABLES pool at all (Bar7/8/9 only ever appear bundled into
+# the one HT1+Sofa+Bar7+Bar8+Bar9 combo, Auto is not in the booking code
+# anywhere), so neither needs a separate guard here, there is no path that
+# could hand either to a conflicting reservation in the first place. See
+# reference_brunnenbar_table_layout for the full confirmed floor plan.
 HINTERER_BEREICH_TABLES = {"HT1", "HT2", "HT3", "Sofa"}
 
 
