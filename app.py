@@ -23,7 +23,7 @@ import random
 import re
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -86,6 +86,14 @@ DUALHOOK_BASE_URL = os.environ.get("DUALHOOK_BASE_URL", "https://api.dualhook.co
 # not look like an instant bot. Tune with the two env vars, seconds.
 REPLY_DELAY_MIN = int(os.environ.get("REPLY_DELAY_MIN", "35"))
 REPLY_DELAY_MAX = int(os.environ.get("REPLY_DELAY_MAX", "110"))
+# ADDED 19 Sep 2026, Dan directly, after a real guest (Isabella Koenig) got
+# the bot's opening reply to a brand new inquiry before Dan had any real
+# chance to step in personally, "so that i have time to answer if needed."
+# Only the very FIRST message the bot would ever send a given sender uses
+# this much longer window, every later reply in the same thread still uses
+# the normal REPLY_DELAY above. See handle_later.
+FIRST_MESSAGE_DELAY_MIN = int(os.environ.get("FIRST_MESSAGE_DELAY_MIN", "600"))
+FIRST_MESSAGE_DELAY_MAX = int(os.environ.get("FIRST_MESSAGE_DELAY_MAX", "720"))
 
 # Dan's own phone, digits only, no plus, WhatsApp format. Wherever the concierge
 # cannot safely answer a real guest itself (a price/policy handoff or an unhappy
@@ -665,6 +673,105 @@ def bar_time_context():
     )
 
 
+_DE_MONTHS = {
+    "januar": 1, "februar": 2, "maerz": 3, "märz": 3, "april": 4, "mai": 5, "juni": 6,
+    "juli": 7, "august": 8, "september": 9, "oktober": 10, "november": 11, "dezember": 12,
+}
+
+
+def _extract_de_date(text: str, now: datetime):
+    """Best effort pull of one concrete date a guest wrote in free text,
+    DD.MM.YYYY, DD.MM., or DD. Monatsname, resolved against `now` so a date
+    without a year picks this year or next, never a date already in the
+    past. Returns YYYY-MM-DD or None. Not real NLP, only the handful of
+    formats guests actually type in this thread's real messages, same
+    philosophy as next7 in bar_time_context above, a computed fact beats
+    asking the model to parse dates itself. Added 19 Sep 2026, see
+    event_date_context below."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    m = re.search(r"\b(\d{1,2})\.(\d{1,2})\.(\d{4})\b", t)
+    if m:
+        try:
+            return date(int(m.group(3)), int(m.group(2)), int(m.group(1))).isoformat()
+        except ValueError:
+            return None
+    m = re.search(r"\b(\d{1,2})\.\s*(\d{1,2})\.(?!\d)", t)
+    if not m:
+        m = re.search(r"\b(\d{1,2})\.?\s*(" + "|".join(_DE_MONTHS.keys()) + r")\b", t, re.IGNORECASE)
+        if not m:
+            return None
+        day, month = int(m.group(1)), _DE_MONTHS[m.group(2).lower()]
+    else:
+        day, month = int(m.group(1)), int(m.group(2))
+    try:
+        candidate = date(now.year, month, day)
+    except ValueError:
+        return None
+    if candidate < now.date():
+        try:
+            candidate = date(now.year + 1, month, day)
+        except ValueError:
+            return None
+    return candidate.isoformat()
+
+
+def event_date_context(sender: str, text: str) -> str:
+    """Ground truth for one date the guest just mentioned, injected into the
+    system prompt exactly like bar_time_context and next7 above, so the
+    model is never trusted to just decide a date is frei on its own instinct.
+
+    ADDED 19 Sep 2026 after a real guest (Isabella Koenig) was told
+    26.12.2026 was still frei in the very FIRST reply, before headcount was
+    even known and before any check of any kind had run, a genuine other
+    open inquiry for that same date (Nadine Burges) and a calendar entry
+    marking the whole holiday stretch closed both sat on the calendar the
+    entire conversation, unnoticed, because the only real availability
+    check in this codebase, upsert_pending_hold's collision check, only
+    ever ran once headcount was known, one reply too late to have caught
+    anything, and even then only alerted Dan in the background, it never
+    changed what the guest was actually told in that same turn. This closes
+    both gaps at once: it runs the moment a date can be parsed at all, and
+    its result becomes a direct instruction the model must follow, not
+    background information it can talk past. Best effort by design, returns
+    empty string on no date found, booking not configured, or any failure,
+    this must never block a reply from going out. See _event_date_status
+    and [[project_brunnenbar_cloud_concierge]]."""
+    if not (BOOKING_ENABLED and GOOGLE_REFRESH_TOKEN and RESERVIERUNGEN_CALENDAR_ID):
+        return ""
+    now = datetime.now(BAR_TZ)
+    date_iso = _extract_de_date(text, now)
+    if not date_iso:
+        return ""
+    try:
+        svc = _calendar_service()
+        status = _event_date_status(svc, date_iso, sender)
+    except Exception as e:
+        logger.warning("event_date_context failed for %s on %s: %s", sender, date_iso, e)
+        return ""
+    if status["closed"]:
+        return (
+            f"EVENT DATUM CHECK fuer {date_iso}, verlass dich NUR hierauf, nicht auf eigene Vermutung "
+            f"oder auf das Beispiel weiter unten im Prompt. Dieser Tag ist im Kalender als GESCHLOSSEN "
+            f"markiert (\"{status['closed_summary']}\"). Sag dem Gast NIEMALS dass dieser Termin frei "
+            f"oder verfuegbar ist, auch nicht vorlaeufig. Sag stattdessen freundlich, dass du das "
+            f"gerade intern klaerst und dich gleich nochmal meldest, und rufe send_reply mit action "
+            f"handoff auf, reason klar benennen dass dieser Tag als geschlossen markiert ist."
+        )
+    if status["collision"]:
+        other = (status["collision"].get("summary") or "").strip()
+        return (
+            f"EVENT DATUM CHECK fuer {date_iso}, verlass dich NUR hierauf, nicht auf eigene Vermutung "
+            f"oder auf das Beispiel weiter unten im Prompt. Fuer diesen Tag liegt bereits eine ANDERE "
+            f"offene Anfrage auf dem Kalender: \"{other}\". Sag dem Gast NIEMALS dass dieser Termin "
+            f"sicher frei ist und lege KEINEN event_hold fuer diesen Tag an. Sag stattdessen freundlich, "
+            f"dass du kurz intern pruefen musst ob es klappt, und rufe send_reply mit action handoff "
+            f"auf, reason klar benennen dass es bereits eine andere Anfrage fuer denselben Tag gibt."
+        )
+    return f"EVENT DATUM CHECK fuer {date_iso}: nichts Widersprechendes im Kalender vermerkt, so weit unauffaellig."
+
+
 _DE_WORDS = set(
     "ich und wir für fuer möchte moechte tisch reservieren reservierung morgen heute "
     "personen leute danke bitte hallo hey servus seid ihr gerne uhr wäre waere hätte "
@@ -962,10 +1069,29 @@ def _pending_hold_all_senders():
     return list(_pending_hold_local_all)
 
 
-def _find_other_tentative_hold(svc, date_iso: str, exclude_sender: str):
-    """Any OTHER sender's tentative placeholder already on this date, so a
-    second inquiry for the same date can trigger a Dan alert instead of
-    silently sitting alongside it unnoticed. Returns the event dict or None."""
+def _event_date_status(svc, date_iso: str, exclude_sender: str = ""):
+    """Real status of one day on RESERVIERUNGEN_CALENDAR_ID for a GROUPS AND
+    EVENTS inquiry: an explicit closure (holiday, Betriebsferien) or a
+    colliding tentative hold from a DIFFERENT guest. Returns
+    {"closed": bool, "closed_summary": str, "collision": event or None}.
+
+    REWRITTEN 19 Sep 2026, root caused after a real guest (Isabella Koenig,
+    26.12.2026) was told that date was frei while a genuine other open
+    inquiry (Nadine Burges, same date, same hinterer Bereich) already sat on
+    the calendar completely unnoticed, and separately while the whole
+    holiday stretch was marked closed. The old function, kept here as
+    _find_other_tentative_hold in spirit, had two real bugs that explain
+    exactly why it never fired: it only matched the literal phrase "noch
+    nicht bestaetigt", but Nadine's hold reads "ANFRAGE, nicht bestaetigt"
+    without the word noch, so the string check silently never matched it;
+    and its phone regex, WhatsApp\\s+(\\d+), could not extract a number
+    written with a plus or internal spaces like "WhatsApp +49 174 9306709",
+    only the bare digit strings the bot itself writes. Both fixed below.
+    This also never checked for a plain closure event at all, there was no
+    such concept anywhere in the code, that is new here. See
+    [[project_brunnenbar_cloud_concierge]]."""
+    exclude_norm = _norm_phone(exclude_sender)
+    out = {"closed": False, "closed_summary": "", "collision": None}
     try:
         lo = datetime.fromisoformat(date_iso).replace(tzinfo=BAR_TZ, hour=0, minute=0, second=0, microsecond=0)
         hi = lo + timedelta(days=1)
@@ -975,16 +1101,20 @@ def _find_other_tentative_hold(svc, date_iso: str, exclude_sender: str):
             singleEvents=True,
         ).execute().get("items", [])
         for ev in items:
-            desc = ev.get("description", "") or ""
-            if "noch nicht bestaetigt" not in desc.lower():
+            blob = ((ev.get("summary") or "") + " " + (ev.get("description") or "")).lower()
+            if "closed" in blob or "geschlossen" in blob or "betriebsferien" in blob:
+                out["closed"] = True
+                out["closed_summary"] = (ev.get("summary") or "").strip()
                 continue
-            m = re.search(r"WhatsApp\s+(\d+)", desc)
-            if m and m.group(1) != exclude_sender:
-                return ev
-        return None
+            if "nicht bestaetigt" not in blob and "nicht bestätigt" not in blob:
+                continue
+            phones = [_norm_phone(p) for p in re.findall(r"\+?\d[\d\s]{6,}\d", ev.get("description") or "")]
+            if any(p and p != exclude_norm for p in phones) and not out["collision"]:
+                out["collision"] = ev
+        return out
     except Exception as e:
-        logger.warning("Collision check failed for %s: %s", date_iso, e)
-        return None
+        logger.warning("Event date status check failed for %s: %s", date_iso, e)
+        return out
 
 
 def upsert_pending_hold(sender: str, name: str, party: int, date_iso: str, occasion: str = "", time_str: str = ""):
@@ -1060,8 +1190,16 @@ def upsert_pending_hold(sender: str, name: str, party: int, date_iso: str, occas
             except Exception as e:
                 logger.warning("Pending hold update failed for %s (id %s), creating a new one instead: %s",
                                 sender, existing.get("event_id"), e)
-        collision = _find_other_tentative_hold(svc, date_iso, sender)
-        if collision:
+        status = _event_date_status(svc, date_iso, sender)
+        if status["closed"]:
+            alert_dan(
+                "event inquiry for a date marked closed on the calendar",
+                "whatsapp", sender,
+                f"New inquiry from {sender} for {date_iso}, but the calendar has this date marked "
+                f"closed: \"{status['closed_summary']}\". Worth a look before this goes any further.",
+            )
+        elif status["collision"]:
+            collision = status["collision"]
             alert_dan(
                 "two event inquiries for the same date, decide who gets it",
                 "whatsapp", sender,
@@ -2011,6 +2149,8 @@ Before asking anything in Step one or Step two, actually scan the full conversat
 
 Step one, the basics. Get the occasion, the date, roughly what time, how many people, and the name of whoever is organising it. A WhatsApp or Instagram display name is not reliable enough to hand to Dan on its own, always ask for it directly, warmly, folded in naturally rather than as an interrogation, for example wie darf ich dich denn nennen or unter welchem namen darf ich das notieren. Do not consider Step one finished, and do not move on to explaining the space in Step three, until you actually have a name, not just a guess from the chat profile.
 
+EVENT DATUM CHECK. ADDED 19 Sep 2026, root caused after a real guest (Isabella Koenig) was told a date was noch frei in the very first reply, before headcount was even known, while a genuine other open inquiry for that exact date and a calendar entry marking the whole holiday stretch closed both sat on the calendar the entire conversation, unnoticed, because nothing had checked yet, the collision check used to only run once headcount was known, one reply too late. Whenever the system prompt for this turn includes a line starting EVENT DATUM CHECK fuer, that line is a real, freshly computed lookup against the actual calendar for a date you or the guest mentioned, follow it exactly, never reason about availability yourself and never fall back on the ist noch frei phrasing in the example lines further down this prompt when that line says otherwise. If it says the day is closed or that another open inquiry already exists, do not tell the guest the date is frei, available, or anything reassuring about availability at all, explain warmly that you need to check internally first and call send_reply with action handoff, reason stating exactly what the EVENT DATUM CHECK line told you. If it says nothing contradicting, or no such line appears at all because no date could be resolved yet, continue normally, this is not a reason to withhold a reply, only a reason to actually know before you speak.
+
 TENTATIVE HOLD. The moment you have both a real date and a rough headcount for a GROUPS AND EVENTS inquiry, even if a name or occasion is still missing, call send_reply action reply as normal but also fill in event_hold with the date, party, name (use Gast if you truly do not have one yet), and occasion if known. This actually places a clearly marked, not yet confirmed placeholder on the calendar, so if you tell a guest a date is frei or reserved for them that is now true, never say a date is blocked or held without also calling event_hold in that same turn, an unbacked promise like that is exactly the kind of mistake that got caught before, Dan found a guest who was told a date was blocked when nothing was ever actually on the calendar. Call event_hold again any later turn the headcount, date, or occasion changes, it always updates the same placeholder rather than creating a second one, you never need to worry about duplicates. CHANGED 10 Sep 2026, also fill in the optional time field on event_hold the moment a start time becomes known, even if it was not known yet when the hold was first created, call event_hold again just to add it, a real guest (Michael, 30th birthday, ganze Bar) had his hold sit as an all day placeholder the entire conversation even after he gave a clear start time, because nothing ever carried it over, do not repeat that. This is never a real booking and never replaces the eventual book_table call once you actually have everything you need, this only makes an open inquiry visible in the meantime so two guests never both think the same date is theirs while you are still gathering details across several messages. REMOVED 17 Sep 2026, this section used to also require a sentence in your first hold reply telling the guest you would check back in a couple days if you had not heard from them. Dan reviewed a real example and called that sentence confusing and unnecessary, especially awkward when the guest is right there actively chatting, not gone quiet. Never say that sentence anymore, the actual automatic chase nudge after PENDING_HOLD_CHASE_AFTER_HOURS still runs in the background regardless, it never needed to be announced up front to work.
 
 Step two, ask if they have been to BrunnenBar before, warmly. This is about warmth and tone for Step three, not a reason to skip it, having stopped by for drinks before does not mean a guest knows how the private event setup works, always explain the two areas in Step three regardless of their answer here. It also matters later, see COME BY AND SEE THE SPACE below for exactly when a first timer reserving a private space actually gets offered a viewing, it is not automatic just because they have not been before.
@@ -2546,6 +2686,10 @@ def debug():
         "CONV_MAX_TURNS": CONV_MAX_TURNS,
         "SKIP_SENDERS_count": len(SKIP_SENDERS),
         "HUMAN_ACTIVE_PAUSE_HOURS": HUMAN_ACTIVE_PAUSE_HOURS,
+        "REPLY_DELAY_MIN": REPLY_DELAY_MIN,
+        "REPLY_DELAY_MAX": REPLY_DELAY_MAX,
+        "FIRST_MESSAGE_DELAY_MIN": FIRST_MESSAGE_DELAY_MIN,
+        "FIRST_MESSAGE_DELAY_MAX": FIRST_MESSAGE_DELAY_MAX,
         "PENDING_HOLD_CHASE_AFTER_HOURS": PENDING_HOLD_CHASE_AFTER_HOURS,
         "PENDING_HOLD_ESCALATE_AFTER_HOURS": PENDING_HOLD_ESCALATE_AFTER_HOURS,
         "pending_holds_open": len(_pending_hold_all_senders()),
@@ -2769,6 +2913,7 @@ async def whatsapp_receive(request: Request):
                 text = (msg.get("text") or {}).get("body", "")
                 logger.info("WhatsApp in from %s: %s", sender, text[:120])
                 conv_append(sender, "user", text)
+                first_message = len(conv_history(sender)) <= 1
                 if sender in SKIP_SENDERS:
                     logger.info("WhatsApp sender %s is on SKIP_SENDERS, logged only, no auto reply, Dan replies personally", sender)
                     continue
@@ -2776,7 +2921,7 @@ async def whatsapp_receive(request: Request):
                     logger.info("WhatsApp sender %s has Dan actively replying by hand, logged only, no auto reply", sender)
                     continue
                 _last_msg[sender] = mid
-                threading.Thread(target=handle_later, args=("whatsapp", sender, text, mid), daemon=True).start()
+                threading.Thread(target=handle_later, args=("whatsapp", sender, text, mid, first_message), daemon=True).start()
             # Coexistence echo, a reply Dan or a teammate typed by hand straight in the
             # WhatsApp Business phone app. Meta mirrors these to us as smb_message_echoes
             # so the bot's memory of a thread is not just its own replies, if someone
@@ -2835,11 +2980,12 @@ async def instagram_receive(request: Request):
             sender = event.get("sender", {}).get("id")
             logger.info("Instagram in from %s: %s", sender, text[:120])
             conv_append(sender, "user", text)
+            first_message = len(conv_history(sender)) <= 1
             if is_human_active(sender):
                 logger.info("Instagram sender %s has Dan actively replying by hand, logged only, no auto reply", sender)
                 continue
             _last_msg[sender] = mid
-            threading.Thread(target=handle_later, args=("instagram", sender, text, mid), daemon=True).start()
+            threading.Thread(target=handle_later, args=("instagram", sender, text, mid, first_message), daemon=True).start()
     return {"received": True}
 
 
@@ -2888,22 +3034,36 @@ async def messenger_receive(request: Request):
             sender = event.get("sender", {}).get("id")
             logger.info("Messenger in from %s: %s", sender, text[:120])
             conv_append(sender, "user", text)
+            first_message = len(conv_history(sender)) <= 1
             if is_human_active(sender):
                 logger.info("Messenger sender %s has Dan actively replying by hand, logged only, no auto reply", sender)
                 continue
             _last_msg[sender] = mid
-            threading.Thread(target=handle_later, args=("messenger", sender, text, mid), daemon=True).start()
+            threading.Thread(target=handle_later, args=("messenger", sender, text, mid, first_message), daemon=True).start()
     return {"received": True}
 
 
-def handle_later(channel: str, sender: str, text: str, mid: str = None):
+def handle_later(channel: str, sender: str, text: str, mid: str = None, first_message: bool = False):
     """Wait a random human feeling pause, then draft and send. Runs in its own
     thread so the webhook can return 200 to Meta straight away. If a newer
     message from the same sender arrived meanwhile, this older one steps aside
-    so the newest turn answers with the full context."""
-    lo, hi = sorted((REPLY_DELAY_MIN, REPLY_DELAY_MAX))
+    so the newest turn answers with the full context.
+
+    CHANGED 19 Sep 2026, Dan directly, after a real guest (Isabella Koenig)
+    got the bot's very first reply to a brand new inquiry before he had any
+    real chance to step in personally, "so that i have time to answer if
+    needed." The very first message the bot would ever send a given sender
+    now waits FIRST_MESSAGE_DELAY_MIN to FIRST_MESSAGE_DELAY_MAX seconds (10+
+    minutes by default) instead of the normal short REPLY_DELAY window. Every
+    later reply in the same thread still uses the normal window, this is only
+    about giving Dan a real window to jump in on something brand new."""
+    if first_message:
+        lo, hi = sorted((FIRST_MESSAGE_DELAY_MIN, FIRST_MESSAGE_DELAY_MAX))
+    else:
+        lo, hi = sorted((REPLY_DELAY_MIN, REPLY_DELAY_MAX))
     delay = random.uniform(lo, hi)
-    logger.info("%s reply to %s scheduled in %.0f s", channel, sender, delay)
+    logger.info("%s reply to %s scheduled in %.0f s%s", channel, sender, delay,
+                " (first message)" if first_message else "")
     time.sleep(delay)
     if mid is not None and _last_msg.get(sender) != mid:
         logger.info("newer message from %s arrived, skipping older scheduled reply", sender)
@@ -3051,6 +3211,9 @@ def claude_decide(sender: str, text: str):
     if LEARNINGS_TEXT:
         system += "\n\n" + LEARNINGS_TEXT
     system += "\n\n" + bar_time_context()
+    edc = event_date_context(sender, text)
+    if edc:
+        system += "\n\n" + edc
     if lang == "en":
         system += (
             "\n\nLANGUAGE OVERRIDE for this reply. The guest is writing in ENGLISH. "
