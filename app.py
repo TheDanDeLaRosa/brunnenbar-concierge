@@ -90,6 +90,7 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 # via env var so a future bump is a Railway variable change, not a code
 # change and redeploy.
 CONCIERGE_MODEL = os.environ.get("CONCIERGE_MODEL", "claude-sonnet-5-5")
+CONCIERGE_FALLBACK_MODEL = os.environ.get("CONCIERGE_FALLBACK_MODEL", "claude-sonnet-4-5")
 GRAPH_VERSION = os.environ.get("GRAPH_VERSION", "v20.0")
 AUTO_ACK = os.environ.get("AUTO_ACK", "true").lower() == "true"
 
@@ -3890,23 +3891,44 @@ def claude_decide(sender: str, text: str):
     elif lang == "de":
         system += "\n\nLANGUAGE OVERRIDE for this reply. The guest is writing in German, so reply fully in German."
     try:
-        r = httpx.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": CONCIERGE_MODEL,
-                "max_tokens": 500,
-                "system": system,
-                "tools": [BOOK_TOOL, SEND_REPLY_TOOL],
-                "tool_choice": {"type": "any"},
-                "messages": messages,
-            },
-            timeout=30,
-        )
+        # MODEL LADDER, added 01 Oct 2026. Every call returned HTTP 400 from about 15:17 after the model bump and
+        # the new deposit_terms tool field, so no guest got a reply for hours. A 400 now falls back to the previous
+        # known good model, and then to the tool schema without deposit_terms, and the response body is logged.
+        import copy
+        _tools_full = [BOOK_TOOL, SEND_REPLY_TOOL]
+        _send_slim = copy.deepcopy(SEND_REPLY_TOOL)
+        _send_slim.get("input_schema", {}).get("properties", {}).pop("deposit_terms", None)
+        _ladder = [(CONCIERGE_MODEL, _tools_full), (CONCIERGE_FALLBACK_MODEL, _tools_full),
+                   (CONCIERGE_FALLBACK_MODEL, [BOOK_TOOL, _send_slim])]
+        r = None
+        _seen = set()
+        for _model, _tools in _ladder:
+            _key = (_model, len(_tools[1].get("input_schema", {}).get("properties", {})))
+            if _key in _seen:
+                continue
+            _seen.add(_key)
+            r = httpx.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": _model,
+                    "max_tokens": 500,
+                    "system": system,
+                    "tools": _tools,
+                    "tool_choice": {"type": "any"},
+                    "messages": messages,
+                },
+                timeout=30,
+            )
+            if r.status_code == 400:
+                logger.error("Anthropic 400 for model %s with %d send_reply fields, body: %s, trying next fallback",
+                             _model, len(_tools[1].get("input_schema", {}).get("properties", {})), r.text[:600])
+                continue
+            break
         r.raise_for_status()
         parts = r.json().get("content", [])
         for p in parts:
