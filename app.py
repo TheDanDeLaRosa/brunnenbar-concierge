@@ -1487,6 +1487,7 @@ def pending_hold_followup_loop():
     while True:
         try:
             run_pending_hold_followups()
+            run_deposit_followups()
         except Exception as e:
             logger.error("pending_hold_followup_loop error: %s", e)
         time.sleep(PENDING_HOLD_CHECK_INTERVAL_SECONDS)
@@ -1892,7 +1893,7 @@ def notify_dan_viewing_times_needed(channel: str, sender: str, name: str, occasi
     )
 
 
-def create_private_space_reservation(name, contact, party, space, start_dt, occasion, lang="de", note=""):
+def create_private_space_reservation(name, contact, party, space, start_dt, occasion, lang="de", note="", pending=False):
     """Same idea as create_reservation, for hinterer_bereich or ganze_bar
     instead of a numbered table. Added 9 Sep 2026 alongside the rest of the
     private space automation, see the block comment above find_free_table."""
@@ -1902,8 +1903,11 @@ def create_private_space_reservation(name, contact, party, space, start_dt, occa
     info = PRIVATE_SPACES[space]
     label = info["label"]
     summary = f"{name} - {party} Personen - {anlass} - {label}"
+    if pending:
+        summary = "VORGEMERKT " + summary
     desc = (
-        f"Name: {name}\n"
+        (f"VORGEMERKT, Anzahlung {DEPOSITS.get(space, 0)} Euro offen. Zahlung bestaetigt? Dann VORGEMERKT aus dem Titel loeschen.\n" if pending else "")
+        + f"Name: {name}\n"
         f"Telefon/Contact: WhatsApp {contact}\n"
         f"Anzahl Personen: {party}\n"
         f"Besonderer Anlass: {anlass}\n"
@@ -2033,6 +2037,220 @@ def post_visit_checkin_loop():
         time.sleep(POST_VISIT_CHECKIN_CHECK_INTERVAL_SECONDS)
 
 
+# DEPOSIT FLOW, added 01 Oct 2026, Dan: new bookings only, no Stripe, bank transfer.
+# Everything here stays OFF until Dan sets DEPOSIT_FLOW_ENABLED=true plus the
+# BANK_* variables and the AGB page is live (credentials, money and legal are Daniel only).
+# Sequence per Legal Seat Fassung 2: the guest agrees to the Bedingungen IN THE CHAT
+# first (§ 305 Abs. 2 BGB), only then does the confirmation email with the bank
+# details go out. The tip is a separate voluntary question in the chat, the email
+# only mentions it as information. The bot never confirms payment, Dan does that by
+# removing VORGEMERKT from the calendar title.
+DEPOSIT_FLOW_ENABLED = os.environ.get("DEPOSIT_FLOW_ENABLED", "false").lower() == "true"
+BANK_HOLDER = os.environ.get("BANK_HOLDER", "")
+BANK_IBAN = os.environ.get("BANK_IBAN", "")
+BANK_BIC = os.environ.get("BANK_BIC", "")
+BANK_NAME = os.environ.get("BANK_NAME", "")
+AGB_URL = os.environ.get("AGB_URL", "brunnenbar.com/reservierungsbedingungen")
+DEPOSITS = {"hinterer_bereich": 150, "ganze_bar": 350}
+_deposit_local = {}
+
+
+def _deposit_active() -> bool:
+    return bool(DEPOSIT_FLOW_ENABLED and BANK_HOLDER and BANK_IBAN)
+
+
+def _deposit_get(sender: str):
+    if _UPSTASH_ON:
+        raw = _upstash("GET", "deposit:" + sender)
+        try:
+            return json.loads(raw) if raw else None
+        except Exception:
+            return None
+    return _deposit_local.get(sender)
+
+
+def _deposit_set(sender: str, rec: dict):
+    if _UPSTASH_ON:
+        _upstash("SET", "deposit:" + sender, json.dumps(rec))
+        _upstash("SADD", "deposit_senders", sender)
+        return
+    _deposit_local[sender] = rec
+
+
+def _deposit_clear(sender: str):
+    if _UPSTASH_ON:
+        _upstash("DEL", "deposit:" + sender)
+        _upstash("SREM", "deposit_senders", sender)
+        return
+    _deposit_local.pop(sender, None)
+
+
+def _deposit_all_senders():
+    if _UPSTASH_ON:
+        return _upstash("SMEMBERS", "deposit_senders") or []
+    return list(_deposit_local.keys())
+
+
+_DAYS_DE = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
+
+
+def _deposit_consent_message(space: str, start_dt, sie: bool, lang: str) -> str:
+    mu = PRIVATE_SPACES[space]["mindestumsatz"]
+    dep = DEPOSITS[space]
+    hm = start_dt.strftime("%H") if not start_dt.minute else start_dt.strftime("%H:%M")
+    wd = _DAYS_DE[start_dt.weekday()]
+    where = "der hintere Bereich" if space == "hinterer_bereich" else "die ganze Bar exklusiv"
+    if lang == "en":
+        where_en = "the back lounge" if space == "hinterer_bereich" else "the whole bar exclusively"
+        return (f"We have pencilled in {where_en} for you on {wd} at {hm}. The Mindestumsatz is {mu} Euro and runs through your drinks "
+                f"like a normal tab. On top there is a deposit of {dep} Euro by bank transfer which is fully credited to your bill on the night. "
+                f"Cancellation is free up to 14 days before and you get the deposit back in full. Our terms are at {AGB_URL}. "
+                f"If that works for you, reply with a yes and your email address and we will send you everything in one email including our bank details")
+    du = not sie
+    return (f"Damit wir {'dich' if du else 'Sie'} fest vormerken können noch kurz das Wichtigste. {where[0].upper() + where[1:]} ist {'für euch' if du else 'für Sie'} "
+            f"{wd} um {hm} Uhr vorgemerkt. Der Mindestumsatz liegt bei {mu} Euro und läuft ganz normal über {'eure' if du else 'Ihre'} Getränke. "
+            f"Dazu kommt eine Anzahlung von {dep} Euro per Überweisung, die am Abend voll auf {'eure' if du else 'Ihre'} Rechnung angerechnet wird. "
+            f"Bis 14 Tage vorher ist die Stornierung kostenlos und {'du bekommst' if du else 'Sie bekommen'} die Anzahlung komplett zurück. "
+            f"Es gelten unsere Reservierungsbedingungen unter {AGB_URL}. "
+            f"Wenn das {'für dich' if du else 'für Sie'} passt, {'schreib uns' if du else 'schreiben Sie uns'} kurz ja und {'deine' if du else 'Ihre'} Mail Adresse, "
+            f"dann schicken wir {'dir' if du else 'Ihnen'} alles gesammelt per Mail, inklusive Bankverbindung")
+
+
+def _deposit_email_body(rec: dict) -> str:
+    start = datetime.fromisoformat(rec["start_iso"])
+    space = rec["space"]
+    label = PRIVATE_SPACES[space]["label"]
+    mu = PRIVATE_SPACES[space]["mindestumsatz"]
+    dep = DEPOSITS[space]
+    du = not rec.get("sie")
+    wd = _DAYS_DE[start.weekday()]
+    date_de = start.strftime("%d.%m.%Y")
+    hm = start.strftime("%H") if not start.minute else start.strftime("%H:%M")
+    days_to = (start.date() - datetime.now(BAR_TZ).date()).days
+    ddays = rec.get("deadline_days", 7)
+    deadline = (datetime.now(BAR_TZ) + timedelta(days=ddays)).strftime("%d.%m.%Y")
+    end_txt = "24 Uhr, letzte Runde 23.30 Uhr" if start.weekday() == 3 else "2 Uhr, letzte Runde 1.30 Uhr"
+    ref = f"{rec['name']} {date_de}"
+    sal = f"Hallo {rec['name']}" if du else f"Guten Tag {rec['name']}"
+    lines = [
+        sal + ",", "",
+        "vielen Dank, wir haben " + ("euch" if du else "Sie") + " vorgemerkt. Hier ist alles noch einmal gesammelt.", "",
+        "Eure Reservierung" if du else "Ihre Reservierung",
+        f"{label}, {wd} {date_de} um {hm} Uhr, {rec['party']} Personen, Anlass {rec.get('occasion') or 'Schöner Abend'}", "",
+        "Mindestumsatz und Trinkgeld",
+        f"Der Mindestumsatz liegt bei {mu} Euro und läuft ganz normal über die Getränke, es fällt keine Miete an. "
+        "Wir haben im Chat um 10 Prozent Trinkgeld für das Team gebeten. Das ist freiwillig, du kannst gerne darauf verzichten und daraus entsteht kein Anspruch." if du else
+        f"Der Mindestumsatz liegt bei {mu} Euro und läuft ganz normal über die Getränke, es fällt keine Miete an. "
+        "Wir haben im Chat um 10 Prozent Trinkgeld für das Team gebeten. Das ist freiwillig, Sie können gerne darauf verzichten und daraus entsteht kein Anspruch.", "",
+        "Anzahlung",
+        f"{dep} Euro per Überweisung bis spätestens {deadline}. Die Anzahlung wird am Abend voll auf die Rechnung angerechnet. "
+        "Erst mit Zahlungseingang ist der Termin fest bestätigt, bis dahin ist er vorgemerkt.",
+        f"Kontoinhaber {BANK_HOLDER}",
+        f"IBAN {BANK_IBAN}",
+    ]
+    if BANK_BIC:
+        lines.append(f"BIC {BANK_BIC}")
+    if BANK_NAME:
+        lines.append(f"Bank {BANK_NAME}")
+    lines += [
+        f"Verwendungszweck {ref}", "",
+        "Stornierung",
+        "Bis 14 Tage vor dem Termin ist die Stornierung kostenlos und die Anzahlung wird komplett erstattet. Danach behalten wir die Anzahlung, weitere Kosten entstehen nicht. "
+        "Für Reservierungen zu einem festen Termin gibt es kein gesetzliches Widerrufsrecht (§ 312g Abs. 2 Nr. 9 BGB).", "",
+        "Am Abend",
+        f"Das Ende ist {end_txt}, eine Verlängerung ist nicht möglich. Drinnen wird nicht geraucht. "
+        "Wünsche zu Essen, Musik oder Deko und wie abgerechnet wird besprechen wir gerne direkt im Chat mit euch." if du else
+        f"Das Ende ist {end_txt}, eine Verlängerung ist nicht möglich. Drinnen wird nicht geraucht. "
+        "Wünsche zu Essen, Musik oder Deko und wie abgerechnet wird besprechen wir gerne direkt im Chat mit Ihnen.", "",
+        "Bedingungen",
+        f"Es gelten unsere Reservierungsbedingungen, denen du im Chat zugestimmt hast, nachzulesen unter {AGB_URL}" if du else
+        f"Es gelten unsere Reservierungsbedingungen, denen Sie im Chat zugestimmt haben, nachzulesen unter {AGB_URL}", "",
+        "Wir freuen uns auf " + ("euch" if du else "Sie") + ".", "",
+        "BrunnenBar", "Inhaber Daniel De La Rosa", "Am Brunnenlech 31", "86150 Augsburg",
+        "Steuernummer 103/263/93059", "Telefon 0821 47019035",
+    ]
+    return "\n".join(lines)
+
+
+def _send_plain_email(to: str, subject: str, body: str):
+    import base64
+    from email.mime.text import MIMEText
+    svc = _gmail_service()
+    mime = MIMEText(body, "plain", "utf-8")
+    mime["To"] = to
+    mime["From"] = BAR_EMAIL
+    mime["Subject"] = subject
+    raw = base64.urlsafe_b64encode(mime.as_bytes()).decode()
+    svc.users().messages().send(userId="me", body={"raw": raw}).execute()
+
+
+def deposit_confirm_and_email(sender: str, email: str, channel: str = "whatsapp") -> bool:
+    """Guest agreed to the terms in the chat and gave an email address. Sends the
+    one confirmation email, moves the record to awaiting_payment, tells Dan.
+    Returns False if anything failed, the caller then does not claim an email went out."""
+    rec = _deposit_get(sender)
+    email = (email or "").strip()
+    if not rec or rec.get("state") != "awaiting_consent":
+        return False
+    if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+        return False
+    try:
+        start = datetime.fromisoformat(rec["start_iso"])
+        days_to = (start.date() - datetime.now(BAR_TZ).date()).days
+        rec["deadline_days"] = 7 if days_to >= 14 else 2
+        subject = f"Deine Reservierung bei der BrunnenBar am {start.strftime('%d.%m.%Y')}" if not rec.get("sie") else \
+            f"Ihre Reservierung bei der BrunnenBar am {start.strftime('%d.%m.%Y')}"
+        _send_plain_email(email, subject, _deposit_email_body(rec))
+    except Exception as e:
+        logger.error("deposit email failed for %s: %s", sender, e)
+        alert_dan("guest agreed to the terms but the confirmation email with the bank details failed to send, please send it by hand",
+                  channel, sender, email, str(e))
+        return False
+    rec.update({"state": "awaiting_payment", "email": email, "sent_ts": time.time(), "alerts": []})
+    _deposit_set(sender, rec)
+    alert_dan("deposit email sent, guest agreed to the terms, now waiting for the Anzahlung. When the money is in, remove VORGEMERKT from the calendar title, "
+              f"deadline in {rec['deadline_days']} days",
+              channel, sender, f"{rec['name']} {rec['party']} Personen {PRIVATE_SPACES[rec['space']]['label']} {rec['start_iso'][:16]} Anzahlung {DEPOSITS[rec['space']]} Euro", "")
+    return True
+
+
+def run_deposit_followups():
+    """Alerts Dan only, never messages the guest and never deletes anything.
+    Payment is confirmed when Dan removes VORGEMERKT from the event title."""
+    if not _deposit_active():
+        return
+    for sender in _deposit_all_senders():
+        try:
+            rec = _deposit_get(sender)
+            if not rec:
+                continue
+            try:
+                ev = _calendar_service().events().get(calendarId=RESERVIERUNGEN_CALENDAR_ID, eventId=rec["event_id"]).execute()
+                gone = ev.get("status") == "cancelled"
+                paid = "VORGEMERKT" not in (ev.get("summary") or "")
+            except Exception:
+                gone, paid = False, False
+            if gone or paid:
+                _deposit_clear(sender)
+                continue
+            if rec.get("state") != "awaiting_payment":
+                continue
+            age_days = (time.time() - rec.get("sent_ts", time.time())) / 86400
+            alerts = rec.get("alerts", [])
+            label = f"{rec['name']} {rec['party']} Personen {rec['start_iso'][:16]}"
+            if age_days >= rec.get("deadline_days", 7) and "deadline" not in alerts:
+                alerts.append("deadline")
+                alert_dan("deposit deadline has passed with no confirmed payment, check the bank and either confirm or release the date",
+                          "whatsapp", sender, label, "")
+            elif age_days >= 3 and "reminder" not in alerts:
+                alerts.append("reminder")
+                alert_dan("deposit still open after 3 days, check the bank", "whatsapp", sender, label, "")
+            rec["alerts"] = alerts
+            _deposit_set(sender, rec)
+        except Exception as e:
+            logger.error("deposit followup failed for %s: %s", sender, e)
+
+
 def process_booking(sender: str, data: dict, lang: str = "de", channel: str = "whatsapp") -> str:
     """Given the details the model gave the tool, check real availability, book
     if it is free, and return the guest reply in the guest's language. Never
@@ -2072,6 +2290,13 @@ def process_booking(sender: str, data: dict, lang: str = "de", channel: str = "w
                    "BOOKING_ENABLED/GOOGLE_REFRESH_TOKEN/RESERVIERUNGEN_CALENDAR_ID, check Railway")
         return _handoff_line(sie, lang)
 
+    if space in ("hinterer_bereich", "ganze_bar") and start_dt.weekday() in (0, 1, 2, 6):
+        # 01 Oct 2026, Dan: no private bookings Mon to Wed or Sunday, there is no team yet, Dan decides personally.
+        logger.info("private booking on a closed weekday blocked, handing to Dan (%s)", date_iso)
+        alert_dan("private space requested on a Monday, Tuesday, Wednesday or Sunday, bot never books these, Dan decides personally",
+                  channel, sender, what, "")
+        return _handoff_line(sie, lang)
+
     if space in ("hinterer_bereich", "ganze_bar"):
         with _book_lock:
             try:
@@ -2092,13 +2317,22 @@ def process_booking(sender: str, data: dict, lang: str = "de", channel: str = "w
                           "guest needs a manual answer" + (f". {prio}" if prio else ""), channel, sender, what)
                 return _full_line(sie, lang)
             try:
-                create_private_space_reservation(name, sender, party, space, start_dt, occasion, lang)
+                _ev = create_private_space_reservation(name, sender, party, space, start_dt, occasion, lang, pending=_deposit_active())
             except Exception as e:
                 logger.error("create_private_space_reservation failed: %s", e)
                 alert_dan(f"{space_label} was free but saving the booking to the calendar failed",
                           channel, sender, what, str(e))
                 return _handoff_line(sie, lang)
         logger.info("booked %s for %s party %s %s %s", space, name, party, date_iso, hhmm)
+        if _deposit_active():
+            try:
+                _deposit_set(sender, {"state": "awaiting_consent", "event_id": (_ev or {}).get("id", ""), "space": space,
+                                      "name": name, "party": party, "occasion": occasion, "sie": sie,
+                                      "start_iso": start_dt.isoformat(), "created_ts": time.time()})
+            except Exception as e:
+                logger.error("deposit record save failed: %s", e)
+            notify_dan_booked(channel, sender, f"VORGEMERKT, wartet auf Zustimmung und Anzahlung. {what}")
+            return _deposit_consent_message(space, start_dt, sie, lang)
         notify_dan_booked(channel, sender, f"{what}, Mindestumsatz {PRIVATE_SPACES[space]['mindestumsatz']} Euro")
         h = start_dt.strftime("%H")
         hm = f"{h}:{start_dt.strftime('%M')}" if start_dt.minute else h
@@ -2651,6 +2885,19 @@ SEND_REPLY_TOOL = {
                     },
                 },
                 "required": ["name"],
+            },
+            "deposit_terms": {
+                "type": "object",
+                "description": (
+                    "Only on action reply, and only when the system prompt says a DEPOSIT CONSENT is pending for this guest. "
+                    "Fill this in when the guest clearly agreed to the terms, meaning they said yes, and gave their email address. "
+                    "Never fill it in from silence, a question, or a half answer, and never invent the email."
+                ),
+                "properties": {
+                    "agreed": {"type": "boolean", "description": "True only if the guest clearly said yes to the terms"},
+                    "email": {"type": "string", "description": "The guest's email address exactly as written"},
+                },
+                "required": ["agreed", "email"],
             },
             "viewing_confirmed": {
                 "type": "object",
@@ -3512,6 +3759,16 @@ def claude_decide(sender: str, text: str):
     edc = event_date_context(sender, text)
     if edc:
         system += "\n\n" + edc
+    try:
+        _dr = _deposit_get(sender) if _deposit_active() else None
+    except Exception:
+        _dr = None
+    if _dr and _dr.get("state") == "awaiting_consent":
+        system += ("\n\nDEPOSIT CONSENT pending for this guest. The last message to them asked them to agree to the Reservierungsbedingungen "
+                   "and to send their email address. If they clearly say yes and give an email address, call send_reply with action reply, "
+                   "a short warm message saying we send everything per Mail now, and deposit_terms with agreed true and the email. If they say yes "
+                   "but gave no email, ask only for the email. If they decline, hesitate, or ask something you cannot answer, use action handoff. "
+                   "Never say an email was sent unless you set deposit_terms. Never mention bank details in the chat.")
     if not _ai_disclosed(sender):
         system += "\n\nAI DISCLOSURE PENDING. A paragraph introducing you as the KI Concierge is automatically placed before your reply. If this is the first reply in the thread and you know the guest's name, open with a short greeting like Hallo Name, it is merged into the introduction. Otherwise start directly with the content. Never introduce yourself as the KI Concierge yourself."
     if lang == "en":
@@ -3554,6 +3811,17 @@ def claude_decide(sender: str, text: str):
                 action = (inp.get("action") or "").strip().lower()
                 message = (inp.get("message") or "").strip()
                 reason = (inp.get("reason") or "").strip()
+                if action == "reply":
+                    _dt = inp.get("deposit_terms")
+                    if isinstance(_dt, dict) and _dt.get("agreed"):
+                        try:
+                            if not deposit_confirm_and_email(sender, str(_dt.get("email") or "")):
+                                message = ""
+                                action = "handoff"
+                                reason = "deposit terms agreed but the confirmation email could not be sent or the address was invalid"
+                        except Exception as e:
+                            logger.error("deposit_terms handling failed: %s", e)
+                            message, action, reason = "", "handoff", "deposit terms handling error"
                 if action == "reply":
                     # TENTATIVE HOLD side effects, see the comment on
                     # upsert_pending_hold above. Best effort and wrapped so a
