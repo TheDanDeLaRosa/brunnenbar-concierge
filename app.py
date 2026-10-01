@@ -2104,13 +2104,13 @@ def _deposit_consent_message(space: str, start_dt, sie: bool, lang: str) -> str:
         where_en = "the back lounge" if space == "hinterer_bereich" else "the whole bar exclusively"
         return (f"We have pencilled in {where_en} for you on {wd} at {hm}. The Mindestumsatz is {mu} Euro and runs through your drinks "
                 f"like a normal tab. On top there is a deposit of {dep} Euro by bank transfer which is fully credited to your bill on the night. "
-                f"Cancellation is free up to 14 days before and you get the deposit back in full. Our terms are at {AGB_URL}. "
+                f"If you cancel more than 14 days before, you get the deposit back in full. Our terms are at {AGB_URL}. "
                 f"If that works for you, reply with a yes and your email address and we will send you everything in one email including our bank details")
     du = not sie
     return (f"Damit wir {'dich' if du else 'Sie'} fest vormerken können noch kurz das Wichtigste. {where[0].upper() + where[1:]} ist {'für euch' if du else 'für Sie'} "
             f"{wd} um {hm} Uhr vorgemerkt. Der Mindestumsatz liegt bei {mu} Euro und läuft ganz normal über {'eure' if du else 'Ihre'} Getränke. "
             f"Dazu kommt eine Anzahlung von {dep} Euro per Überweisung, die am Abend voll auf {'eure' if du else 'Ihre'} Rechnung angerechnet wird. "
-            f"Bis 14 Tage vorher ist die Stornierung kostenlos und {'du bekommst' if du else 'Sie bekommen'} die Anzahlung komplett zurück. "
+            f"Wenn {'du' if du else 'Sie'} mehr als 14 Tage vor dem Termin {'stornierst' if du else 'stornieren'}, {'bekommst du' if du else 'bekommen Sie'} die Anzahlung komplett zurück. "
             f"Es gelten unsere Reservierungsbedingungen unter {AGB_URL}. "
             f"Wenn das {'für dich' if du else 'für Sie'} passt, {'schreib uns' if du else 'schreiben Sie uns'} kurz ja und {'deine' if du else 'Ihre'} Mail Adresse, "
             f"dann schicken wir {'dir' if du else 'Ihnen'} alles gesammelt per Mail, inklusive Bankverbindung")
@@ -2126,9 +2126,7 @@ def _deposit_email_body(rec: dict) -> str:
     wd = _DAYS_DE[start.weekday()]
     date_de = start.strftime("%d.%m.%Y")
     hm = start.strftime("%H") if not start.minute else start.strftime("%H:%M")
-    days_to = (start.date() - datetime.now(BAR_TZ).date()).days
-    ddays = rec.get("deadline_days", 7)
-    deadline = (datetime.now(BAR_TZ) + timedelta(days=ddays)).strftime("%d.%m.%Y")
+    deadline = rec.get("deadline_text", "")
     end_txt = "24 Uhr, letzte Runde 23.30 Uhr" if start.weekday() == 3 else "2 Uhr, letzte Runde 1.30 Uhr"
     ref = f"{rec['name']} {date_de}"
     sal = f"Hallo {rec['name']}" if du else f"Guten Tag {rec['name']}"
@@ -2143,7 +2141,7 @@ def _deposit_email_body(rec: dict) -> str:
         f"Der Mindestumsatz liegt bei {mu} Euro und läuft ganz normal über die Getränke, es fällt keine Miete an. "
         "Wir haben im Chat um 10 Prozent Trinkgeld für das Team gebeten. Das ist freiwillig, Sie können gerne darauf verzichten und daraus entsteht kein Anspruch.", "",
         "Anzahlung",
-        f"{dep} Euro per Überweisung bis spätestens {deadline}. Die Anzahlung wird am Abend voll auf die Rechnung angerechnet. "
+        f"{dep} Euro per Überweisung, fällig {deadline}. Die Anzahlung wird am Abend voll auf die Rechnung angerechnet. "
         "Erst mit Zahlungseingang ist der Termin fest bestätigt, bis dahin ist er vorgemerkt.",
         f"Kontoinhaber {BANK_HOLDER}",
         f"IBAN {BANK_IBAN}",
@@ -2155,7 +2153,7 @@ def _deposit_email_body(rec: dict) -> str:
     lines += [
         f"Verwendungszweck {ref}", "",
         "Stornierung",
-        "Bis 14 Tage vor dem Termin ist die Stornierung kostenlos und die Anzahlung wird komplett erstattet. Danach behalten wir die Anzahlung, weitere Kosten entstehen nicht. "
+        "Bei einer Stornierung mehr als 14 Tage vor dem Termin wird die Anzahlung komplett erstattet. Bei 14 Tagen oder weniger behalten wir die Anzahlung, weitere Kosten entstehen nicht. "
         "Für Reservierungen zu einem festen Termin gibt es kein gesetzliches Widerrufsrecht (§ 312g Abs. 2 Nr. 9 BGB).", "",
         "Am Abend",
         f"Das Ende ist {end_txt}, eine Verlängerung ist nicht möglich. Drinnen wird nicht geraucht. "
@@ -2196,8 +2194,16 @@ def deposit_confirm_and_email(sender: str, email: str, channel: str = "whatsapp"
         return False
     try:
         start = datetime.fromisoformat(rec["start_iso"])
-        days_to = (start.date() - datetime.now(BAR_TZ).date()).days
-        rec["deadline_days"] = 7 if days_to >= 14 else 2
+        # AGB § 7.2 (Stand 01.10.2026): due within 14 days of the confirmation, at the latest 7 days before the
+        # event, and immediately if the event is less than 7 days away.
+        now_b = datetime.now(BAR_TZ)
+        due = min(now_b + timedelta(days=14), start - timedelta(days=7))
+        if due <= now_b:
+            rec["deadline_text"] = "unverzüglich nach Erhalt dieser Mail"
+            rec["deadline_ts"] = (now_b + timedelta(days=2)).timestamp()
+        else:
+            rec["deadline_text"] = f"bis spätestens {due.strftime('%d.%m.%Y')}"
+            rec["deadline_ts"] = due.timestamp()
         subject = f"Deine Reservierung bei der BrunnenBar am {start.strftime('%d.%m.%Y')}" if not rec.get("sie") else \
             f"Ihre Reservierung bei der BrunnenBar am {start.strftime('%d.%m.%Y')}"
         _send_plain_email(email, subject, _deposit_email_body(rec))
@@ -2209,7 +2215,7 @@ def deposit_confirm_and_email(sender: str, email: str, channel: str = "whatsapp"
     rec.update({"state": "awaiting_payment", "email": email, "sent_ts": time.time(), "alerts": []})
     _deposit_set(sender, rec)
     alert_dan("deposit email sent, guest agreed to the terms, now waiting for the Anzahlung. When the money is in, remove VORGEMERKT from the calendar title, "
-              f"deadline in {rec['deadline_days']} days",
+              f"deadline {rec['deadline_text']} per AGB 7.2",
               channel, sender, f"{rec['name']} {rec['party']} Personen {PRIVATE_SPACES[rec['space']]['label']} {rec['start_iso'][:16]} Anzahlung {DEPOSITS[rec['space']]} Euro", "")
     return True
 
@@ -2238,7 +2244,7 @@ def run_deposit_followups():
             age_days = (time.time() - rec.get("sent_ts", time.time())) / 86400
             alerts = rec.get("alerts", [])
             label = f"{rec['name']} {rec['party']} Personen {rec['start_iso'][:16]}"
-            if age_days >= rec.get("deadline_days", 7) and "deadline" not in alerts:
+            if time.time() >= rec.get("deadline_ts", time.time() + 99999) and "deadline" not in alerts:
                 alerts.append("deadline")
                 alert_dan("deposit deadline has passed with no confirmed payment, check the bank and either confirm or release the date",
                           "whatsapp", sender, label, "")
