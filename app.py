@@ -2295,7 +2295,7 @@ def process_booking(sender: str, data: dict, lang: str = "de", channel: str = "w
         logger.info("private booking on a closed weekday blocked, handing to Dan (%s)", date_iso)
         alert_dan("private space requested on a Monday, Tuesday, Wednesday or Sunday, bot never books these, Dan decides personally",
                   channel, sender, what, "")
-        return _handoff_line(sie, lang)
+        return _closed_day_line(sie, lang)
 
     if space in ("hinterer_bereich", "ganze_bar"):
         with _book_lock:
@@ -2510,6 +2510,23 @@ def _book_or_handoff(sender: str, data: dict, lang: str, channel: str, guest_tex
     return _handoff_line(bool(data.get("sie")), lang)
 
 
+def _closed_day_line(sie=False, lang="de"):
+    """Private space on a Mon to Wed or Sunday, 01 Oct 2026 Dan: never a no, we have to check
+    internally because a team has to be set up for that day, Dan answers personally."""
+    if lang == "en":
+        return random.choice([
+            "That is a day we are normally closed, so we need to check internally first and put a team together for it. Dan will get back to you personally",
+            "We would need to check that one internally first, since we would have to set up a team for that day. Dan will come back to you personally",
+        ])
+    if sie:
+        return ("An diesem Tag haben wir normalerweise geschlossen, deshalb müssen wir intern kurz prüfen und dafür ein Team zusammenstellen. "
+                "Dan meldet sich persönlich bei Ihnen")
+    return random.choice([
+        "An dem Tag haben wir normalerweise zu, deshalb müssen wir intern kurz prüfen und dafür ein Team zusammenstellen. Dan meldet sich persönlich bei dir",
+        "Das müssen wir intern kurz klären, weil wir für den Tag erst ein Team zusammenstellen müssten. Dan meldet sich persönlich bei dir",
+    ])
+
+
 def _handoff_line(sie=False, lang="de"):
     if lang == "en":
         return random.choice([
@@ -2593,7 +2610,7 @@ READ THE WHOLE THREAD FIRST, EVERY SINGLE TIME. Before you write one word of a r
 
 TIME AND OPENING HOURS. For anything about whether the bar is open, or what day or time it is, rely ONLY on the AKTUELLER ZEITPUNKT line given to you and never guess the weekday. Opening hours are Donnerstag 18 bis 24 Uhr, Freitag und Samstag 18 bis 2 Uhr, sonst geschlossen. There is a Happy Hour bis 20 Uhr, mention it warmly but never quote prices. If today is a closed day, say so kindly and name the next open day. This TIME AND OPENING HOURS section is about a normal RESERVATION, a guest coming to drink on a night the bar is already open to everyone, it has nothing to do with a private exclusive booking of the whole bar, see the next paragraph for that, those are two different things and must never be mixed into the same answer.
 
-PRIVATBUCHUNG AN SCHLIESSTAGEN. CHANGED 01 Oct 2026, Dan direct. Wunschtermine fuer eine private Buchung (ganze Bar oder hinterer Bereich) an einem Montag, Dienstag oder Mittwoch bietest du NICHT selbst an und buchst nichts, es gibt dafuer noch kein Team. Fragt ein Gast danach oder ist sein Freitag oder Samstag schon vergeben, sag warm dass wir das intern klaeren muessen und ruf send_reply mit action handoff auf, reason Schliesstag Anfrage mit Datum, Personenzahl und Wunschzeit, Dan meldet sich persoenlich. Kein Hold, kein Kalendereintrag, keine Endzeit vereinbaren, kein Preis. Sonntag bleibt komplett ausgeschlossen, niemals als Option nennen, auch nicht wenn der Gast danach fragt, das ist ebenfalls ein HANDOFF.
+PRIVATBUCHUNG AN SCHLIESSTAGEN. CHANGED 01 Oct 2026, Dan direct. Wunschtermine fuer eine private Buchung (ganze Bar oder hinterer Bereich) an einem Montag, Dienstag oder Mittwoch bietest du NICHT selbst an und buchst nichts, es gibt dafuer noch kein Team. Fragt ein Gast danach oder ist sein Freitag oder Samstag schon vergeben, sag warm, nie als Absage, dass wir das intern kurz pruefen muessen weil wir fuer den Tag erst ein Team zusammenstellen muessten, und ruf send_reply mit action handoff auf, reason Schliesstag Anfrage mit Datum, Personenzahl und Wunschzeit, Dan meldet sich persoenlich. Kein Hold, kein Kalendereintrag, keine Endzeit vereinbaren, kein Preis. Sonntag bleibt komplett ausgeschlossen, niemals als Option nennen, auch nicht wenn der Gast danach fragt, das ist ebenfalls ein HANDOFF.
 
 RESERVATIONS AND EVENTS, CHANGED 9 Sep 2026, Dan directly: "the bot should complete all reservations and only let me know when they are booked... reach out only if something is strange or need extra help... it should be end to end, self healing and self improving." You now complete every reservation and event yourself, plain table or a real private space, any party size, ending in an actual book_table call, not a handoff to Dan. The only reasons left to use action handoff for a reservation or event are real exceptions, listed at the end of GROUPS AND EVENTS below, never just because a party is bigger or wants a private space.
 
