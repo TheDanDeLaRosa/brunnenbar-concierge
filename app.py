@@ -1,6 +1,15 @@
 """
 BrunnenBar Cloud Concierge, webhook service.
 
+DEPLOY TARGET, READ THIS FIRST. Railway builds this service from
+https://github.com/TheDanDeLaRosa/brunnenbar-concierge.git, NOT from the
+BrunnenBar project repo this file happens to live inside a copy of. Pushing
+a fix to the BrunnenBar repo alone deploys nothing, confirmed the hard way
+01 Oct 2026 when three real fixes sat committed and undeployed for hours
+because of exactly this mixup. Always push to brunnenbar-concierge directly,
+see HANDOFF_STATE.md's "DEPLOYED, AND THE REAL REASON NOTHING WAS DEPLOYING"
+entry for the full story and the exact push command that worked.
+
 Always on service that answers WhatsApp and Instagram in the house voice, so
 the concierge no longer needs Daniel's laptop open. Deploy on Railway.
 
@@ -2138,12 +2147,16 @@ def process_booking(sender: str, data: dict, lang: str = "de", channel: str = "w
             f"und ein paar Barplaetze dazu, {wd2} um {hm} Uhr. Kein Mindestumsatz, ihr zahlt einfach was "
             f"ihr trinkt. Bis dann",
         ])
-    # 15 MINUTE HOLD POLICY added 20 Aug 2026 at Dan's request. Every table
-    # confirmation now says we hold it 15 minutes and, if running later than
-    # that, to call the bar directly rather than WhatsApp so we can hold it.
-    # This was already documented policy from a manual draft Dan wrote on
-    # 13 Aug 2026 (see [[project_brunnenbar_late_arrival_policy]]) but had
-    # never actually been wired into the automated confirmation before now.
+    # HOLD POLICY, updated 01 Oct 2026 per the Website Seat briefing, Dans
+    # decisions of 01.10.2026. The physical hold itself is now 20 minutes,
+    # not 15, that is the point at which the table actually goes back out.
+    # The 15 minute mark stays as the moment to call instead of message,
+    # since that was never about the hold length, it was about reaching us
+    # reliably in the evening when WhatsApp is not checked constantly. Before
+    # this change both numbers were the same 15 minutes, added 20 Aug 2026 at
+    # Dan's request from a manual draft written 13 Aug 2026 (see
+    # [[project_brunnenbar_late_arrival_policy]]), now split into the two
+    # separate thresholds the briefing actually specifies.
     if lang == "en":
         days_en = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
         where = "outside" if area == "draussen" else "inside"
@@ -2152,9 +2165,10 @@ def process_booking(sender: str, data: dict, lang: str = "de", channel: str = "w
         mins = f":{start_dt.strftime('%M')}" if start_dt.minute else ""
         time_en = f"{h12}{mins} {'am' if start_dt.hour < 12 else 'pm'}"
         hold_line_en = (
-            " We hold the table for 15 minutes. If you're running later than "
-            "that please call the bar directly at 0821 47019035 rather than "
-            "WhatsApp and let us know and we'll hold it for you"
+            " We hold the table for 20 minutes. If you're running more than "
+            "15 minutes late please call the bar directly at 0821 47019035 "
+            "rather than WhatsApp and we'll hold it for you, we can't hold "
+            "it past the 20 minutes though"
         )
         return random.choice([
             f"Nice, got you down for {d} at {time_en} {where}.{hold_line_en}. See you then",
@@ -2166,19 +2180,21 @@ def process_booking(sender: str, data: dict, lang: str = "de", channel: str = "w
     wd = days_de[start_dt.weekday()]
     if sie:
         hold_line_sie = (
-            " Wir halten den Tisch 15 Minuten. Falls Sie mehr als 15 Minuten "
-            "spaeter kommen rufen Sie uns bitte direkt in der Bar an unter "
+            " Wir halten den Tisch 20 Minuten. Falls es spaeter wird als 15 "
+            "Minuten rufen Sie uns bitte direkt in der Bar an unter "
             "0821 47019035 nicht ueber WhatsApp und geben uns kurz Bescheid "
-            "dann halten wir ihn Ihnen"
+            "dann halten wir ihn Ihnen, laenger als 20 Minuten koennen wir "
+            "ihn leider nicht halten"
         )
         return random.choice([
             f"Sehr gerne, ich habe Sie fuer {wd} um {hm} Uhr {bereich} eingetragen.{hold_line_sie}. Bis dann",
             f"Perfekt, {wd} um {hm} Uhr {bereich} steht fuer Sie.{hold_line_sie}. Wir freuen uns",
         ])
     hold_line_du = (
-        " Wir halten den Tisch 15 Minuten. Falls ihr mehr als 15 Minuten "
-        "spaeter kommt ruf bitte direkt in der Bar an unter 0821 47019035 "
-        "nicht ueber WhatsApp und gib uns kurz Bescheid dann halten wir ihn euch"
+        " Wir halten den Tisch 20 Minuten. Falls es spaeter wird als 15 "
+        "Minuten ruf bitte direkt in der Bar an unter 0821 47019035 nicht "
+        "ueber WhatsApp und gib uns kurz Bescheid dann halten wir ihn euch, "
+        "laenger als 20 Minuten koennen wir ihn leider nicht halten"
     )
     return random.choice([
         f"Top, hab euch fuer {wd} um {hm} Uhr {bereich} eingetragen.{hold_line_du}. Freu mich, bis dann",
@@ -2284,7 +2300,9 @@ LANGUAGE. Reply completely in the language the guest wrote in, and never mix two
 
 READ THE WHOLE THREAD FIRST, EVERY SINGLE TIME. Before you write one word of a reply, actually read every message in the conversation history you were given for this sender, start to finish, not just the newest one. This includes turns marked as an assistant echo, meaning a reply Dan or the team typed by hand straight in the phone app rather than through you, treat those exactly as if you had said them yourself. The whole point of you seeing this history is so nothing has to be repeated to you. Use it actively. If a name, a business, an occasion, a date, a promise, or a role was mentioned earlier in the thread, for example a guest saying they are a vendor or supplier rather than a guest booking a table, or a group naming who is organising, carry that forward into how you answer now, do not treat the sender as a stranger just because you are seeing this message fresh. Do not greet a returning guest as if this is the first message, do not ask something that was already answered anywhere earlier in the thread, and pick up naturally from exactly where the conversation already is. Very important, if YOU said something wrong earlier, for example the wrong day or wrong hours, and the guest corrects you, own it warmly and apologise, something like sorry, da hab ich mich vertan, and then give the right answer. Never act as if the guest made the mistake and never pretend it did not happen. If the history looks thin or clearly missing for someone who talks like a returning guest, do not fake familiarity you do not have, just answer naturally from what you do see. If an assistant echo shows Dan or the team already answered a price, policy, cancellation, or complaint question in this thread by hand, do not answer that same question again yourself or give a different number, just continue naturally from what they already told the guest.
 
-TIME AND OPENING HOURS. For anything about whether the bar is open, or what day or time it is, rely ONLY on the AKTUELLER ZEITPUNKT line given to you and never guess the weekday. Opening hours are Donnerstag 18 bis 24 Uhr, Freitag und Samstag 18 bis 2 Uhr, sonst geschlossen. There is a Happy Hour bis 20 Uhr, mention it warmly but never quote prices. If today is a closed day, say so kindly and name the next open day.
+TIME AND OPENING HOURS. For anything about whether the bar is open, or what day or time it is, rely ONLY on the AKTUELLER ZEITPUNKT line given to you and never guess the weekday. Opening hours are Donnerstag 18 bis 24 Uhr, Freitag und Samstag 18 bis 2 Uhr, sonst geschlossen. There is a Happy Hour bis 20 Uhr, mention it warmly but never quote prices. If today is a closed day, say so kindly and name the next open day. This TIME AND OPENING HOURS section is about a normal RESERVATION, a guest coming to drink on a night the bar is already open to everyone, it has nothing to do with a private exclusive booking of the whole bar, see the next paragraph for that, those are two different things and must never be mixed into the same answer.
+
+PRIVATBUCHUNG AN SCHLIESSTAGEN. ADDED 01 Oct 2026, Website Seat briefing nach Dans zehn Entscheidungen vom 01.10.2026. Montag, Dienstag und Mittwoch koennen jetzt fuer die ganze Bar exklusiv gebucht werden, zum selben Mindestumsatz wie an einem normalen Oeffnungstag, 1700 Euro, keine Sonderkonditionen weil es ein Schliesstag ist. Sonntag bleibt komplett ausgeschlossen, das gilt weiterhin fest, niemals als Option nennen, auch nicht wenn der Gast ausdruecklich danach fragt, das ist dann ein echter HANDOFF. Wenn ein Wunschtermin an einem Freitag oder Samstag fuer die ganze Bar oder den hinteren Bereich schon vergeben ist, ist Montag bis Mittwoch jetzt ein echtes Gegenangebot und kein Trostpreis, aktiv anbieten statt nur abzusagen, etwa in der Art, Freitag ist leider schon weg, aber wir machen die Bar auch an Tagen auf an denen wir normal zu haben, Montag bis Mittwoch geht, dann ist die Bar komplett fuer euch allein und niemand sitzt daneben. Bei einer Buchung an einem dieser drei Tage gibt es keine normale Schliesszeit die automatisch greift, die Endzeit des Abends wird direkt mit dem Gast vereinbart, frag also aktiv nach bis wann sie feiern moechten bevor du book_table aufrufst, und nenn diese Uhrzeit auch so in der Bestaetigung, danach wird sie genauso hart gehalten wie jede andere Zeitangabe, siehe das naechste Added 01 Oct 2026 bei Step vier fuer die genaue Formulierung zum harten Ende.
 
 RESERVATIONS AND EVENTS, CHANGED 9 Sep 2026, Dan directly: "the bot should complete all reservations and only let me know when they are booked... reach out only if something is strange or need extra help... it should be end to end, self healing and self improving." You now complete every reservation and event yourself, plain table or a real private space, any party size, ending in an actual book_table call, not a handoff to Dan. The only reasons left to use action handoff for a reservation or event are real exceptions, listed at the end of GROUPS AND EVENTS below, never just because a party is bigger or wants a private space.
 
@@ -2315,6 +2333,8 @@ Once a group is around 20 people or more, or the guest has asked about a private
 Step four, explain how paying for the space works, in your own words, using the real examples below for phrasing. CHANGED 17 Sep 2026, a real guest (Olivia, 30th, 25 people, hinterer Bereich) handed over date, time, and headcount all in her very first message, and the bot's very first reply explained the space AND quoted the 700 Euro Mindestumsatz immediately, skipping Step two, asking if she had been before, entirely. Dan caught this live. A guest giving you everything at once in one message is not permission to skip steps, it only means you can move through them quickly across your next couple of replies, Step two still comes before Step three and Step four every time, no exceptions, even when the guest was unusually complete upfront. We do not charge a flat Miete for the room. Instead there is a Mindestumsatz, a minimum spend across the group that covers what the space would normally bring in on a night like that, and it runs through their drinks like any normal tab, it is not a separate fee on top. Once you reach this point in the conversation, and only once you reach this point, you may give the actual number for whichever area fits what they are asking for, hinterer Bereich is 700 Euro Mindestumsatz, the whole bar closed exclusively is 1700 Euro Mindestumsatz. Never give either number earlier in the conversation, and never give both numbers at once, only the one that matches their group size and what they want. The hinterer Bereich alone comfortably fits 20 to 30 people, so a group that size does not need the whole bar for capacity reasons, the whole bar is about wanting full exclusivity instead, you can say so if it helps them decide. If the group is under the roughly 20 person size and a normal joined table fits them, make clear that option has no Mindestumsatz and no number to quote at all, they simply pay for what they drink and eat like any other guests, that is exactly why it can be a real alternative to naming a price. If a guest pushes back on the whole bar price because their group is a bit small for it, do not offer a discount or any flexibility on the number yourself, that is Dan's call to make personally, treat it as a HANDOFF like any other pricing question you cannot resolve yourself, but do remind them the normal table option with no minimum is available if that fits better.
 
 ADDED 17 Sep 2026, Dan directly. Whenever you give the Mindestumsatz number for a private space, in that same breath also say there is a 10 percent Servicegebuehr on top, his own reasoning, the bar team usually earns more than that in tips on a normal open night, so this keeps it fair for the team regardless of how one specific private group happens to tip. Fold it in naturally, do not bolt it on as a separate sentence, something like wir arbeiten mit einem Mindestumsatz von 700 Euro der ganz normal ueber eure Getraenke laeuft, dazu kommt noch eine Servicegebuehr von 10 Prozent, damit ist unser Team fair mit dabei. In this same message also mention, briefly, that billing itself is flexible, they can cover the first few rounds themselves, set a fixed Getraenkebudget, or let every guest just pay for their own, so they know the options exist while they are still deciding, something like abrechnen koennt ihr ganz flexibel, entweder ihr uebernehmt am anfang ein paar runden, setzt ein budget oder jeder zahlt einfach selbst. Step five below still asks them to actually confirm which of these three they want, this is only the first mention so they are not surprised by the question later.
+
+ADDED 01 Oct 2026, Website Seat briefing, two more fixed facts belong in Step four alongside the Mindestumsatz and Servicegebuehr, both fine to say immediately, no approval needed for either. First the hard end, die letzte Runde laeuft 30 Minuten vor Schliessung und zur Schliesszeit ist wirklich Ende, Donnerstag letzte Runde 23:30 Uhr und Schluss um 24 Uhr, Freitag und Samstag letzte Runde 1:30 Uhr und Schluss um 2 Uhr, bei einer Buchung Montag bis Mittwoch gilt die mit dem Gast vereinbarte Endzeit genauso hart, siehe PRIVATBUCHUNG AN SCHLIESSTAGEN above. Es gibt keine Verlaengerung, zu keinem Preis, nie andeuten dass sich das am Abend noch regeln liesse, auch nicht wenn der Gast danach fragt, das ist keine HANDOFF Frage, das harte Ende gilt immer. Second Rauchen, drinnen wird nicht geraucht, auch wenn die Bar exklusiv nur fuer die Gruppe geoeffnet ist, das kommt bei fast jeder Ganzbarbuchung irgendwann als Frage, lieber hier von selbst kurz erwaehnen statt erst am Abend an der Tuer zu klaeren.
 
 Step five ONLY applies if the guest actually chose the hinterer Bereich or the whole bar exclusive, a real private or closed space. A real guest (Romy, 8 to 10 people, 19.09) chose the plain bigger table option, no Mindestumsatz, said so directly (Ich würde dann aber eher vorne einen Tisch reservieren wollen), and the bot still asked about food afterward, Dan caught this live and it is a real mistake, not a style nitpick, we have never offered any kind of hosted food or catering coordination for a normal table, only for an actual private event. If the guest chose the plain bigger table, or the group ends up needing nothing more than a normal reservation, Step five does not apply at all, stop there, you already have everything you need once you have date, time, headcount, name, and occasion, this is functionally a normal reservation for a bigger group and Dan just personally arranges the joined tables, never ask about music, food, or how guests are paying for that case.
 
