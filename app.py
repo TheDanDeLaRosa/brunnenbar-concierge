@@ -2050,7 +2050,7 @@ BANK_HOLDER = os.environ.get("BANK_HOLDER", "")
 BANK_IBAN = os.environ.get("BANK_IBAN", "")
 BANK_BIC = os.environ.get("BANK_BIC", "")
 BANK_NAME = os.environ.get("BANK_NAME", "")
-AGB_URL = os.environ.get("AGB_URL", "brunnenbar.com/reservierungsbedingungen")
+AGB_URL = os.environ.get("AGB_URL", "brunnenbar.com/AGB")
 DEPOSITS = {"hinterer_bereich": 150, "ganze_bar": 350}
 _deposit_local = {}
 
