@@ -184,7 +184,19 @@ HUMAN_ACTIVE_PAUSE_HOURS = int(os.environ.get("HUMAN_ACTIVE_PAUSE_HOURS", "24"))
 # a human pause that outlived the guest's patience, anything. This is the
 # general safety net under all of the specific fixes, not a replacement for
 # them. See run_stale_thread_watchdog below for exactly what it checks.
-STALE_THREAD_SLA_HOURS = int(os.environ.get("STALE_THREAD_SLA_HOURS", "6"))
+# LOWERED 01 Oct 2026, Dan direct, after a real guest (Vanessa, table for 8,
+# 30.10, birthday) answered every qualifying question in a fast back and
+# forth, each with a reply inside the normal REPLY_DELAY window, then got
+# nothing back after her final answer, roughly 38 hours, well past the old
+# 6 hour SLA's first alert and apparently past whatever Dan actually saw of
+# it too. This was a plain RESERVATIONS flow, not a slower multi day event
+# inquiry the 6 hour figure was originally calibrated for, see the docstring
+# below, a normal table booking has every reason to resolve same evening.
+# Dropped to 2 hours, still well above LIVE_SERVICE_STALE_SLA_MINUTES so it
+# never fights that faster net while the bar is actually open, but no longer
+# capable of leaving a fast moving thread quiet overnight before Dan even
+# hears about it.
+STALE_THREAD_SLA_HOURS = int(os.environ.get("STALE_THREAD_SLA_HOURS", "2"))
 STALE_THREAD_CHECK_INTERVAL_SECONDS = int(os.environ.get("STALE_THREAD_CHECK_INTERVAL_SECONDS", str(30 * 60)))
 # LIVE SERVICE FAST WATCHDOG, added 5 Sep 2026. A real guest (Sophie, wanted a
 # table for 2 tonight) confirmed a time at 15:11 and got nothing back, no
@@ -514,12 +526,39 @@ def run_stale_thread_watchdog():
             elif sender in _stale_alerted_local:
                 continue
             channel_guess = "email" if sender.startswith("email:") else "whatsapp"
+            # FAST MOVING THREAD SIGNAL, added 01 Oct 2026 alongside the SLA
+            # drop above. A thread where the last few exchanges each got a
+            # reply within seconds or minutes, then suddenly nothing, reads
+            # very differently from a cold inquiry nobody has touched in a
+            # day, the guest was actively mid conversation and now sees
+            # silence right when they expect a confirmation. Cheap heuristic,
+            # look at the last 3 user turns and check whether each was
+            # answered inside 10 minutes, no business logic, just timing.
+            fast_moving = False
+            try:
+                user_turns = [i for i, h in enumerate(history) if h.get("role") == "user"]
+                recent = user_turns[-3:]
+                answered_fast = 0
+                for idx in recent[:-1]:  # exclude the final, still unanswered turn
+                    if idx + 1 < len(history) and history[idx + 1].get("role") == "assistant":
+                        gap = float(history[idx + 1].get("ts", 0)) - float(history[idx].get("ts", 0))
+                        if 0 < gap < 600:
+                            answered_fast += 1
+                fast_moving = len(recent) >= 2 and answered_fast >= len(recent) - 1
+            except Exception:
+                pass
+            urgency = (
+                "This thread was moving fast, each of the guest's last few messages got a reply "
+                "within minutes, then it just stopped, that pattern usually means something broke "
+                "mid conversation rather than a thread nobody got to yet, worth a look now. "
+                if fast_moving else ""
+            )
             alert_dan(
                 "a guest message has gone unanswered past the SLA, please check this thread yourself",
                 channel_guess, sender, last.get("content", ""),
-                f"No reply from us in about {age_h:.1f} hours. Could be a real bug, a handoff you "
-                f"have not gotten to yet, or a paused thread that slipped your mind, this needs your "
-                f"eyes regardless of which.",
+                f"{urgency}No reply from us in about {age_h:.1f} hours. Could be a real bug, a handoff "
+                f"you have not gotten to yet, or a paused thread that slipped your mind, this needs "
+                f"your eyes regardless of which.",
             )
             if _UPSTASH_ON:
                 _upstash("SET", "stale_alerted:" + sender, "1", "EX", 7 * 24 * 3600)
