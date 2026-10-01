@@ -3458,6 +3458,16 @@ def _with_ai_disclosure(sender: str, reply: str, lang: str = "de") -> str:
     lg = "en" if lang == "en" else "de"
     first = len(conv_history(sender)) <= 1
     intro = AI_DISCLOSE_TEXT[(lg, first)]
+    # Friendly first message, 01 Oct 2026 Dan: keep the name greeting. If the
+    # model opened with Hallo <Name>, reuse that name in the disclosure line.
+    if first:
+        m = re.match(r"^\s*(Hallo|Hi|Hey|Servus|Moin|Huhu|Hello)\s+([A-ZÄÖÜ][\w\-äöüßÄÖÜ]{1,24})\s*[,!.:]?\s*", reply)
+        if m and m.group(2).lower() not in ("zusammen", "ihr", "du", "there"):
+            word = "Hi" if lg == "en" else "Hallo"
+            intro = intro.replace("Hallo,", f"Hallo {m.group(2)},", 1).replace("Hi, I am", f"{word} {m.group(2)}, I am", 1)
+            rest = reply[m.end():].lstrip()
+            if rest:
+                reply = rest[0].upper() + rest[1:]
     try:
         if _bar_open_now():
             intro += AI_DISCLOSE_PHONE[lg]
@@ -3503,7 +3513,7 @@ def claude_decide(sender: str, text: str):
     if edc:
         system += "\n\n" + edc
     if not _ai_disclosed(sender):
-        system += "\n\nAI DISCLOSURE PENDING. A paragraph introducing you as the KI Concierge is automatically placed before your reply, so start directly with the content, no greeting, no self introduction."
+        system += "\n\nAI DISCLOSURE PENDING. A paragraph introducing you as the KI Concierge is automatically placed before your reply. If this is the first reply in the thread and you know the guest's name, open with a short greeting like Hallo Name, it is merged into the introduction. Otherwise start directly with the content. Never introduce yourself as the KI Concierge yourself."
     if lang == "en":
         system += (
             "\n\nLANGUAGE OVERRIDE for this reply. The guest is writing in ENGLISH. "
