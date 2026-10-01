@@ -763,11 +763,12 @@ def event_date_context(sender: str, text: str) -> str:
         other = (status["collision"].get("summary") or "").strip()
         return (
             f"EVENT DATUM CHECK fuer {date_iso}, verlass dich NUR hierauf, nicht auf eigene Vermutung "
-            f"oder auf das Beispiel weiter unten im Prompt. Fuer diesen Tag liegt bereits eine ANDERE "
-            f"offene Anfrage auf dem Kalender: \"{other}\". Sag dem Gast NIEMALS dass dieser Termin "
-            f"sicher frei ist und lege KEINEN event_hold fuer diesen Tag an. Sag stattdessen freundlich, "
-            f"dass du kurz intern pruefen musst ob es klappt, und rufe send_reply mit action handoff "
-            f"auf, reason klar benennen dass es bereits eine andere Anfrage fuer denselben Tag gibt."
+            f"oder auf das Beispiel weiter unten im Prompt. Fuer diesen Tag steht bereits etwas anderes "
+            f"im Kalender, bestaetigt oder noch offen: \"{other}\". Sag dem Gast NIEMALS dass dieser "
+            f"Termin sicher frei ist und lege KEINEN event_hold fuer diesen Tag an. Sag stattdessen "
+            f"freundlich, dass du kurz intern pruefen musst ob es klappt, und rufe send_reply mit "
+            f"action handoff auf, reason klar benennen dass fuer denselben Tag schon etwas anderes "
+            f"auf dem Kalender steht."
         )
     return f"EVENT DATUM CHECK fuer {date_iso}: nichts Widersprechendes im Kalender vermerkt, so weit unauffaellig."
 
@@ -1089,7 +1090,27 @@ def _event_date_status(svc, date_iso: str, exclude_sender: str = ""):
     only the bare digit strings the bot itself writes. Both fixed below.
     This also never checked for a plain closure event at all, there was no
     such concept anywhere in the code, that is new here. See
-    [[project_brunnenbar_cloud_concierge]]."""
+    [[project_brunnenbar_cloud_concierge]].
+
+    BUGFIX 25 Sep 2026, a real double booking, Rita Neumann (confirmed
+    30.01.2026, hinterer Bereich, 35 to 40 Personen, 10.10.2026) and Olivia
+    Wiecha (a bot created tentative hold, 16.09.2026, ca 25 Personen, same
+    10.10.2026) both sat on the calendar for the same night with nobody ever
+    told. Dan direct: "this literally cant happen... i know for fact that we
+    said that it needs to be checked if we have space or not. if not, we
+    would take endless bookings." He is right that the check exists, it was
+    just never wired in here. PRIVATE_SPACE_AUTOMATION (9 Sep 2026) already
+    has a correct, real availability checker for exactly this, find_private_space
+    and _private_space_events_on below, driven by _detect_space reading the
+    actual words Hinterer Bereich or ganze Bar out of an event's title and
+    description, confirmed or not, bot made or Dan's own manual entry. That
+    checker was built for the real create_private_space_reservation path and
+    was never once called from here, so this text check, matching only the
+    literal phrase "nicht bestaetigt", was structurally blind to any
+    confirmed booking, exactly like Rita's. Two entirely separate collision
+    domains existed side by side for over two weeks. Now this pulls in the
+    same real checker, so a hold or a guest facing availability claim can
+    never again ignore an already confirmed private space booking."""
     exclude_norm = _norm_phone(exclude_sender)
     out = {"closed": False, "closed_summary": "", "collision": None}
     try:
@@ -1107,14 +1128,92 @@ def _event_date_status(svc, date_iso: str, exclude_sender: str = ""):
                 out["closed_summary"] = (ev.get("summary") or "").strip()
                 continue
             if "nicht bestaetigt" not in blob and "nicht bestätigt" not in blob:
+                # Not another tentative hold by the old text check, but it
+                # could still be a real, confirmed private space booking,
+                # checked next below rather than skipped here.
                 continue
             phones = [_norm_phone(p) for p in re.findall(r"\+?\d[\d\s]{6,}\d", ev.get("description") or "")]
             if any(p and p != exclude_norm for p in phones) and not out["collision"]:
                 out["collision"] = ev
+        if not out["collision"] and not out["closed"]:
+            for space, s, e in _private_space_events_on(date_iso):
+                out["collision"] = {
+                    "summary": f"real {PRIVATE_SPACES[space]['label']} booking already on the calendar that day",
+                }
+                break
         return out
     except Exception as e:
         logger.warning("Event date status check failed for %s: %s", date_iso, e)
         return out
+
+
+def _date_claims(svc, date_iso: str, exclude_sender: str = ""):
+    """Every other guest's real claim on this date, a confirmed private space
+    booking or a tentative hold, sorted earliest created first. Added 01 Oct
+    2026 for the POLICY, FIRST HOLD OR CONFIRMATION WINS THE DATE rule, see
+    HANDOFF_STATE.md, Dan direct after Rita/Olivia (10.10.2026) and Dana/Jan
+    (21.11.2026) were both found double booked with nobody able to say at a
+    glance who actually asked first. Reuses the same two detectors as
+    _event_date_status, a tentative hold by the "nicht bestaetigt" text and a
+    real space booking by _detect_space, just keeps the creation timestamp,
+    name and party size this time instead of stopping at a yes/no. Best
+    effort, returns an empty list on any failure, this must never block a
+    reply or a booking."""
+    exclude_norm = _norm_phone(exclude_sender)
+    out = []
+    try:
+        lo = datetime.fromisoformat(date_iso).replace(tzinfo=BAR_TZ, hour=0, minute=0, second=0, microsecond=0)
+        hi = lo + timedelta(days=1)
+        items = svc.events().list(
+            calendarId=RESERVIERUNGEN_CALENDAR_ID,
+            timeMin=lo.isoformat(), timeMax=hi.isoformat(),
+            singleEvents=True,
+        ).execute().get("items", [])
+        for ev in items:
+            desc = ev.get("description") or ""
+            summary = ev.get("summary") or ""
+            blob = (summary + " " + desc).lower()
+            is_hold = "nicht bestaetigt" in blob or "nicht bestätigt" in blob
+            is_space = _detect_space(summary + " " + desc) is not None
+            if not (is_hold or is_space):
+                continue
+            phones = [_norm_phone(p) for p in re.findall(r"\+?\d[\d\s]{6,}\d", desc)]
+            if exclude_norm and exclude_norm in phones:
+                continue
+            name_m = re.search(r"Name:\s*(.+)", desc)
+            party_m = re.search(r"(?:Ungefaehre Personenzahl|Anzahl Personen):\s*(?:ca\.?\s*)?(\d+)", desc)
+            out.append({
+                "created": ev.get("created") or "",
+                "name": (name_m.group(1).strip() if name_m else summary.split(" - ")[0].strip()),
+                "party": int(party_m.group(1)) if party_m else 0,
+                "kind": "space" if is_space else "hold",
+                "summary": summary.strip(),
+            })
+        out.sort(key=lambda c: c["created"])
+        return out
+    except Exception as e:
+        logger.warning("_date_claims failed for %s: %s", date_iso, e)
+        return []
+
+
+def _priority_note(claims, new_name: str, new_party: int, new_created_iso: str = ""):
+    """Plain, house voice sentence on who the 01 Oct 2026 first-hold-or-
+    confirmation policy actually favors, for Dan to read straight inside an
+    alert and act on in one message, never auto-decided, only stated. Group
+    size only ever breaks a genuine same calendar day tie, per Dan direct:
+    "whoever has a tentative hold or a confirmation first, gets the
+    location. if two groups request at the same time, then we take the
+    larger group." Empty string if there is nothing to compare against."""
+    if not claims:
+        return ""
+    first = claims[0]
+    same_day = bool(new_created_iso) and first["created"][:10] == new_created_iso[:10]
+    if same_day and new_party > first["party"]:
+        return (f"Policy Hinweis: {first['name']} ({first['party']}pp) war zuerst auf dem Kalender, "
+                f"aber beide Anfragen kamen am selben Tag rein und {new_name} ist mit {new_party}pp "
+                f"die groessere Gruppe, laut der Regel waere das ein Gleichstand zugunsten {new_name}.")
+    return (f"Policy Hinweis: {first['name']} ({first['party']}pp) war zuerst auf dem Kalender, "
+            f"das Datum gehoert nach der Regel ihnen, nicht {new_name}.")
 
 
 def upsert_pending_hold(sender: str, name: str, party: int, date_iso: str, occasion: str = "", time_str: str = ""):
@@ -1200,12 +1299,14 @@ def upsert_pending_hold(sender: str, name: str, party: int, date_iso: str, occas
             )
         elif status["collision"]:
             collision = status["collision"]
+            claims = _date_claims(svc, date_iso, sender)
+            prio = _priority_note(claims, name, party, datetime.now(BAR_TZ).isoformat())
             alert_dan(
-                "two event inquiries for the same date, decide who gets it",
+                "new event inquiry collides with something already on the calendar, decide who gets it",
                 "whatsapp", sender,
-                f"New inquiry from {sender} for {date_iso}, but this date already has a tentative "
-                f"hold: \"{collision.get('summary', '')}\". Worth reaching out to the first guest to "
-                f"ask if they have decided before this one goes further.",
+                f"New inquiry from {sender} for {date_iso}, but this date already has \"{collision.get('summary', '')}\" "
+                f"on the calendar, confirmed or tentative. Worth deciding who actually gets the date "
+                f"before this one goes any further." + (f" {prio}" if prio else ""),
             )
         ev = svc.events().insert(calendarId=RESERVIERUNGEN_CALENDAR_ID, body=body).execute()
         _pending_hold_set(sender, {"event_id": ev.get("id"), "date": date_iso, "ts": now, "nudged_at": None, "escalated": False})
@@ -1245,7 +1346,21 @@ def run_pending_hold_followups():
     once if their tentative hold has gone quiet, then alerts Dan once if that
     nudge also goes unanswered, so a date is never just sat on forever for a
     guest who went silent. Respects SKIP_SENDERS and is_human_active exactly
-    like every other outbound message in this file."""
+    like every other outbound message in this file.
+
+    HARDENED 01 Oct 2026. Found while checking why Jan's hold (21.11.2026,
+    created 24 Sep) had sat 7 days past the 48 hour chase window with no
+    nudge ever reaching him, is_human_active should have cleared within 24h
+    of Dan's last reply so this should have fired days earlier. Could not
+    pin the exact cause without production logs or Upstash access, this
+    session has neither, so two defenses were added instead of one guess.
+    One, a failed send_whatsapp on a nudge now alerts Dan immediately
+    instead of only a backend log line nobody reads, so a send failure is
+    never silent again. Two, a hard backstop, if a hold is still completely
+    unnudged after 3x PENDING_HOLD_CHASE_AFTER_HOURS, whatever the reason,
+    Dan gets alerted directly that the automatic nudge path looks stuck for
+    this one, rather than it sitting forever. Neither explains Jan's case
+    retroactively, that needs real log access, see HANDOFF_STATE.md."""
     now = time.time()
     for sender in _pending_hold_all_senders():
         try:
@@ -1253,6 +1368,25 @@ def run_pending_hold_followups():
             if not record:
                 continue
             age_h = (now - float(record.get("ts", now))) / 3600
+            if (not record.get("nudged_at") and not record.get("stuck_alerted")
+                    and age_h >= PENDING_HOLD_CHASE_AFTER_HOURS * 3):
+                # Backstop, checked before the skip/human-active gate below on
+                # purpose. Whatever stopped the normal nudge from ever firing
+                # or recording a result, including is_human_active staying
+                # true far longer than expected, this guest has now gone
+                # three times the normal chase window with nothing, Dan needs
+                # to know regardless of the reason, see the 01 Oct 2026
+                # hardening note on this function.
+                alert_dan(
+                    "tentative hold never got its automatic follow up, needs a manual look",
+                    "whatsapp", sender,
+                    f"Date {record.get('date')}, this hold is {age_h / 24:.1f} days old and the "
+                    f"automatic reminder never went out at all, well past when it should have. "
+                    f"Worth reaching out yourself and worth flagging to Claude to dig into why.",
+                )
+                record["stuck_alerted"] = True
+                _pending_hold_set(sender, record)
+                continue
             if sender in SKIP_SENDERS or is_human_active(sender):
                 continue
             if not record.get("nudged_at") and age_h >= PENDING_HOLD_CHASE_AFTER_HOURS:
@@ -1262,6 +1396,17 @@ def run_pending_hold_followups():
                     record["nudged_at"] = now
                     _pending_hold_set(sender, record)
                     logger.info("Pending hold nudge sent to %s", sender)
+                elif not record.get("nudge_failed_alerted"):
+                    # The send itself failed, not silently this time, see the
+                    # 01 Oct 2026 hardening note on this function.
+                    alert_dan(
+                        "automatic follow up to a tentative hold failed to send",
+                        "whatsapp", sender,
+                        f"Date {record.get('date')}, the scheduled reminder to this guest about their "
+                        f"hold could not actually be sent, worth checking yourself.",
+                    )
+                    record["nudge_failed_alerted"] = True
+                    _pending_hold_set(sender, record)
                 continue
             nudged_at = record.get("nudged_at")
             if nudged_at and not record.get("escalated"):
@@ -1878,8 +2023,14 @@ def process_booking(sender: str, data: dict, lang: str = "de", channel: str = "w
                 return _handoff_line(sie, lang)
             if not free:
                 logger.info("no free %s for %s %s party %s", space, date_iso, hhmm, party)
+                try:
+                    claims = _date_claims(_calendar_service(), date_iso, sender)
+                    prio = _priority_note(claims, name, party, datetime.now(BAR_TZ).isoformat())
+                except Exception as e:
+                    logger.warning("priority note failed for %s: %s", date_iso, e)
+                    prio = ""
                 alert_dan(f"{space_label} is not available at the requested time or party is over its capacity, "
-                          "guest needs a manual answer", channel, sender, what)
+                          "guest needs a manual answer" + (f". {prio}" if prio else ""), channel, sender, what)
                 return _full_line(sie, lang)
             try:
                 create_private_space_reservation(name, sender, party, space, start_dt, occasion, lang)
