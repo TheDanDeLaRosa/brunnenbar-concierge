@@ -3327,6 +3327,7 @@ def subscribe_messenger_route():
 
 @app.on_event("startup")
 def _startup_subscribe():
+    threading.Thread(target=resume_pending_replies, daemon=True).start()
     logger.info("Startup: subscribing app to WhatsApp Business Account %s", WHATSAPP_BUSINESS_ACCOUNT_ID or "(not set)")
     subscribe_waba()
     if MESSENGER_PAGE_ID and MESSENGER_TOKEN:
@@ -3546,43 +3547,123 @@ async def messenger_receive(request: Request):
     return {"received": True}
 
 
-def handle_later(channel: str, sender: str, text: str, mid: str = None, first_message: bool = False):
+# DURABLE PENDING REPLIES, added 01 Oct 2026. Root cause of guest messages going
+# unanswered right after a deploy: handle_later sleeps in a daemon thread, a
+# Railway restart kills that thread, Meta already got its 200 so it never
+# retries, and nothing re answered the guest. Six deploys in 90 minutes on
+# 01 Oct made it visible. Now every scheduled reply is also written to Upstash
+# with its due time, cleared after the reply went out or was deliberately
+# skipped, and replayed on startup so a restart only delays an answer.
+_pending_local = {}
+
+
+def _pending_reply_set(sender: str, rec: dict):
+    if _UPSTASH_ON:
+        _upstash("SET", "pending_reply:" + sender, json.dumps(rec), "EX", 6 * 3600)
+        _upstash("SADD", "pending_reply_senders", sender)
+    else:
+        _pending_local[sender] = rec
+
+
+def _pending_reply_get(sender: str):
+    if _UPSTASH_ON:
+        raw = _upstash("GET", "pending_reply:" + sender)
+        try:
+            return json.loads(raw) if raw else None
+        except Exception:
+            return None
+    return _pending_local.get(sender)
+
+
+def _pending_reply_clear(sender: str, mid=None):
+    """Only clears if the stored record is for this message, so an older thread
+    cannot erase a newer pending reply."""
+    try:
+        rec = _pending_reply_get(sender)
+        if rec and mid is not None and rec.get("mid") not in (None, mid):
+            return
+        if _UPSTASH_ON:
+            _upstash("DEL", "pending_reply:" + sender)
+            _upstash("SREM", "pending_reply_senders", sender)
+        else:
+            _pending_local.pop(sender, None)
+    except Exception as e:
+        logger.warning("pending reply clear failed for %s: %s", sender, e)
+
+
+def resume_pending_replies():
+    """Startup replay of replies that were still waiting when the process died."""
+    try:
+        senders = (_upstash("SMEMBERS", "pending_reply_senders") or []) if _UPSTASH_ON else list(_pending_local)
+    except Exception as e:
+        logger.error("resume_pending_replies failed to read: %s", e)
+        return
+    for sender in senders:
+        rec = _pending_reply_get(sender)
+        if not rec:
+            _pending_reply_clear(sender)
+            continue
+        try:
+            hist = conv_history(sender)
+            if not hist or hist[-1].get("role") != "user":
+                _pending_reply_clear(sender)  # already answered by the bot or by Dan
+                continue
+            _last_msg[sender] = rec.get("mid")
+            logger.info("Resuming pending %s reply to %s after restart", rec.get("channel"), sender)
+            threading.Thread(target=handle_later, args=(rec["channel"], sender, rec["text"], rec.get("mid"),
+                                                       rec.get("first_message", False), rec.get("due_ts")), daemon=True).start()
+        except Exception as e:
+            logger.error("resume of pending reply for %s failed: %s", sender, e)
+
+
+def handle_later(channel: str, sender: str, text: str, mid: str = None, first_message: bool = False, resume_due=None):
     """Wait a random human feeling pause, then draft and send. Runs in its own
     thread so the webhook can return 200 to Meta straight away. If a newer
     message from the same sender arrived meanwhile, this older one steps aside
     so the newest turn answers with the full context.
 
-    CHANGED 19 Sep 2026, Dan directly, after a real guest (Isabella Koenig)
-    got the bot's very first reply to a brand new inquiry before he had any
-    real chance to step in personally, "so that i have time to answer if
-    needed." The very first message the bot would ever send a given sender
-    now waits FIRST_MESSAGE_DELAY_MIN to FIRST_MESSAGE_DELAY_MAX seconds (10+
-    minutes by default) instead of the normal short REPLY_DELAY window. Every
-    later reply in the same thread still uses the normal window, this is only
-    about giving Dan a real window to jump in on something brand new."""
-    if first_message:
-        lo, hi = sorted((FIRST_MESSAGE_DELAY_MIN, FIRST_MESSAGE_DELAY_MAX))
+    CHANGED 19 Sep 2026, Dan directly, the very first message the bot would
+    ever send a given sender waits FIRST_MESSAGE_DELAY_MIN to MAX seconds (10+
+    minutes by default) instead of the normal short window, so Dan has a real
+    chance to step in on something brand new. CHANGED 01 Oct 2026, the wait is
+    persisted, see the DURABLE PENDING REPLIES comment above, resume_due is the
+    original due timestamp when a restart replays this reply."""
+    if resume_due is not None:
+        delay = max(0.0, float(resume_due) - time.time()) + random.uniform(5, 40)
     else:
-        lo, hi = sorted((REPLY_DELAY_MIN, REPLY_DELAY_MAX))
-    delay = random.uniform(lo, hi)
+        if first_message:
+            lo, hi = sorted((FIRST_MESSAGE_DELAY_MIN, FIRST_MESSAGE_DELAY_MAX))
+        else:
+            lo, hi = sorted((REPLY_DELAY_MIN, REPLY_DELAY_MAX))
+        delay = random.uniform(lo, hi)
+        try:
+            _pending_reply_set(sender, {"channel": channel, "text": text, "mid": mid,
+                                        "first_message": first_message, "due_ts": time.time() + delay})
+        except Exception as e:
+            logger.warning("pending reply persist failed for %s: %s", sender, e)
     logger.info("%s reply to %s scheduled in %.0f s%s", channel, sender, delay,
                 " (first message)" if first_message else "")
     time.sleep(delay)
     if mid is not None and _last_msg.get(sender) != mid:
         logger.info("newer message from %s arrived, skipping older scheduled reply", sender)
         return
-    # Re-check here, not just at webhook intake, added 5 Sep 2026. is_human_active
-    # was true at intake time but the whole point of this function is a
-    # deliberate 35-110s delay before answering, and Dan can reply by hand
-    # to the guest at any point during that window. Without this second
-    # check the bot could still fire after Dan already handled it live,
-    # which is exactly what happened to a guest named Ben Rieger on 4 Sep
-    # 2026. See [[project_brunnenbar_cloud_concierge]].
+    # Re-check here, not just at webhook intake, added 5 Sep 2026, Dan can
+    # reply by hand during the delay window.
     if is_human_active(sender):
         logger.info("%s sender %s went human active during the reply delay, skipping scheduled reply", channel, sender)
+        _pending_reply_clear(sender, mid)
         return
-    handle(channel, sender, text)
-
+    try:
+        hist = conv_history(sender)
+        if hist and hist[-1].get("role") != "user":
+            logger.info("%s thread %s already answered meanwhile, skipping scheduled reply", channel, sender)
+            return
+    except Exception:
+        pass
+    try:
+        handle(channel, sender, text)
+    finally:
+        _pending_reply_clear(sender, mid)
 
 def handle(channel: str, sender: str, text: str):
     action, value, lang = claude_decide(sender, text)
