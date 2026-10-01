@@ -79,6 +79,17 @@ INSTAGRAM_ACCOUNT_ID = os.environ.get("INSTAGRAM_ACCOUNT_ID", "")
 MESSENGER_PAGE_ID = os.environ.get("MESSENGER_PAGE_ID", "")
 MESSENGER_TOKEN = os.environ.get("MESSENGER_TOKEN", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+# CONCIERGE_MODEL, bumped 01 Oct 2026, Dan direct, from claude-sonnet-4-5 to
+# claude-sonnet-5-5. Pricing stayed flat when 5.5 shipped (2 dollars input,
+# 10 output per million tokens, same tier as before) so this is a capability
+# upgrade at no real cost increase for this bot's volume, not a tradeoff.
+# Reasoning behind the pick, see HANDOFF_STATE.md, "MODEL BUMP" entry, 01 Oct
+# 2026, the bot stays on Sonnet rather than Opus, each turn here is a single
+# structured tool call against a long rulebook, not open ended multi step
+# reasoning, so Opus's premium buys capability this bot does not need. Set
+# via env var so a future bump is a Railway variable change, not a code
+# change and redeploy.
+CONCIERGE_MODEL = os.environ.get("CONCIERGE_MODEL", "claude-sonnet-5-5")
 GRAPH_VERSION = os.environ.get("GRAPH_VERSION", "v20.0")
 AUTO_ACK = os.environ.get("AUTO_ACK", "true").lower() == "true"
 
@@ -2870,6 +2881,7 @@ def debug():
         "LEARNINGS_loaded": bool(LEARNINGS_TEXT),
         "LEARNINGS_chars": len(LEARNINGS_TEXT),
         "ANTHROPIC_API_KEY": bool(ANTHROPIC_API_KEY),
+        "CONCIERGE_MODEL": CONCIERGE_MODEL,
         "GRAPH_VERSION": GRAPH_VERSION,
         "AUTO_ACK": AUTO_ACK,
         "DUALHOOK_API_KEY": bool(DUALHOOK_API_KEY),
@@ -3445,7 +3457,7 @@ def claude_decide(sender: str, text: str):
                 "content-type": "application/json",
             },
             json={
-                "model": "claude-sonnet-4-5",
+                "model": CONCIERGE_MODEL,
                 "max_tokens": 500,
                 "system": system,
                 "tools": [BOOK_TOOL, SEND_REPLY_TOOL],
