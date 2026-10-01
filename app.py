@@ -2047,7 +2047,7 @@ def post_visit_checkin_loop():
 # removing VORGEMERKT from the calendar title.
 DEPOSIT_FLOW_ENABLED = os.environ.get("DEPOSIT_FLOW_ENABLED", "false").lower() == "true"
 BANK_HOLDER = os.environ.get("BANK_HOLDER", "")
-BANK_IBAN = os.environ.get("BANK_IBAN", "")
+BANK_IBAN = os.environ.get("BANK_IBAN") or os.environ.get("Bank_IBAN", "")  # Railway var was created as Bank_IBAN, accept both
 BANK_BIC = os.environ.get("BANK_BIC", "")
 BANK_NAME = os.environ.get("BANK_NAME", "")
 AGB_URL = os.environ.get("AGB_URL", "brunnenbar.com/AGB")
