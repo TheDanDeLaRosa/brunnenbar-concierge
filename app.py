@@ -91,6 +91,8 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 # change and redeploy.
 CONCIERGE_MODEL = os.environ.get("CONCIERGE_MODEL", "claude-sonnet-5-5")
 CONCIERGE_FALLBACK_MODEL = os.environ.get("CONCIERGE_FALLBACK_MODEL", "claude-sonnet-4-5")
+# Live diagnostics for /debug, no secrets, added 01 Oct 2026 so an Anthropic failure can be read without Railway logs.
+_API_DIAG = {"ok": 0, "fail": 0, "last_ok_model": "", "last_ok_ts": 0, "last_error": "", "last_error_ts": 0}
 GRAPH_VERSION = os.environ.get("GRAPH_VERSION", "v20.0")
 AUTO_ACK = os.environ.get("AUTO_ACK", "true").lower() == "true"
 
@@ -3158,6 +3160,7 @@ def debug():
         "LEARNINGS_chars": len(LEARNINGS_TEXT),
         "ANTHROPIC_API_KEY": bool(ANTHROPIC_API_KEY),
         "CONCIERGE_MODEL": CONCIERGE_MODEL,
+        "API_DIAG": dict(_API_DIAG),
         "DEPOSIT_FLOW_ENABLED": DEPOSIT_FLOW_ENABLED,
         "DEPOSIT_FLOW_ACTIVE": _deposit_active(),
         "BANK_CONFIGURED": bool(BANK_HOLDER and BANK_IBAN),
@@ -3927,9 +3930,20 @@ def claude_decide(sender: str, text: str):
             if r.status_code == 400:
                 logger.error("Anthropic 400 for model %s with %d send_reply fields, body: %s, trying next fallback",
                              _model, len(_tools[1].get("input_schema", {}).get("properties", {})), r.text[:600])
+                _API_DIAG["last_error"] = f"400 model={_model} fields={len(_tools[1].get('input_schema', {}).get('properties', {}))} body={r.text[:400]}"
+                _API_DIAG["last_error_ts"] = time.time()
                 continue
+            _API_DIAG["last_ok_model"] = _model if r.status_code < 400 else _API_DIAG["last_ok_model"]
             break
-        r.raise_for_status()
+        try:
+            r.raise_for_status()
+            _API_DIAG["ok"] += 1
+            _API_DIAG["last_ok_ts"] = time.time()
+        except Exception:
+            _API_DIAG["fail"] += 1
+            _API_DIAG["last_error"] = f"{r.status_code} body={r.text[:400]}"
+            _API_DIAG["last_error_ts"] = time.time()
+            raise
         parts = r.json().get("content", [])
         for p in parts:
             if p.get("type") != "tool_use":
