@@ -93,6 +93,68 @@ CONCIERGE_MODEL = os.environ.get("CONCIERGE_MODEL", "claude-sonnet-5-5")
 CONCIERGE_FALLBACK_MODEL = os.environ.get("CONCIERGE_FALLBACK_MODEL", "claude-sonnet-4-5")
 # Live diagnostics for /debug, no secrets, added 01 Oct 2026 so an Anthropic failure can be read without Railway logs.
 _API_DIAG = {"ok": 0, "fail": 0, "last_ok_model": "", "last_ok_ts": 0, "last_error": "", "last_error_ts": 0}
+
+# FORCED TOOL USE CAPABILITY, added 02 Oct 2026. Root cause of the 01 and 02 Oct
+# silence: claude-sonnet-5-5 answers HTTP 400 "tool_choice: type tool and any are
+# not supported for this model", because per the Anthropic docs (define-tools,
+# "Forcing tool use") Opus 5.5, Sonnet 5.5, Fable 5.1 and Mythos 5.1 reject
+# forced tool use regardless of thinking settings. The bot forced a tool call on
+# every turn, so every call to those models failed. Now the code never assumes a
+# model supports it: known models are listed here, any other model is probed and
+# the result remembered (Redis plus memory), and without forcing we use auto plus
+# a strict system instruction and one corrective retry, so the reply still always
+# comes from a schema validated tool call and never from free text.
+_NO_FORCED_TOOL_RE = re.compile(r"^claude-(opus|sonnet)-5-5|^claude-(fable|mythos)-5-1")
+_no_force_local = set()
+_TOOL_ONLY_SUFFIX = (
+    "\n\nOUTPUT RULE. Answer ONLY by calling exactly one tool, send_reply or book_table. "
+    "Never write the guest reply as plain text. Any text outside a tool call is discarded."
+)
+_TOOL_RETRY_SUFFIX = (
+    "\n\nYour previous attempt did not call a tool and was discarded. Call send_reply now "
+    "(or book_table if all booking details are complete). Do not write anything outside the tool call."
+)
+
+
+def _model_allows_forced_tool(model: str) -> bool:
+    if _NO_FORCED_TOOL_RE.match(model or ""):
+        return False
+    if model in _no_force_local:
+        return False
+    try:
+        if _UPSTASH_ON and _upstash("GET", "no_force_tool:" + model):
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def _mark_model_no_forced_tool(model: str):
+    _no_force_local.add(model)
+    try:
+        if _UPSTASH_ON:
+            _upstash("SET", "no_force_tool:" + model, "1", "EX", 30 * 24 * 3600)
+    except Exception:
+        pass
+
+
+_last_model_degraded_alert = {"ts": 0.0}
+
+
+def _alert_model_degraded(primary: str, used: str, why: str):
+    """WhatsApp Dan once per 6 hours when the primary model could not answer and a
+    fallback did, so a silent degradation can never run for days again."""
+    now = time.time()
+    if now - _last_model_degraded_alert["ts"] < 6 * 3600:
+        return
+    _last_model_degraded_alert["ts"] = now
+    try:
+        if DAN_ALERT_WHATSAPP:
+            send_whatsapp(DAN_ALERT_WHATSAPP,
+                          f"Concierge Hinweis: das Hauptmodell {primary} hat nicht geklappt ({why[:160]}). "
+                          f"Antworten laufen gerade ueber {used}. Gaeste werden weiter bedient, bitte bei Gelegenheit melden.")
+    except Exception as e:
+        logger.error("model degraded alert failed: %s", e)
 GRAPH_VERSION = os.environ.get("GRAPH_VERSION", "v20.0")
 AUTO_ACK = os.environ.get("AUTO_ACK", "true").lower() == "true"
 
@@ -3139,6 +3201,42 @@ def oauth_calendar_start():
     return RedirectResponse("https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params))
 
 
+_selftest_last = {"ts": 0.0}
+
+
+@app.get("/selftest")
+def selftest():
+    """Live canary, added 02 Oct 2026. Runs the real model call path (ladder,
+    forced tool capability handling, schema) against a few canned guest
+    messages and reports which model answered and whether each returned a valid
+    decision. No guest is contacted and nothing is booked, the sender is a
+    throwaway id. Rate limited to one run per 60 seconds so it cannot be abused
+    to burn API credit. Open it in a browser after any model or prompt change."""
+    now = time.time()
+    if now - _selftest_last["ts"] < 60:
+        return {"error": "rate limited, try again in a minute"}
+    _selftest_last["ts"] = now
+    cases = [
+        "Hallo, habt ihr heute Abend geoeffnet?",
+        "Hi, can I reserve a table for 2 on Friday around 9pm inside?",
+        "Wir waeren 14 Leute fuer einen Geburtstag, wie laeuft das bei euch?",
+        "Danke dir, bis dann!",
+    ]
+    out = []
+    for i, t in enumerate(cases):
+        started = time.time()
+        try:
+            action, value, lang = claude_decide("selftest:%d" % i, t)
+            out.append({"case": t, "action": action, "ok": action != "none",
+                        "seconds": round(time.time() - started, 1),
+                        "preview": (value if isinstance(value, str) else str(value))[:120]})
+        except Exception as e:
+            out.append({"case": t, "action": "exception", "ok": False, "error": str(e)[:200]})
+    return {"all_ok": all(o["ok"] for o in out), "model": CONCIERGE_MODEL,
+            "forced_tool_ok": _model_allows_forced_tool(CONCIERGE_MODEL),
+            "API_DIAG": dict(_API_DIAG), "results": out}
+
+
 @app.get("/debug")
 def debug():
     """Which config is present, booleans only, never the values. Safe to open in a browser."""
@@ -3160,6 +3258,7 @@ def debug():
         "LEARNINGS_chars": len(LEARNINGS_TEXT),
         "ANTHROPIC_API_KEY": bool(ANTHROPIC_API_KEY),
         "CONCIERGE_MODEL": CONCIERGE_MODEL,
+        "CONCIERGE_MODEL_FORCED_TOOL": _model_allows_forced_tool(CONCIERGE_MODEL),
         "API_DIAG": dict(_API_DIAG),
         "DEPOSIT_FLOW_ENABLED": DEPOSIT_FLOW_ENABLED,
         "DEPOSIT_FLOW_ACTIVE": _deposit_active(),
@@ -3845,8 +3944,10 @@ def claude_decide(sender: str, text: str):
     with value the message string), or 'none' on any failure including the
     model not calling a tool at all.
 
-    Both book_table and send_reply are offered with tool_choice any, forcing
-    the model to call one of them on every turn rather than ever answering
+    Both book_table and send_reply are offered and the model must call one of
+    them on every turn (tool_choice any where the model supports it, auto plus a
+    strict output rule and a corrective retry where it does not, see
+    _model_allows_forced_tool) rather than ever answering
     with plain free text. This exists because plain text answers proved
     unsafe twice in one real session, once the model wrote out its own
     classification reasoning ending in a real marker word, once with no
@@ -3905,36 +4006,63 @@ def claude_decide(sender: str, text: str):
                    (CONCIERGE_FALLBACK_MODEL, [BOOK_TOOL, _send_slim])]
         r = None
         _seen = set()
+        _degraded_why = ""
         for _model, _tools in _ladder:
             _key = (_model, len(_tools[1].get("input_schema", {}).get("properties", {})))
             if _key in _seen:
                 continue
             _seen.add(_key)
-            r = httpx.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": ANTHROPIC_API_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": _model,
-                    "max_tokens": 500,
-                    "system": system,
-                    "tools": _tools,
-                    "tool_choice": {"type": "any"},
-                    "messages": messages,
-                },
-                timeout=30,
-            )
-            if r.status_code == 400:
-                logger.error("Anthropic 400 for model %s with %d send_reply fields, body: %s, trying next fallback",
-                             _model, len(_tools[1].get("input_schema", {}).get("properties", {})), r.text[:600])
-                _API_DIAG["last_error"] = f"400 model={_model} fields={len(_tools[1].get('input_schema', {}).get('properties', {}))} body={r.text[:400]}"
-                _API_DIAG["last_error_ts"] = time.time()
-                continue
-            _API_DIAG["last_ok_model"] = _model if r.status_code < 400 else _API_DIAG["last_ok_model"]
-            break
+            _got_tool = False
+            _attempt = 0
+            _force = _model_allows_forced_tool(_model)
+            while _attempt < 3:
+                _attempt += 1
+                _sys = system if _force else system + _TOOL_ONLY_SUFFIX + (_TOOL_RETRY_SUFFIX if _attempt > 1 else "")
+                r = httpx.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key": ANTHROPIC_API_KEY,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                    json={
+                        "model": _model,
+                        "max_tokens": 1500,
+                        "system": _sys,
+                        "tools": _tools,
+                        "tool_choice": {"type": "any"} if _force else {"type": "auto"},
+                        "messages": messages,
+                    },
+                    timeout=45,
+                )
+                if r.status_code == 400:
+                    if _force and "tool_choice" in r.text:
+                        # this model does not allow forced tool use, remember it and retry right away with auto
+                        logger.warning("Model %s rejects forced tool use, switching to auto and remembering it", _model)
+                        _mark_model_no_forced_tool(_model)
+                        _force = False
+                        _attempt -= 1
+                        continue
+                    logger.error("Anthropic 400 for model %s with %d send_reply fields, body: %s, trying next fallback",
+                                 _model, len(_tools[1].get("input_schema", {}).get("properties", {})), r.text[:600])
+                    _API_DIAG["last_error"] = f"400 model={_model} fields={len(_tools[1].get('input_schema', {}).get('properties', {}))} body={r.text[:400]}"
+                    _API_DIAG["last_error_ts"] = time.time()
+                    _degraded_why = _degraded_why or f"400 {r.text[:120]}"
+                    break
+                if r.status_code >= 400:
+                    break  # 429, 5xx and so on, let raise_for_status below report it
+                if any(p_.get("type") == "tool_use" for p_ in (r.json().get("content") or [])):
+                    _got_tool = True
+                    _API_DIAG["last_ok_model"] = _model
+                    break
+                logger.warning("Model %s returned no tool call on attempt %d (force=%s), retrying", _model, _attempt, _force)
+                _degraded_why = _degraded_why or "no tool call returned"
+                if _force:
+                    break  # forced mode cannot produce this, do not loop
+            if _got_tool:
+                if _model != CONCIERGE_MODEL and _degraded_why:
+                    _alert_model_degraded(CONCIERGE_MODEL, _model, _degraded_why)
+                break
         try:
             r.raise_for_status()
             _API_DIAG["ok"] += 1
