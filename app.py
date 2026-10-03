@@ -3518,6 +3518,15 @@ async def whatsapp_receive(request: Request):
                     continue
                 sender = msg.get("from")
                 text = (msg.get("text") or {}).get("body", "")
+                # TEAM GROUP GUARD, added 03 Oct 2026, Dan direct: "it shouldnt be sending
+                # things that i dont approve to the team." Because the number runs in
+                # coexistence mode, every group it belongs to (Brunnenbar Team) mirrors into
+                # this webhook looking like a 1:1 guest DM, and the bot auto replied into the
+                # group in guest voice. Group traffic is never guest traffic. Log only, never
+                # reply, never alert Dan.
+                if _is_group_message(msg, sender):
+                    logger.info("WhatsApp GROUP message from %s, logged only, bot never replies in groups", sender)
+                    continue
                 logger.info("WhatsApp in from %s: %s", sender, text[:120])
                 conv_append(sender, "user", text)
                 first_message = len(conv_history(sender)) <= 1
@@ -4231,10 +4240,40 @@ def claude_decide(sender: str, text: str):
         return ("none", "", lang)
 
 
+TEAM_GROUP_IDS = {
+    s.strip() for s in os.environ.get("TEAM_GROUP_IDS", "").split(",") if s.strip()
+}
+
+
+def _looks_like_group_target(to) -> bool:
+    """True for anything that is not a plain digits only phone number, or that is a
+    configured team group id. Group JIDs look like 120363...@g.us or carry a dash."""
+    t = str(to or "").strip()
+    if not t:
+        return True
+    if t in TEAM_GROUP_IDS:
+        return True
+    return ("@g.us" in t) or ("-" in t) or (not t.isdigit())
+
+
+def _is_group_message(msg: dict, sender) -> bool:
+    """True when an inbound WhatsApp webhook message came from a group chat."""
+    if msg.get("group_id") or msg.get("group") or msg.get("recipient_type") == "group":
+        return True
+    ctx = msg.get("context") or {}
+    if isinstance(ctx, dict) and (ctx.get("group_id") or ctx.get("group")):
+        return True
+    return _looks_like_group_target(sender)
+
+
 def send_whatsapp(to: str, text: str) -> bool:
     """Send one WhatsApp message. Returns True only on a confirmed send, so
     callers like alert_dan know whether they need a fallback path rather than
     just hoping the log line was enough."""
+    # Last line of defence, 03 Oct 2026: never send to a group, whatever called us.
+    if _looks_like_group_target(to):
+        logger.error("BLOCKED WhatsApp send to group style target %s, bot never posts in groups", to)
+        return False
     if DUALHOOK_API_KEY:
         url = DUALHOOK_BASE_URL + "/" + WHATSAPP_PHONE_NUMBER_ID + "/messages"
         headers = {"Authorization": "Bearer " + DUALHOOK_API_KEY}
