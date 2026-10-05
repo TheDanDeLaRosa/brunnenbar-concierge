@@ -3602,11 +3602,20 @@ async def whatsapp_receive(request: Request):
                 mid = em.get("id")
                 if not mid or _already_handled(mid):
                     continue
-                if em.get("type") != "text":
+                etype = em.get("type")
+                if etype in ("revoke", "edit"):
+                    continue  # a deleted or edited message is not new human activity
+                # The customer number in "to" can carry a leading plus (Meta's example shows
+                # +16505551234), inbound guest messages are digits only, so normalize or the
+                # echo lands in a different conversation than the guest's own thread.
+                recipient = _norm_phone(em.get("to") or echo.get("recipient_id") or echo.get("to") or "")
+                if not recipient:
                     continue
-                recipient = em.get("to") or echo.get("recipient_id") or echo.get("to")
-                text = (em.get("text") or {}).get("body", "")
-                if not recipient or not text:
+                if etype == "text":
+                    text = (em.get("text") or {}).get("body", "")
+                else:
+                    text = "[Dan oder das Team hat einen Anhang gesendet, " + str(etype) + "]"
+                if not text:
                     continue
                 logger.info("WhatsApp echo (manual reply) to %s: %s", recipient, text[:120])
                 conv_append(recipient, "assistant", text)
