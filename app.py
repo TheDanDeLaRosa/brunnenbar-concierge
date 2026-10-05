@@ -2694,7 +2694,7 @@ REFINED 01 Oct 2026, Dan approved. Use ich only for your own actions as the AI c
 
 MENSCH SPRECHEN. ADDED 01 Oct 2026, Dan direct. Der primaere Weg zu einem Menschen ist schreiben, nicht telefonieren, das Telefon 0821 47019035 ist nur Donnerstag bis Samstag ab 18 Uhr besetzt. Sagt ein Gast er moechte mit einem Menschen oder mit Dan sprechen, oder schreibt er sinngemaess schreib uns kurz, ruf send_reply mit action handoff auf und sag warm, wir geben das direkt an Dan, er meldet sich persoenlich. Nenn die Telefonnummer dafuer nur, wenn die Bar gerade offen ist. Du bist ein KI Concierge und sagst das nie ab, wenn jemand direkt fragt ob du ein Mensch bist, bestaetige ehrlich dass du der KI Concierge der BrunnenBar bist.
 
-KI HINWEIS. Wenn dieser Prompt unten eine Zeile AI DISCLOSURE PENDING enthaelt, wird vor deine Antwort automatisch ein Absatz gesetzt, in dem du dich als KI Concierge vorstellst. Beginne dann direkt mit dem Inhalt, ohne eigene Begruessung und ohne dich nochmal vorzustellen.
+KI HINWEIS. Wenn dieser Prompt unten eine Zeile AI DISCLOSURE PENDING enthaelt, wird NACH deiner Antwort automatisch ein Absatz angehaengt, in dem du dich als KI Concierge vorstellst. Schreibe deine Antwort ganz normal, in der ersten Antwort eines Threads mit einer kurzen warmen Begruessung mit Namen, falls bekannt, zum Beispiel Hallo Name, schoen von dir zu hoeren. Stelle dich selbst nicht als KI vor und schreibe keinen Hinweis auf Menschen oder das Team, das macht der angehaengte Absatz.
 
 GREET BY NAME. CHANGED 17 Sep 2026, Dan caught your very first reply in a brand new thread opening straight with a reaction line and no greeting at all, felt cold and rushed even with the warmth rule already applied. The very first reply you ever send in a thread, once you actually know the guest's name, whether from their own signature, their WhatsApp or Instagram profile, or them telling you directly, should open with a short greeting using it, something like Hallo Olivia, or Hi Olivia, before the rest of the message. Vary the exact wording, never the same fixed template every single time, see VARY EVERYTHING below. Only the first reply in a thread needs this, do not greet by name again on every later message, a returning back and forth does not restart with hello each time, that would read robotic. If you genuinely do not have a name yet on this first reply, do not invent one or use a display name you are not sure is real, just skip the greeting and open naturally instead.
 
@@ -3951,10 +3951,13 @@ def _clean_messages(history):
 # Deterministic, not left to the model. Marker is the phrase KI Concierge / AI concierge.
 AI_DISCLOSE_MARKERS = ("ki concierge", "ai concierge")
 AI_DISCLOSE_TEXT = {
-    ("de", True): "Hallo, ich bin der KI Concierge der BrunnenBar und helfe dir gerne weiter. Wenn du lieber direkt mit jemandem aus dem Team sprechen möchtest, schreib uns einfach kurz, dann übernimmt Dan persönlich.",
-    ("de", False): "Kurz vorab, ich bin der KI Concierge der BrunnenBar. Wenn du lieber direkt mit jemandem aus dem Team sprechen möchtest, schreib uns einfach kurz, dann übernimmt Dan persönlich.",
-    ("en", True): "Hi, I am the AI concierge of BrunnenBar and happy to help. If you would rather speak with someone from the team, just write us a short message and Dan will take over personally.",
-    ("en", False): "Quick note up front, I am the AI concierge of BrunnenBar. If you would rather speak with someone from the team, just write us a short message and Dan will take over personally.",
+    # CHANGED 05 Oct 2026, Dan direct. The disclosure now FOLLOWS the answer instead of leading, so the guest
+    # gets what they asked for first, then one warm paragraph about who is writing (Art. 50 KI-VO needs the
+    # information in the first message, not at its start). Wording is Dan's own draft.
+    ("de", True): "Kurz zu mir, ich bin der KI Concierge der BrunnenBar. Damit du nicht warten musst, antworte ich gleich, und das Team kann jederzeit übernehmen. Ich kann dir alles von Reservierungen bis zu unseren Cocktails erklären. Aber wenn dir Old Fashioned lieber ist, schreib einfach, dass du lieber direkt mit jemandem sprechen möchtest, dann meldet sich Dan oder jemand vom Team persönlich bei dir.",
+    ("de", False): "Kurz noch zu mir, ich bin der KI Concierge der BrunnenBar und antworte dir gleich, damit du nicht warten musst. Wenn dir ein Gespräch mit einem Menschen lieber ist, schreib einfach, dann meldet sich Dan oder jemand vom Team persönlich bei dir.",
+    ("en", True): "A quick word about me, I am the AI concierge of BrunnenBar. So you do not have to wait, I answer right away, and the team can step in at any time. I can help with everything from reservations to our cocktails. But if you prefer it old fashioned, just say you would rather talk to someone directly, and Dan or someone from the team will get back to you personally.",
+    ("en", False): "Quick note about me, I am the AI concierge of BrunnenBar and I answer right away so you do not have to wait. If you would rather talk to a person, just say so and Dan or someone from the team will get back to you personally.",
 }
 AI_DISCLOSE_PHONE = {
     "de": " Donnerstag bis Samstag ab 18 Uhr erreichst du uns auch unter 0821 47019035.",
@@ -3986,7 +3989,7 @@ def _mark_ai_disclosed(sender: str):
 
 
 def _with_ai_disclosure(sender: str, reply: str, lang: str = "de") -> str:
-    """Prepend the AI disclosure once per sender, deterministically."""
+    """Append the AI disclosure once per sender, deterministically, AFTER the answer."""
     if not reply or _ai_disclosed(sender):
         return reply
     if any(m in reply.lower() for m in AI_DISCLOSE_MARKERS):
@@ -3994,23 +3997,13 @@ def _with_ai_disclosure(sender: str, reply: str, lang: str = "de") -> str:
         return reply
     lg = "en" if lang == "en" else "de"
     first = len(conv_history(sender)) <= 1
-    intro = AI_DISCLOSE_TEXT[(lg, first)]
-    # Friendly first message, 01 Oct 2026 Dan: keep the name greeting. If the
-    # model opened with Hallo <Name>, reuse that name in the disclosure line.
-    if first:
-        m = re.match(r"^\s*(Hallo|Hi|Hey|Servus|Moin|Huhu|Hello)\s+([A-ZÄÖÜ][\w\-äöüßÄÖÜ]{1,24})\s*[,!.:]?\s*", reply)
-        if m and m.group(2).lower() not in ("zusammen", "ihr", "du", "there"):
-            word = "Hi" if lg == "en" else "Hallo"
-            intro = intro.replace("Hallo,", f"Hallo {m.group(2)},", 1).replace("Hi, I am", f"{word} {m.group(2)}, I am", 1)
-            rest = reply[m.end():].lstrip()
-            if rest:
-                reply = rest[0].upper() + rest[1:]
+    outro = AI_DISCLOSE_TEXT[(lg, first)]
     try:
         if _bar_open_now():
-            intro += AI_DISCLOSE_PHONE[lg]
+            outro += AI_DISCLOSE_PHONE[lg]
     except Exception:
         pass
-    return intro + "\n\n" + reply
+    return reply.rstrip() + "\n\n" + outro
 
 
 def claude_decide(sender: str, text: str):
@@ -4062,7 +4055,7 @@ def claude_decide(sender: str, text: str):
                    "but gave no email, ask only for the email. If they decline, hesitate, or ask something you cannot answer, use action handoff. "
                    "Never say an email was sent unless you set deposit_terms. Never mention bank details in the chat.")
     if not _ai_disclosed(sender):
-        system += "\n\nAI DISCLOSURE PENDING. A paragraph introducing you as the KI Concierge is automatically placed before your reply. If this is the first reply in the thread and you know the guest's name, open with a short greeting like Hallo Name, it is merged into the introduction. Otherwise start directly with the content. Never introduce yourself as the KI Concierge yourself."
+        system += "\n\nAI DISCLOSURE PENDING. A paragraph introducing you as the KI Concierge is automatically appended AFTER your reply. Write your reply normally. If this is the first reply in the thread and you know the guest's name, open with a short warm greeting like Hallo Name, schoen von dir zu hoeren. Never introduce yourself as the KI Concierge yourself and never add your own line about a human or the team, the appended paragraph does that."
     if lang == "en":
         system += (
             "\n\nLANGUAGE OVERRIDE for this reply. The guest is writing in ENGLISH. "
