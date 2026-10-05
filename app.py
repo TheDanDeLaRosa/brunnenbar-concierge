@@ -3262,6 +3262,8 @@ def selftest():
         "Hi, can I reserve a table for 2 on Friday around 9pm inside?",
         "Wir waeren 14 Leute fuer einen Geburtstag, wie laeuft das bei euch?",
         "Danke dir, bis dann!",
+        "Was ist eigentlich im Porn Star Martini drin und ist der stark?",
+        "Ist im Aperol Spritz Gluten oder Sulfit drin? Ich habe eine Allergie.",
     ]
     out = []
     for i, t in enumerate(cases):
@@ -3270,12 +3272,20 @@ def selftest():
             action, value, lang = claude_decide("selftest:%d" % i, t)
             out.append({"case": t, "action": action, "ok": action != "none",
                         "seconds": round(time.time() - started, 1),
-                        "preview": (value if isinstance(value, str) else str(value))[:120]})
+                        "preview": (value if isinstance(value, str) else str(value))[:400]})
         except Exception as e:
             out.append({"case": t, "action": "exception", "ok": False, "error": str(e)[:200]})
     return {"all_ok": all(o["ok"] for o in out), "model": CONCIERGE_MODEL,
             "forced_tool_ok": _model_allows_forced_tool(CONCIERGE_MODEL),
             "API_DIAG": dict(_API_DIAG), "results": out}
+
+
+@app.get("/menu_debug")
+def menu_debug():
+    """Is the live menu loaded, how many items, how old, last error, and the first lines of what the bot sees."""
+    return {"loaded": bool(_menu_state["text"]), "items": _menu_state["items"], "chars": len(_menu_state["text"]),
+            "age_seconds": round(time.time() - _menu_state["ts"]) if _menu_state["ts"] else None,
+            "last_error": _menu_state["last_error"], "url": MENU_URL, "sample": _menu_state["text"][:900]}
 
 
 @app.get("/debug")
@@ -3505,6 +3515,8 @@ def _startup_subscribe():
     logger.info("Startup: starting live service fast watchdog every %s s, SLA %s min while the bar is open",
                 LIVE_SERVICE_STALE_CHECK_INTERVAL_SECONDS, LIVE_SERVICE_STALE_SLA_MINUTES)
     threading.Thread(target=live_service_stale_watchdog_loop, daemon=True).start()
+    logger.info("Startup: starting live menu refresh loop every %s s from %s", MENU_REFRESH_SECONDS, MENU_URL)
+    threading.Thread(target=_menu_refresh_loop, daemon=True).start()
 
 
 def challenge(request: Request):
@@ -3965,6 +3977,122 @@ AI_DISCLOSE_PHONE = {
 }
 
 
+
+# LIVE MENU KNOWLEDGE, added 05 Oct 2026, Dan direct, so the bot can answer basic drink questions. The bot
+# holds NO menu data of its own. It reads the live published copy (WordPress page 217, built from the two
+# master JSON files per _Reference/Menu_Data_Flow_Canon.md), keeps the last good copy, and refreshes every
+# 30 minutes, so a menu change published by the Head Barkeeper seat reaches guest answers by itself and
+# nothing here can go stale. Allergens are deliberately NOT included, Dan chose the safe route, the bot
+# never states allergen facts and hands those questions to the team, see MENU_PROMPT_RULES.
+MENU_URL = os.environ.get("MENU_URL", "https://brunnenbar.com/wp-json/wp/v2/pages/217?_fields=content")
+MENU_REFRESH_SECONDS = int(os.environ.get("MENU_REFRESH_SECONDS", str(30 * 60)))
+_menu_state = {"text": "", "items": 0, "ts": 0.0, "last_error": "", "last_attempt": 0.0}
+
+MENU_PROMPT_RULES = (
+    "SPEISEKARTE. Unten steht die aktuelle Getraenkekarte der BrunnenBar, live von der Webseite. Nutze sie, um Fragen "
+    "zu Getraenken zu beantworten, also was drin ist, ob etwas alkoholfrei ist, wie stark es ist, und um nach Geschmack "
+    "hoechstens zwei oder drei passende Drinks vorzuschlagen. Erfinde niemals ein Getraenk, eine Zutat oder einen Preis. "
+    "Was nicht auf der Karte steht, kennst du nicht, sag das ehrlich und biete an, dass das Team es klaert. Fuer die ganze "
+    "Karte verweise auf brunnenbar.com/cocktailkarte. Preise nennst du nur, wenn der Gast direkt danach fragt und die "
+    "Preisregel es erlaubt, also nie in der ersten oder zweiten Nachricht, dann genau den Preis aus der Karte. "
+    "ALLERGENE UND UNVERTRAEGLICHKEITEN. Sage selbst niemals, ob ein Getraenk Allergene enthaelt oder frei davon ist, auch "
+    "nicht aus den Zutaten abgeleitet. Schreibe kurz und warm, dass du dazu nichts Verlaessliches sagen kannst, dass die "
+    "Allergenliste auf brunnenbar.com/cocktailkarte steht und dass das Team es gern direkt sagt, vor Ort oder unter "
+    "0821 47019035. Bei einer ernsten Allergie, bei Atemnot oder wenn der Gast fuer die Antwort darauf angewiesen ist, "
+    "nutze action handoff. Der Karte entnimmst du KEINE Allergenangaben."
+)
+
+
+def _menu_price(it: dict) -> str:
+    def fmt(v):
+        try:
+            return f"{float(v):.2f}".replace(".", ",") + " Euro"
+        except (TypeError, ValueError):
+            return ""
+    prices = it.get("prices") or []
+    if len(prices) > 1:
+        bits = []
+        for pr in prices:
+            f = fmt(pr.get("price"))
+            if f:
+                bits.append((str(pr.get("size") or "").strip() + " " + f).strip())
+        return " / ".join(bits)
+    return fmt(it.get("price")) if it.get("price") is not None else (fmt(prices[0].get("price")) if prices else "")
+
+
+def _menu_compact(menu: dict):
+    """Turn the merged menu payload into compact guest facing text. Returns (text, item_count)."""
+    lines, count = [], 0
+    for sec in (menu.get("sections") or []):
+        items = [i for i in (sec.get("items") or []) if isinstance(i, dict) and i.get("name") and not i.get("hidden_on_card")]
+        if not items:
+            continue
+        lines.append("## " + str(sec.get("title") or sec.get("name") or ""))
+        for it in items:
+            parts = [str(it["name"])]
+            ing = ", ".join(str(x) for x in (it.get("ingredients") or []))
+            if ing:
+                parts.append(ing)
+            if it.get("alcohol_free"):
+                parts.append("alkoholfrei")
+            elif it.get("strength"):
+                parts.append("Staerke " + str(it["strength"]))
+            desc = str(it.get("description") or "").strip()
+            if len(desc) > 130:
+                desc = desc[:127].rstrip() + "..."
+            if desc:
+                parts.append(desc)
+            price = _menu_price(it)
+            if price:
+                parts.append("Preis " + price)
+            lines.append(" | ".join(parts))
+            count += 1
+    return "\n".join(lines), count
+
+
+def _menu_parse_page(payload: dict) -> dict:
+    import html as _html
+    c = payload.get("content")
+    c = c.get("rendered") if isinstance(c, dict) else c
+    m = re.search(r"<pre[^>]*id=[\"']bb-menu[\"'][^>]*>(.*?)</pre>", c or "", re.S)
+    if not m:
+        raise ValueError("bb-menu block not found in page 217")
+    body = re.sub(r"<[^>]+>", "", _html.unescape(m.group(1))).strip()
+    return json.loads(body)
+
+
+def refresh_menu() -> bool:
+    _menu_state["last_attempt"] = time.time()
+    try:
+        r = httpx.get(MENU_URL, timeout=20, headers={"User-Agent": "BrunnenBarConcierge/1.0"})
+        r.raise_for_status()
+        menu = _menu_parse_page(r.json())
+        text, count = _menu_compact(menu)
+        if count < 20:
+            raise ValueError(f"menu parse produced only {count} items, keeping the previous copy")
+        _menu_state.update({"text": text, "items": count, "ts": time.time(), "last_error": ""})
+        logger.info("Menu refreshed, %d items, %d chars", count, len(text))
+        return True
+    except Exception as e:
+        _menu_state["last_error"] = str(e)[:300]
+        logger.error("Menu refresh failed, keeping previous copy (%s items): %s", _menu_state["items"], e)
+        return False
+
+
+def _menu_refresh_loop():
+    while True:
+        refresh_menu()
+        time.sleep(MENU_REFRESH_SECONDS)
+
+
+def _menu_prompt_block() -> str:
+    if not _menu_state["text"] and time.time() - _menu_state["last_attempt"] > 300:
+        refresh_menu()
+    if not _menu_state["text"]:
+        return ""
+    return MENU_PROMPT_RULES + "\n\n" + _menu_state["text"]
+
+
 def _ai_disclosed(sender: str) -> bool:
     try:
         if _UPSTASH_ON and _upstash("GET", "ai_disclosed:" + sender):
@@ -4041,6 +4169,9 @@ def claude_decide(sender: str, text: str):
     if LEARNINGS_TEXT:
         system += "\n\n" + LEARNINGS_TEXT
     system += "\n\n" + bar_time_context()
+    _mb = _menu_prompt_block()
+    if _mb:
+        system += "\n\n" + _mb
     edc = event_date_context(sender, text)
     if edc:
         system += "\n\n" + edc
