@@ -3586,8 +3586,19 @@ async def whatsapp_receive(request: Request):
             # so the bot's memory of a thread is not just its own replies, if someone
             # answers a guest manually the bot needs to see that too before it ever
             # replies again in that thread.
-            for echo in value.get("smb_message_echoes", []):
-                em = echo.get("message", {}) or {}
+            # ECHO PAYLOAD SHAPE FIX, 05 Oct 2026. Dan answered Pascal from his phone and the
+            # webhook got a POST (723 bytes) but no echo was logged or stored, so the bot kept
+            # jumping into his threads. Meta's coexistence webhook field smb_message_echoes
+            # carries the list under value.message_echoes (each item flat, with from, to, id,
+            # type, text.body), not under value.smb_message_echoes as this code assumed. Accept
+            # both shapes, and log the keys of any change that matched nothing so a future shape
+            # change is visible instead of silent.
+            _echo_items = list(value.get("smb_message_echoes") or []) + list(value.get("message_echoes") or [])
+            if not value.get("messages") and not _echo_items and not value.get("statuses"):
+                logger.info("WhatsApp webhook change with no handled content, field=%s keys=%s",
+                            change.get("field"), sorted(value.keys()))
+            for echo in _echo_items:
+                em = echo.get("message") or echo
                 mid = em.get("id")
                 if not mid or _already_handled(mid):
                     continue
