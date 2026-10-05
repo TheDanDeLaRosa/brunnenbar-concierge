@@ -509,6 +509,47 @@ def is_human_active(sender: str) -> bool:
     return bool(until and time.time() < until)
 
 
+def clear_human_active(sender: str):
+    sender = _norm_phone(sender)
+    if not sender:
+        return
+    if _UPSTASH_ON:
+        _upstash("DEL", "human_active:" + sender)
+    _human_active_until.pop(sender, None)
+
+
+_DAN_CMD_RE = re.compile(r"^\s*(stopp|stop|pause|ich|weiter|resume|bot)\s+(\+?[\d][\d\s\-]{7,})\s*$", re.I)
+
+
+def _handle_dan_command(sender: str, text: str) -> bool:
+    """Control channel that does not depend on Meta echoes, added 05 Oct 2026.
+    The bot only learns that Dan is chatting by hand from smb_message_echoes, and
+    no echo lines appear in the Railway logs, so it kept jumping into threads Dan
+    was working. From Dan's own alert number, 'stopp <number>' pauses the bot in
+    that guest thread for HUMAN_ACTIVE_PAUSE_HOURS, 'weiter <number>' hands the
+    thread back. Returns True if the message was a command (and is not guest
+    traffic)."""
+    if not DAN_ALERT_WHATSAPP or _norm_phone(sender) != _norm_phone(DAN_ALERT_WHATSAPP):
+        return False
+    m = _DAN_CMD_RE.match(text or "")
+    if not m:
+        return False
+    verb = m.group(1).lower()
+    target = _norm_phone(m.group(2))
+    if verb in ("weiter", "resume", "bot"):
+        clear_human_active(target)
+        reply = f"Okay, der Bot antwortet bei {target} wieder."
+    else:
+        mark_human_active(target)
+        reply = f"Okay, der Bot bleibt bei {target} die naechsten {HUMAN_ACTIVE_PAUSE_HOURS} Stunden still. Mit weiter {target} gibst du den Chat zurueck."
+    logger.info("Dan command %s for %s", verb, target)
+    try:
+        send_whatsapp(DAN_ALERT_WHATSAPP, reply)
+    except Exception as e:
+        logger.error("Dan command confirmation failed: %s", e)
+    return True
+
+
 def conv_append(sender: str, role: str, content: str):
     """Record one turn of a guest thread, durably if Upstash is configured,
     otherwise in this process's memory only (wiped on next restart). Every
@@ -3527,6 +3568,8 @@ async def whatsapp_receive(request: Request):
                 if _is_group_message(msg, sender):
                     logger.info("WhatsApp GROUP message from %s, logged only, bot never replies in groups", sender)
                     continue
+                if _handle_dan_command(sender, text):
+                    continue
                 logger.info("WhatsApp in from %s: %s", sender, text[:120])
                 conv_append(sender, "user", text)
                 first_message = len(conv_history(sender)) <= 1
@@ -3805,6 +3848,13 @@ def handle(channel: str, sender: str, text: str):
         reason = (value or {}).get("reason", "no reason given")
         logger.info("Handoff to Dan (%s, %s): %s", channel, sender, reason)
         alert_dan("concierge needs you", channel, sender, text, reason)
+        # Dan replies himself after a handoff, and echoes of his replies are not reaching us,
+        # so stay quiet in this thread until Dan hands it back (weiter <number>) or the pause ends.
+        if channel == "whatsapp":
+            try:
+                mark_human_active(sender)
+            except Exception as e:
+                logger.error("pause after handoff failed for %s: %s", sender, e)
         return
     elif action == "cancel_request":
         reply = (value or "").strip() or "alles gut und danke fuers Bescheid geben, bis zum naechsten mal"
