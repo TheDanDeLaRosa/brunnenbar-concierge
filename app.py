@@ -642,6 +642,13 @@ def run_stale_thread_watchdog():
                     continue
             elif sender in _stale_alerted_local:
                 continue
+            # Added 06 Oct 2026. Never nag about Dan's own emails to the bar
+            # inbox (his one word "Gewerbe" note was flagged as an unanswered
+            # guest), and the once only flag below now lives 90 days instead
+            # of 7, so an old thread stops resurfacing as a "new" alert every
+            # week (a 679 hour old "Yes past" came back that way).
+            if sender.lower().replace("email:", "") in {DAN_ALERT_EMAIL.lower(), "mail@dandelarosa.com"}:
+                continue
             channel_guess = "email" if sender.startswith("email:") else "whatsapp"
             # FAST MOVING THREAD SIGNAL, added 01 Oct 2026 alongside the SLA
             # drop above. A thread where the last few exchanges each got a
@@ -678,7 +685,7 @@ def run_stale_thread_watchdog():
                 f"your eyes regardless of which.",
             )
             if _UPSTASH_ON:
-                _upstash("SET", "stale_alerted:" + sender, "1", "EX", 7 * 24 * 3600)
+                _upstash("SET", "stale_alerted:" + sender, "1", "EX", 90 * 24 * 3600)
             else:
                 _stale_alerted_local[sender] = now
         except Exception as e:
@@ -4685,6 +4692,49 @@ def notify_dan_booked(channel: str, sender: str, summary: str):
         logger.warning("Could not reach Dan with booking FYI for %s on %s (not urgent, not retried)", sender, channel)
 
 
+def _dan_digest_collapse(entries):
+    """Added 06 Oct 2026, Dan: "there are duplicate messages in the email".
+    The same guest message showed up two to three times in one digest, first
+    as the real "needs you" handoff, then again as the stale thread SLA
+    reminder a couple of hours later, plus exact repeats. Dan already got
+    every one of those on WhatsApp in real time, so the digest only needs
+    each guest thread once. Merge by (sender, first 80 chars of the guest
+    message). The first entry is kept, a later SLA reminder for the same
+    message is folded into it as a one line note, any other exact repeat is
+    dropped. An SLA reminder with no earlier handoff for that message stays,
+    it is the only record of that thread. Never raises, falls back to the
+    unmerged list."""
+    try:
+        import re as _re
+        def _key(text):
+            m_from = _re.search(r"^From:\s*(.+)$", text or "", _re.M)
+            m_msg = _re.search(r'^Message:\s*"(.*)', text or "", _re.M | _re.S)
+            if not (m_from and m_msg):
+                return None
+            sender = _re.sub(r"^email:", "", m_from.group(1).strip().lower())
+            msg = _re.sub(r"\s+", " ", m_msg.group(1)).strip().lower()[:80]
+            return (sender, msg)
+        out, seen = [], {}
+        for e in entries:
+            text = e.get("text") or ""
+            k = _key(text)
+            is_sla = "past the SLA" in text
+            if k is None or k not in seen:
+                if k is not None:
+                    seen[k] = e
+                out.append(e)
+                continue
+            first = seen[k]
+            if is_sla:
+                when = datetime.fromtimestamp(e.get("ts", time.time()), BAR_TZ).strftime("%d.%m %H:%M")
+                first["text"] = (first.get("text") or "").rstrip() + f"\n(Still unanswered at {when}.)"
+            # exact repeats and repeat handoffs for the same message are dropped
+        return out
+    except Exception as ex:
+        logger.error("dan digest collapse failed, sending unmerged: %s", ex)
+        return entries
+
+
 def run_dan_alert_digest():
     """Runs periodically, see dan_alert_digest_loop below. Once per real
     calendar day, after DAN_ALERT_DIGEST_HOUR Europe/Berlin, emails Dan one
@@ -4712,7 +4762,10 @@ def run_dan_alert_digest():
         _dan_digest_set_last_date(today)
         return
     entries.sort(key=lambda e: e.get("ts", 0))
-    lines = [f"BrunnenBar concierge daily digest, {len(entries)} notification(s) since the last one.", ""]
+    raw_count = len(entries)
+    entries = _dan_digest_collapse(entries)
+    lines = [f"BrunnenBar concierge daily digest, {len(entries)} item(s) since the last one"
+             + (f" ({raw_count - len(entries)} repeat reminders merged)." if raw_count > len(entries) else "."), ""]
     for e in entries:
         ts = datetime.fromtimestamp(e.get("ts", time.time()), BAR_TZ).strftime("%d.%m %H:%M")
         lines.append(f"--- {ts} ---")
@@ -4726,7 +4779,7 @@ def run_dan_alert_digest():
         mime = MIMEText(body, "plain", "utf-8")
         mime["To"] = DAN_ALERT_EMAIL
         mime["From"] = BAR_EMAIL
-        mime["Subject"] = f"BrunnenBar concierge daily digest, {len(entries)} item(s)"
+        mime["Subject"] = f"BrunnenBar concierge daily digest, {len(entries)} item(s)"  # entries is already collapsed
         raw = base64.urlsafe_b64encode(mime.as_bytes()).decode()
         svc.users().messages().send(userId="me", body={"raw": raw}).execute()
         logger.info("Dan alert digest sent, %d entries", len(entries))
