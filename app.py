@@ -3382,6 +3382,39 @@ def conversation_debug(sender: str):
     }
 
 
+@app.get("/unanswered")
+def unanswered_debug(min_minutes: int = 10, max_hours: int = 72):
+    """Read only list of every tracked thread whose last turn is still a guest
+    message nobody answered, newest first. Added 08 Oct 2026 so unanswered
+    guests can be listed on demand without waiting for the watchdog alerts.
+    Sends nothing and changes nothing. paused_for_dan is true when the thread
+    is in the human active pause (Dan answered by hand in the last 24 h), in
+    which case the bot is silent on purpose and only Dan can reply."""
+    now = time.time()
+    out = []
+    for sender in _conv_active_senders():
+        try:
+            history = conv_history(sender)
+            if not history or history[-1].get("role") != "user":
+                continue
+            ts = float(history[-1].get("ts") or 0)
+            if not ts:
+                continue
+            age_min = (now - ts) / 60
+            if age_min < min_minutes or age_min > max_hours * 60:
+                continue
+            out.append({
+                "sender": sender,
+                "age_minutes": round(age_min),
+                "paused_for_dan": bool(is_human_active(sender)),
+                "last_guest_message": (history[-1].get("content") or "")[:300],
+            })
+        except Exception as e:
+            out.append({"sender": sender, "error": str(e)})
+    out.sort(key=lambda r: r.get("age_minutes", 0))
+    return {"count": len(out), "threads": out}
+
+
 @app.get("/calendars")
 def calendars_debug():
     """List the calendars this connection can see, so we can confirm the
