@@ -1618,7 +1618,7 @@ def pending_hold_followup_loop():
 # about actually booking the space is now automatic. Mindestumsatz is always
 # the one standard published number, 700 or 1700 Euro, never negotiated here.
 PRIVATE_SPACES = {
-    "hinterer_bereich": {"capacity": 32, "mindestumsatz": 700, "label": "Hinterer Bereich"},
+    "hinterer_bereich": {"capacity": 45, "mindestumsatz": 700, "label": "Hinterer Bereich"},  # standing, Dan 09.10.2026
     "ganze_bar": {"capacity": 65, "mindestumsatz": 1700, "label": "Ganze Bar exklusiv"},
 }
 
@@ -2009,6 +2009,12 @@ def _night_ledger(date_iso, start_dt, req_end):
             continue
         pending.append((party, (summary + " " + desc).lower(), summary))
     for party, low, summary in pending:
+        # Standing capacity for parties, Dan 09.10.2026, back about 45, full
+        # bar about 65. More than the back holds means it needs the whole bar.
+        if party > 45 and "draussen" not in low:
+            occ |= INSIDE_POOL
+            big_inside = True
+            continue
         if "draussen" in low or "draußen" in low or "outside" in low:
             order = [OUTSIDE_POOL]
         elif re.search(r"\bvorne?\b|\bfront\b", low):
