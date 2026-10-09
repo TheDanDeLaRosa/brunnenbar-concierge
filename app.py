@@ -1872,6 +1872,25 @@ def find_free_table(date_iso: str, start_dt: datetime, party: int, area: str):
                 return None
             else:
                 overlapping.append(fp)
+    # Whole inside taken by two large events (back plus front), Dan 09 Oct
+    # 2026, Sa 10.10. Rita in the back and Olivia in the front, "the bot
+    # should have said sorry we are all booked up". On such a night the bot
+    # takes no new table at all, outside included, it hands off instead.
+    if area == "draussen":
+        back_taken = any(
+            sp == "hinterer_bereich" and s < req_end and start_dt < e
+            for sp, s, e in _private_space_events_on(date_iso)
+        )
+        front_taken = False
+        for fp, fs, fe, zone in _freeform_group_events_on(date_iso):
+            if not (fs < req_end and start_dt < max(fe, fs + turn)):
+                continue
+            if zone == "back":
+                back_taken = True
+            elif zone == "front" and fp >= FRONT_TAKEOVER_PARTY:
+                front_taken = True
+        if back_taken and front_taken:
+            return None
     return _seat_new_party(overlapping, party, _area_tables(area), blocked)
 
 
@@ -3567,6 +3586,15 @@ def reservations_debug(date: str = ""):
             "raw": raw,
             "counted_count": len(parsed),
             "counted": [{"area": a, "party": pp, "start": s.isoformat()} for a, pp, s in parsed],
+            "freeform_groups": [
+                {"party": fp, "start": fs.isoformat(), "zone": z}
+                for fp, fs, fe, z in _freeform_group_events_on(date)
+            ],
+            "probe_party2": {
+                f"{a}_{h}": find_free_table(
+                    date, datetime.fromisoformat(date).replace(hour=h, tzinfo=BAR_TZ), 2, a)
+                for a in ("drinnen", "draussen") for h in (19, 22)
+            },
         }
     except Exception as e:
         return {"error": str(e)}
