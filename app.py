@@ -1834,7 +1834,7 @@ def _freeform_group_events_on(date_iso: str):
     return final
 
 
-def find_free_table(date_iso: str, start_dt: datetime, party: int, area: str):
+def _find_free_table_legacy(date_iso: str, start_dt: datetime, party: int, area: str):
     """The table the new party would get in the requested area and 3 hour turn,
     or None if the area cannot seat everyone, so it never overbooks. The turn is
     measured from the actual start time, a 19:30 booking holds until 22:30.
@@ -1902,6 +1902,161 @@ def find_free_table(date_iso: str, start_dt: datetime, party: int, area: str):
         if back_taken and front_taken:
             return None
     return _seat_new_party(overlapping, party, _area_tables(area), blocked)
+
+
+# TABLE LEDGER, rebuilt 09 Oct 2026 after the Rnd2 22 Uhr overbooking, Dan:
+# "the bot needs to assign them to tables, you know the table names and what
+# fits on each table, dont let overbookings ever happen again." Every
+# calendar entry that night, structured or freeform, is now placed on REAL
+# named tables, then the new party only gets a table nobody holds. House
+# rules from Dan, small parties fill the front first, the back is kept for
+# big parties, large groups go in the back, and when nothing fits the answer
+# is None (the caller hands off or declines), never a guess.
+FRONT_POOL = frozenset({"Stam", "ST3", "Rnd2"})
+BACK_POOL = frozenset({"HT1", "HT2", "HT3", "Sofa"})
+OUTSIDE_POOL = frozenset(n for n, (s, a) in TABLES.items() if a == "draussen")
+INSIDE_POOL = FRONT_POOL | BACK_POOL
+SMALL_PARTY_MAX = 8      # biggest single front table, Stam
+BIG_EVENT_PARTY = 12
+
+
+def _table_seats(name):
+    return TABLES[name][0]
+
+
+def _pack_pool(party, free_tables):
+    """Smallest single table that fits, else the smallest whitelisted combo
+    (TABLE_COMBOS) fully free. Returns a set of table names or None."""
+    singles = sorted((t for t in free_tables if _table_seats(t) >= party), key=_table_seats)
+    if singles:
+        return {singles[0]}
+    avail = set(free_tables) | {"Bar7", "Bar8", "Bar9"}  # stools only ever used inside the big combo
+    cands = [(cap, combo) for combo, cap in TABLE_COMBOS.items()
+             if cap >= party and combo <= avail and (combo & set(TABLES)) <= set(free_tables)]
+    if cands:
+        cands.sort(key=lambda x: (x[0], len(x[1])))
+        return set(cands[0][1])
+    return None
+
+
+def _event_party(ev):
+    low = ((ev.get("summary") or "") + " " + (ev.get("description") or "")).lower()
+    m2 = re.search(r"(\d+)\s*bis\s*(\d+)\s*person", low)
+    if m2:
+        return int(m2.group(2))
+    m = (re.search(r"anzahl personen\s*:?\s*(\d+)", low)
+         or re.search(r"personenzahl\s*:?\s*(\d+)", low)
+         or re.search(r"(\d+)\s*person", low))
+    return int(m.group(1)) if m else None
+
+
+def _night_ledger(date_iso, start_dt, req_end):
+    """Tables occupied during [start_dt, req_end) by every calendar entry.
+    Returns (occupied set, big_inside bool). big_inside means a big group
+    holds part of the inside."""
+    svc = _calendar_service()
+    day = datetime.fromisoformat(date_iso).replace(tzinfo=BAR_TZ)
+    lo = day.replace(hour=0, minute=0, second=0, microsecond=0)
+    items = svc.events().list(
+        calendarId=RESERVIERUNGEN_CALENDAR_ID,
+        timeMin=lo.isoformat(), timeMax=(lo + timedelta(days=1)).isoformat(),
+        singleEvents=True, orderBy="startTime",
+    ).execute().get("items", [])
+    turn = timedelta(hours=TURN_HOURS)
+    occ = set()
+    big_inside = False
+    pending = []
+    for ev in items:
+        summary = ev.get("summary") or ""
+        desc = ev.get("description") or ""
+        sl = summary.lower()
+        if sl.strip().startswith("abgesagt") or any(w in sl for w in _FREEFORM_SKIP_WORDS):
+            continue
+        st = ev.get("start", {}).get("dateTime")
+        if not st:
+            continue
+        s = datetime.fromisoformat(st)
+        en = ev.get("end", {}).get("dateTime")
+        e = max(datetime.fromisoformat(en) if en else s, s + turn)
+        if not (s < req_end and start_dt < e):
+            continue
+        segs = re.split(r"\s[–-]\s", summary)
+        if segs and segs[-1].strip().lower().startswith("bar"):
+            continue  # walk in bar seats, not bookable tables
+        # 1. exact tables the booking engine wrote
+        mt = _TABLE_FIELD_RE.search(desc) or _TABLE_FIELD_RE.search(summary)
+        if mt:
+            names = {x for x in mt.group(1).split("+") if x in TABLES}
+            if names:
+                occ |= names
+                continue
+        # 2. whole spaces
+        space = _detect_space(summary)
+        if not space:
+            space = _detect_space(summary + " " + desc)
+            if space and re.search(r"\bvorne?\b|\bfront\b", desc.lower()):
+                space = None
+        if space == "ganze_bar":
+            occ |= set(TABLES)
+            big_inside = True
+            continue
+        if space == "hinterer_bereich":
+            occ |= BACK_POOL
+            big_inside = True
+            continue
+        party = _event_party(ev)
+        if not party:
+            continue
+        pending.append((party, (summary + " " + desc).lower(), summary))
+    for party, low, summary in pending:
+        if "draussen" in low or "draußen" in low or "outside" in low:
+            order = [OUTSIDE_POOL]
+        elif re.search(r"\bvorne?\b|\bfront\b", low):
+            order = [FRONT_POOL, BACK_POOL]
+        elif "hinten" in low or "hintere" in low:
+            order = [BACK_POOL, FRONT_POOL]
+        elif party > SMALL_PARTY_MAX:
+            order = [BACK_POOL, FRONT_POOL]
+        else:
+            order = [FRONT_POOL, BACK_POOL, OUTSIDE_POOL]
+        placed = False
+        for pool in order:
+            got = _pack_pool(party, pool - occ)
+            if got:
+                occ |= got
+                placed = True
+                break
+        if not placed:
+            # nothing fits cleanly, a big group takes over the first pool that
+            # still has free tables, never leave it unplaced
+            for pool in order:
+                if pool - occ:
+                    occ |= pool
+                    placed = True
+                    break
+        if party >= BIG_EVENT_PARTY:
+            big_inside = True
+    return occ, big_inside
+
+
+def find_free_table(date_iso: str, start_dt: datetime, party: int, area: str):
+    """A free named table for this party and 3 hour turn, or None. Never
+    overbooks, see TABLE LEDGER above. Inside, parties up to 8 only ever get
+    front tables (Stam, ST3, Rnd2), bigger parties get the back (HT tables or
+    the whitelisted combos). Outside uses the 3xx tables. When the whole
+    inside is held by big groups the bot takes nothing, outside included."""
+    req_end = start_dt + timedelta(hours=TURN_HOURS)
+    occ, big_inside = _night_ledger(date_iso, start_dt, req_end)
+    if area == "draussen":
+        if big_inside and (INSIDE_POOL <= occ):
+            return None
+        got = _pack_pool(party, OUTSIDE_POOL - occ)
+    else:
+        pool = FRONT_POOL if party <= SMALL_PARTY_MAX else BACK_POOL
+        got = _pack_pool(party, pool - occ)
+    if not got:
+        return None
+    return "+".join(sorted(got))
 
 
 def create_reservation(name, contact, party, area, start_dt, occasion, table, lang="de", note=""):
