@@ -1738,6 +1738,58 @@ def find_private_space(date_iso: str, start_dt: datetime, party: int, space: str
     return True
 
 
+FRONT_TAKEOVER_PARTY = int(os.environ.get("FRONT_TAKEOVER_PARTY", "12"))
+_FREEFORM_SKIP_WORDS = ("abgesagt", "kurs", "geputzt", "besichtigung", "cocktailkurs",
+                        "viewing", "meeting", "probearbeiten", "interview")
+
+
+def _freeform_group_events_on(date_iso: str):
+    """Calendar entries that carry a headcount but that parse_event cannot
+    place (no drinnen or draussen marker), as (party, start, end). Skips
+    private space events (handled by _private_space_events_on), outside
+    entries, bar entries, courses, cleaning, viewings and cancelled entries.
+    Added 09 Oct 2026 after the Rnd2 22 Uhr overbooking."""
+    svc = _calendar_service()
+    day = datetime.fromisoformat(date_iso).replace(tzinfo=BAR_TZ)
+    lo = day.replace(hour=0, minute=0, second=0, microsecond=0)
+    hi = lo + timedelta(days=1)
+    items = svc.events().list(
+        calendarId=RESERVIERUNGEN_CALENDAR_ID,
+        timeMin=lo.isoformat(), timeMax=hi.isoformat(),
+        singleEvents=True, orderBy="startTime",
+    ).execute().get("items", [])
+    out = []
+    for ev in items:
+        summary = (ev.get("summary") or "")
+        text = (summary + " " + (ev.get("description") or ""))
+        low = text.lower()
+        if any(w in summary.lower() for w in _FREEFORM_SKIP_WORDS):
+            continue
+        if parse_event(ev):
+            continue
+        if _detect_space(text):
+            continue
+        if "draussen" in low or "draußen" in low or "outside" in low:
+            continue
+        segs = re.split(r"\s[–-]\s", summary)
+        if segs and segs[-1].strip().lower().startswith("bar"):
+            continue
+        m = re.search(r"(\d+)\s*(?:bis\s*\d+\s*)?person", low)
+        if not m:
+            continue
+        party = int(m.group(1))
+        # "35 bis 40 Personen" style, take the upper number to stay cautious
+        m2 = re.search(r"(\d+)\s*bis\s*(\d+)\s*person", low)
+        if m2:
+            party = int(m2.group(2))
+        start = ev.get("start", {}).get("dateTime")
+        end = ev.get("end", {}).get("dateTime") or start
+        if not start:
+            continue
+        out.append((party, datetime.fromisoformat(start), datetime.fromisoformat(end)))
+    return out
+
+
 def find_free_table(date_iso: str, start_dt: datetime, party: int, area: str):
     """The table the new party would get in the requested area and 3 hour turn,
     or None if the area cannot seat everyone, so it never overbooks. The turn is
@@ -1767,6 +1819,22 @@ def find_free_table(date_iso: str, start_dt: datetime, party: int, area: str):
         p for (a, p, s) in reservations_on(date_iso)
         if a == area and s < req_end and start_dt < s + turn
     ]
+    # BUGFIX 09 Oct 2026, a real overbooking, the bot confirmed a 22 Uhr table
+    # (Rnd2) on Sat 10.10. while Olivia's 25 person birthday already held the
+    # front. Her calendar entry is freeform with no area, so parse_event
+    # returns None and reservations_on never counted it, same for Welter,
+    # Pascal, Sienna, Paula. Freeform group entries now count against the
+    # front, see _freeform_group_events_on. Big ones (12 plus) take the whole
+    # front, smaller ones count as a party in the front. Leans cautious on
+    # purpose, a wrong block ends in a handoff to Dan, a wrong yes is an
+    # overbooked night.
+    if area == "drinnen":
+        for fp, fs, fe in _freeform_group_events_on(date_iso):
+            if not (fs < req_end and start_dt < max(fe, fs + turn)):
+                continue
+            if fp >= FRONT_TAKEOVER_PARTY:
+                return None
+            overlapping.append(fp)
     return _seat_new_party(overlapping, party, _area_tables(area), blocked)
 
 
