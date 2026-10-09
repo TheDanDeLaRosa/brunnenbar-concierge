@@ -1710,6 +1710,9 @@ def _ganze_bar_conflict(date_iso: str, start_dt: datetime, end_dt: datetime) -> 
     for space, s, e in _private_space_events_on(date_iso):
         if s < end_dt and start_dt < e:
             return True
+    for fp, fs, fe, zone in _freeform_group_events_on(date_iso):
+        if fs < end_dt and start_dt < max(fe, fs + turn):
+            return True
     return False
 
 
@@ -1735,10 +1738,15 @@ def find_private_space(date_iso: str, start_dt: datetime, party: int, space: str
     for sp, s, e in _private_space_events_on(date_iso):
         if s < end_dt and start_dt < e:
             return False
+    # freeform large group entries sit in the back too, added 09 Oct 2026
+    for fp, fs, fe, zone in _freeform_group_events_on(date_iso):
+        if zone == "back" and fs < end_dt and start_dt < max(fe, fs + turn):
+            return False
     return True
 
 
 FRONT_TAKEOVER_PARTY = int(os.environ.get("FRONT_TAKEOVER_PARTY", "12"))
+FREEFORM_BACK_PARTY = int(os.environ.get("FREEFORM_BACK_PARTY", "8"))
 _FREEFORM_SKIP_WORDS = ("abgesagt", "kurs", "geputzt", "besichtigung", "cocktailkurs",
                         "viewing", "meeting", "probearbeiten", "interview")
 
@@ -1786,8 +1794,34 @@ def _freeform_group_events_on(date_iso: str):
         end = ev.get("end", {}).get("dateTime") or start
         if not start:
             continue
-        out.append((party, datetime.fromisoformat(start), datetime.fromisoformat(end)))
-    return out
+        # Zone, Dan 09 Oct 2026: "if there is a large booking, it will always
+        # be in the back". So 8 plus with no stated area means back, unless
+        # the entry says front (vorne), small ones count as front parties
+        # unless the entry says hinten.
+        if re.search(r"\bvorne?\b|\bfront\b", low):
+            zone = "front"
+        elif party >= FREEFORM_BACK_PARTY or "hinten" in low or "hintere" in low:
+            zone = "back"
+        else:
+            zone = "front_small"
+        out.append([party, datetime.fromisoformat(start), datetime.fromisoformat(end), zone, bool(re.search(r"hinten|hintere", low))])
+    # Spillover: only one large group fits the back at a time. A large group
+    # with no stated area that overlaps a private back booking or an earlier
+    # large group goes to the front instead, that is how Dan plans it (Olivia
+    # in front while Rita holds the back, Sa 10.10.).
+    try:
+        back_busy = [(s, e) for sp, s, e in _private_space_events_on(date_iso) if sp == "hinterer_bereich"]
+    except Exception:
+        back_busy = []
+    final = []
+    for p, s, e, zone, explicit_back in sorted(out, key=lambda x: x[1]):
+        end_eff = max(e, s + timedelta(hours=TURN_HOURS))
+        if zone == "back" and not explicit_back and any(s < be and bs < end_eff for bs, be in back_busy):
+            zone = "front"
+        elif zone == "back":
+            back_busy.append((s, end_eff))
+        final.append((p, s, e, zone))
+    return final
 
 
 def find_free_table(date_iso: str, start_dt: datetime, party: int, area: str):
@@ -1829,12 +1863,15 @@ def find_free_table(date_iso: str, start_dt: datetime, party: int, area: str):
     # purpose, a wrong block ends in a handoff to Dan, a wrong yes is an
     # overbooked night.
     if area == "drinnen":
-        for fp, fs, fe in _freeform_group_events_on(date_iso):
+        for fp, fs, fe, zone in _freeform_group_events_on(date_iso):
             if not (fs < req_end and start_dt < max(fe, fs + turn)):
                 continue
-            if fp >= FRONT_TAKEOVER_PARTY:
+            if zone == "back":
+                blocked |= HINTERER_BEREICH_TABLES
+            elif zone == "front" and fp >= FRONT_TAKEOVER_PARTY:
                 return None
-            overlapping.append(fp)
+            else:
+                overlapping.append(fp)
     return _seat_new_party(overlapping, party, _area_tables(area), blocked)
 
 
