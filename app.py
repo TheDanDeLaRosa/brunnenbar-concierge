@@ -1693,7 +1693,15 @@ def _private_space_events_on(date_iso: str):
         end = ev.get("end", {}).get("dateTime")
         if not start or not end:
             continue
-        space = _detect_space((ev.get("summary", "") or "") + " " + (ev.get("description", "") or ""))
+        summ = ev.get("summary", "") or ""
+        desc = ev.get("description", "") or ""
+        space = _detect_space(summ + " " + desc)
+        # BUGFIX 09 Oct 2026, Olivia's note says "hinterer Bereich ist fuer
+        # Rita reserviert, Olivia vorne einplanen", which read as a back
+        # booking. If the title names no space and the note says front, it is
+        # a front group, handled by _freeform_group_events_on.
+        if space and not _detect_space(summ) and re.search(r"\bvorne?\b|\bfront\b", desc.lower()):
+            space = None
         if space:
             out.append((space, datetime.fromisoformat(start), datetime.fromisoformat(end)))
     return out
@@ -1775,7 +1783,9 @@ def _freeform_group_events_on(date_iso: str):
             continue
         if parse_event(ev):
             continue
-        if _detect_space(text):
+        if _detect_space(summary):
+            continue
+        if _detect_space(text) and not re.search(r"\bvorne?\b|\bfront\b", (ev.get("description") or "").lower()):
             continue
         if "draussen" in low or "draußen" in low or "outside" in low:
             continue
