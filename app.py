@@ -4198,8 +4198,36 @@ def handle_later(channel: str, sender: str, text: str, mid: str = None, first_me
     finally:
         _pending_reply_clear(sender, mid)
 
+def _dan_owned_thread(sender: str) -> bool:
+    """True if Dan (or the team) has written in this thread and the bot never
+    has. Dan 10 Oct 2026, the bot must not jump into a thread he handles
+    personally, it only pings him. The AI notice therefore only ever goes out
+    in threads the bot itself starts."""
+    try:
+        if _ai_disclosed(sender):
+            return False
+        hist = conv_history(sender)
+        return any(h.get("role") == "assistant" and str(h.get("content", "")).strip() for h in hist[:-1])
+    except Exception:
+        return False
+
+
 def handle(channel: str, sender: str, text: str):
+    if _dan_owned_thread(sender):
+        logger.info("Dan owned thread (%s, %s), bot stays silent and pings Dan", channel, sender)
+        alert_dan("guest wrote in a thread you handle personally, the bot stays silent", channel, sender, text,
+                  "Dan owned thread")
+        conv_append(sender, "assistant", "")
+        return
     action, value, lang = claude_decide(sender, text)
+    if action == "silent":
+        conv_append(sender, "assistant", "")
+        if channel == "whatsapp":
+            try:
+                mark_human_active(sender)
+            except Exception as e:
+                logger.error("pause after viewing ping failed for %s: %s", sender, e)
+        return
     if action == "none":
         _maybe_alert_api_failure(channel, sender, text)
         return
@@ -4683,9 +4711,11 @@ def claude_decide(sender: str, text: str):
                     # so he can say yes fast instead of starting from a
                     # blank question. Same best effort wrapping, this must
                     # never block the guest's actual reply from going out.
+                    viewing_ping = False
                     try:
                         requested = inp.get("viewing_requested")
                         if isinstance(requested, dict):
+                            viewing_ping = True
                             req_name = (requested.get("name") or "").strip() or "Gast"
                             req_occasion = (requested.get("occasion") or "").strip()
                             req_preferred = (requested.get("preferred") or "").strip()
@@ -4761,6 +4791,11 @@ def claude_decide(sender: str, text: str):
                                     logger.warning("Viewing appointment calendar write failed or skipped for %s", sender)
                     except Exception as e:
                         logger.error("viewing_confirmed side effect failed for %s: %s", sender, e)
+                    # Dan 10 Oct 2026, "it shouldnt say anything if its checking
+                    # with me". A viewing request already pinged Dan, the guest
+                    # gets nothing until Dan gives a time himself.
+                    if viewing_ping and action == "reply":
+                        return ("silent", "", lang)
                     return (action, message, lang)
                 if action in ("cancel_request", "escalate_emergency", "escalate_complaint"):
                     return (action, message, lang)
@@ -5432,6 +5467,10 @@ def handle_email(svc, msg_id):
     conv_append(sender_key, "user", text)
     _last_msg[sender_key] = msg_id
     action, value, lang = claude_decide(sender_key, text)
+    if action == "silent":
+        conv_append(sender_key, "assistant", "")
+        mark_handled()
+        return
     if action == "none":
         _maybe_alert_api_failure("email", sender_key, text)
         mark_handled()
