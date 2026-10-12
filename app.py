@@ -927,9 +927,9 @@ def event_date_context(sender: str, text: str) -> str:
             f"EVENT DATUM CHECK fuer {date_iso}, verlass dich NUR hierauf, nicht auf eigene Vermutung "
             f"oder auf das Beispiel weiter unten im Prompt. Dieser Tag ist im Kalender als GESCHLOSSEN "
             f"markiert (\"{status['closed_summary']}\"). Sag dem Gast NIEMALS dass dieser Termin frei "
-            f"oder verfuegbar ist, auch nicht vorlaeufig. Sag stattdessen freundlich, dass du das "
-            f"gerade intern klaerst und dich gleich nochmal meldest, und rufe send_reply mit action "
-            f"handoff auf, reason klar benennen dass dieser Tag als geschlossen markiert ist."
+            f"oder verfuegbar ist, auch nicht vorlaeufig. Antworte mit send_reply action reply, kurz "
+            f"und warm, dass wir an diesem Tag leider geschlossen haben, und frage ob ein anderes "
+            f"Datum passen wuerde."
         )
     if status["collision"]:
         other = (status["collision"].get("summary") or "").strip()
@@ -937,10 +937,11 @@ def event_date_context(sender: str, text: str) -> str:
             f"EVENT DATUM CHECK fuer {date_iso}, verlass dich NUR hierauf, nicht auf eigene Vermutung "
             f"oder auf das Beispiel weiter unten im Prompt. Fuer diesen Tag steht bereits etwas anderes "
             f"im Kalender, bestaetigt oder noch offen: \"{other}\". Sag dem Gast NIEMALS dass dieser "
-            f"Termin sicher frei ist und lege KEINEN event_hold fuer diesen Tag an. Sag stattdessen "
-            f"freundlich, dass du kurz intern pruefen musst ob es klappt, und rufe send_reply mit "
-            f"action handoff auf, reason klar benennen dass fuer denselben Tag schon etwas anderes "
-            f"auf dem Kalender steht."
+            f"Termin frei ist, versprich keinen Raum und keinen Bereich und lege KEINEN event_hold fuer "
+            f"diesen Tag an. Dan 12.10.2026, der Gast bekommt eine ehrliche Antwort, kein Schweigen und "
+            f"kein Versprechen. Antworte mit send_reply action reply, kurz, warm, ohne Namen oder "
+            f"Details zur anderen Reservierung, dass es an diesem Tag leider nicht klappt weil schon "
+            f"etwas fest geplant ist, und frage ob ein anderes Datum passen wuerde. Keine Preise."
         )
     return f"EVENT DATUM CHECK fuer {date_iso}: nichts Widersprechendes im Kalender vermerkt, so weit unauffaellig."
 
@@ -5279,9 +5280,26 @@ _FALSE_BOOKING_MARKERS = (
 )
 
 
+# SPACE AND DATE PROMISES, 12 Oct 2026, Dan: "renting out the space when it's
+# already reserved is an issue and it keeps happening, the bot promised the
+# space without even speaking about pricing or anything." A free text reply
+# (action reply) must never say a date, space or table is free, blocked, held
+# or reserved, only a real booking tool call may, and every private space or
+# event decision belongs to Dan. Any reply containing such wording is blocked
+# and Dan gets a silent alert instead, the guest receives nothing.
+_SPACE_PROMISE_MARKERS = (
+    "noch frei", "ist frei", "sind frei", "bleibt blockiert", "blockiert", "bleibt frei", "bleibt reserviert",
+    "fuer euch reserviert", "für euch reserviert", "fuer dich reserviert", "für dich reserviert",
+    "halte ich euch", "halte ich dir", "halten wir euch", "halten wir dir", "ist noch verfuegbar", "ist noch verfügbar",
+    "ist noch offen", "steht fuer euch", "steht für euch", "steht fuer dich", "steht für dich",
+    "klappt bei uns", "geht klar", "passt bei uns", "ist gebucht", "ist vorgemerkt", "habe ich vorgemerkt",
+    "hab ich vorgemerkt", "is still free", "is still available", "i will hold", "i'll hold", "is reserved for you",
+)
+
+
 def _looks_like_false_booking_confirmation(reply: str) -> bool:
     low = reply.lower()
-    return any(m in low for m in _FALSE_BOOKING_MARKERS)
+    return any(m in low for m in _FALSE_BOOKING_MARKERS) or any(m in low for m in _SPACE_PROMISE_MARKERS)
 
 
 def _maybe_alert_api_failure(channel: str, sender: str, text: str):
