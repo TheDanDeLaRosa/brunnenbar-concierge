@@ -953,7 +953,8 @@ def event_date_context(sender: str, text: str) -> str:
         return ""
     try:
         svc = _calendar_service()
-        status = _event_date_status(svc, date_iso, sender)
+        _p, _sp = _party_space_from_text(sender, text)
+        status = _event_date_status(svc, date_iso, sender, _p, _sp)
     except Exception as e:
         logger.warning("event_date_context failed for %s on %s: %s", sender, date_iso, e)
         return ""
@@ -978,7 +979,14 @@ def event_date_context(sender: str, text: str) -> str:
             f"Details zur anderen Reservierung, dass es an diesem Tag leider nicht klappt weil schon "
             f"etwas fest geplant ist, und frage ob ein anderes Datum passen wuerde. Keine Preise."
         )
-    return f"EVENT DATUM CHECK fuer {date_iso}: nichts Widersprechendes im Kalender vermerkt, so weit unauffaellig."
+    cap = status.get("back_capacity")
+    cap_txt = ""
+    if cap is not None:
+        cap_txt = (f" Im hinteren Bereich ist an diesem Abend Platz fuer hoechstens {cap} Personen"
+                   f"{'' if status.get('whole_bar_free') else ', die ganze Bar ist nicht komplett frei'}. "
+                   "Nenne den Termin nie als frei fuer mehr Personen oder fuer die ganze Bar wenn sie nicht frei ist, "
+                   "und frage zuerst nach der Personenzahl.")
+    return f"EVENT DATUM CHECK fuer {date_iso}: nichts Widersprechendes im Kalender vermerkt, so weit unauffaellig.{cap_txt}"
 
 
 _DE_WORDS = set(
@@ -1278,7 +1286,7 @@ def _pending_hold_all_senders():
     return list(_pending_hold_local_all)
 
 
-def _event_date_status(svc, date_iso: str, exclude_sender: str = ""):
+def _event_date_status(svc, date_iso: str, exclude_sender: str = "", party=None, space=None):
     """Real status of one day on RESERVIERUNGEN_CALENDAR_ID for a GROUPS AND
     EVENTS inquiry: an explicit closure (holiday, Betriebsferien) or a
     colliding tentative hold from a DIFFERENT guest. Returns
@@ -1350,32 +1358,27 @@ def _event_date_status(svc, date_iso: str, exclude_sender: str = ""):
                 }
                 break
         # BUGFIX 12 Oct 2026, the bot told Sarah (Halloween party, 31.10.) the
-        # date was free and blocked it while "Evy Gel, Sofa, 20:00" already
-        # sat on the calendar. Dan: "the bot jumped again and confirmed
-        # another party without consulting me and us already having a
-        # reservation." An event inquiry only counts as free on a night with
-        # NO other evening entry at all, a table booking, a freeform entry,
-        # anything. Everything else is a silent handoff to Dan, who decides
-        # whether the party fits around it.
+        # date was free while "Evy Gel, Sofa, 20:00" sat on the calendar.
+        # REVISED 12 Oct 2026, Dan: assembly can be flexible but never
+        # overbook, every entry is checked against what is actually
+        # available. Evy on the Sofa blocks the Sofa and the whole bar, but
+        # HT1, HT2 and HT3 still take 20 people. So the date is a collision
+        # only when the requested space or headcount no longer fits the free
+        # tables, see _back_free_capacity.
         if not out["collision"] and not out["closed"]:
-            skip_words = _FREEFORM_SKIP_WORDS + ("bar wird",)
-            for ev in items:
-                summ = (ev.get("summary") or "").strip()
-                sl = summ.lower()
-                if not summ or sl.startswith("abgesagt") or any(w in sl for w in skip_words):
-                    continue
-                st = ev.get("start", {}).get("dateTime")
-                if not st:
-                    continue
-                en = ev.get("end", {}).get("dateTime") or st
-                evening = lo.replace(hour=17)
-                if datetime.fromisoformat(en) <= evening:
-                    continue  # a daytime entry such as a course, not the evening
-                phones = [_norm_phone(p) for p in re.findall(r"\+?\d[\d\s]{6,}\d", ev.get("description") or "")]
-                if exclude_norm and exclude_norm in phones:
-                    continue  # the guest's own earlier entry
-                out["collision"] = {"summary": f"another reservation is already on the calendar that evening, {summ}"}
-                break
+            try:
+                back_cap, bar_free = _evening_capacity(date_iso)
+                out["back_capacity"] = back_cap
+                out["whole_bar_free"] = bar_free
+                need_whole = space == "ganze_bar" or (party or 0) > PRIVATE_SPACES["hinterer_bereich"]["capacity"]
+                if need_whole and not bar_free:
+                    out["collision"] = {"summary": "other reservations already on the calendar that evening, the whole bar is not free"}
+                elif party and party > back_cap and not need_whole:
+                    out["collision"] = {"summary": f"the back has room for about {back_cap} guests that evening, not {party}"}
+                elif back_cap <= 0:
+                    out["collision"] = {"summary": "the back is fully taken that evening"}
+            except Exception as e:
+                logger.warning("evening capacity check failed for %s: %s", date_iso, e)
         return out
     except Exception as e:
         logger.warning("Event date status check failed for %s: %s", date_iso, e)
@@ -1524,7 +1527,7 @@ def upsert_pending_hold(sender: str, name: str, party: int, date_iso: str, occas
             except Exception as e:
                 logger.warning("Pending hold update failed for %s (id %s), creating a new one instead: %s",
                                 sender, existing.get("event_id"), e)
-        status = _event_date_status(svc, date_iso, sender)
+        status = _event_date_status(svc, date_iso, sender, party)
         if status["closed"]:
             alert_dan(
                 "event inquiry for a date marked closed on the calendar",
@@ -1812,14 +1815,11 @@ def find_private_space(date_iso: str, start_dt: datetime, party: int, space: str
         if s < end_dt and start_dt < e:
             return False
     # freeform large group entries sit in the back too, added 09 Oct 2026
-    for fp, fs, fe, zone in _freeform_group_events_on(date_iso):
-        if zone == "back" and fs < end_dt and start_dt < max(fe, fs + turn):
-            return False
-    # table ledger, the back room tables (HT1, HT2, HT3, Sofa) must all be free
+    # (freeform back groups are placed on tables by the ledger below)
+    # table ledger, the free back tables must hold the party. Partial is fine,
+    # Evy on the Sofa leaves HT1, HT2 and HT3 for 20, Dan 12.10.2026.
     occ, _big = _night_ledger(date_iso, start_dt, end_dt)
-    if occ & BACK_POOL:
-        return False
-    return True
+    return party <= _back_free_capacity(occ)
 
 
 FRONT_TAKEOVER_PARTY = int(os.environ.get("FRONT_TAKEOVER_PARTY", "12"))
@@ -2133,6 +2133,54 @@ def _night_ledger(date_iso, start_dt, req_end):
         if party >= BIG_EVENT_PARTY:
             big_inside = True
     return occ, big_inside
+
+
+SOFA_COMBO_SEATS = 5
+
+
+def _back_free_capacity(occ):
+    """How many guests the back can still take given occupied tables. Whole
+    back free means standing capacity (about 45), otherwise the seats of the
+    free back tables. Dan 12 Oct 2026, Evy on the Sofa does not block HT1,
+    HT2 and HT3, those still take 20 people."""
+    if not (occ & BACK_POOL):
+        return PRIVATE_SPACES["hinterer_bereich"]["capacity"]
+    return sum(SOFA_COMBO_SEATS if t == "Sofa" else _table_seats(t) for t in (BACK_POOL - occ))
+
+
+def _evening_capacity(date_iso, start_dt=None):
+    """(back capacity left, whole bar free bool) for the evening window."""
+    day = datetime.fromisoformat(date_iso).replace(tzinfo=BAR_TZ, hour=0, minute=0, second=0, microsecond=0)
+    # start time unknown at inquiry time, so check the whole evening, 18 to 3 Uhr
+    st = start_dt or day.replace(hour=18)
+    en = (st + timedelta(hours=TURN_HOURS)) if start_dt else day.replace(hour=23) + timedelta(hours=4)
+    occ, _big = _night_ledger(date_iso, st, en)
+    return _back_free_capacity(occ), (not occ)
+
+
+_GUEST_PARTY_RE = re.compile(r"(\d{1,3})\s*(?:bis|\-|–|to)?\s*(\d{1,3})?\s*(?:personen|leute|g[aä]ste|people|guests|pax|freunde)", re.I)
+
+
+def _party_space_from_text(sender, text):
+    """Best effort guest headcount (largest number named) and requested space
+    from the message plus the recent thread."""
+    blobs = [str(text or "")]
+    try:
+        blobs += [str(h.get("content", "")) for h in conv_history(sender)[-10:] if h.get("role") == "user"]
+    except Exception:
+        pass
+    party = None
+    space = None
+    for b in reversed(blobs):
+        if party is None:
+            nums = []
+            for m in _GUEST_PARTY_RE.finditer(b):
+                nums += [int(x) for x in m.groups() if x]
+            if nums:
+                party = max(nums)
+        if space is None:
+            space = _detect_space(b)
+    return party, space
 
 
 def find_free_table(date_iso: str, start_dt: datetime, party: int, area: str):
@@ -5447,6 +5495,12 @@ _DECLINE_TEXT = {
 }
 
 
+_ASK_PARTY_TEXT = {
+    "de": "Mit wie vielen Leuten wärt ihr denn ungefähr? Dann schaue ich, was an dem Abend bei uns möglich ist.",
+    "en": "Roughly how many people would you be? Then I can check what works for that evening.",
+}
+
+
 def _space_promise_check(sender: str, text: str, reply: str, lang=None):
     """Dan 12 Oct 2026, a reply may say a date or space is free, it just must
     never be wrong. Returns ("ok", reply) when the reply makes no claim or the
@@ -5466,7 +5520,10 @@ def _space_promise_check(sender: str, text: str, reply: str, lang=None):
                         break
         if not date_iso:
             return ("block", "")
-        status = _event_date_status(_calendar_service(), date_iso, sender)
+        _p, _sp = _party_space_from_text(sender, text)
+        status = _event_date_status(_calendar_service(), date_iso, sender, _p, _sp)
+        if not _p and not _sp and status.get("whole_bar_free") is False:
+            return ("ask", _ASK_PARTY_TEXT.get(lang or "de", _ASK_PARTY_TEXT["de"]))  # busy night, headcount unknown
         if status["closed"] or status["collision"]:
             return ("decline", _DECLINE_TEXT.get(lang or "de", _DECLINE_TEXT["de"]))
         return ("ok", reply)
