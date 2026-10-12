@@ -4318,6 +4318,13 @@ def handle(channel: str, sender: str, text: str):
                       "blocked before sending, guest needs a real reply and a real table from you",
                       channel, sender, text, reply[:200])
             return
+        verdict, checked = _space_promise_check(sender, text, reply, lang)
+        if verdict == "block":
+            logger.error("Blocked an unverifiable date or space claim (%s, %s): %s", channel, sender, reply[:300])
+            alert_dan("bot's draft claimed a date or space was free or held and the calendar could not verify it, "
+                      "not sent, please reply yourself", channel, sender, text, reply[:200])
+            return
+        reply = checked
     reply = (reply or "").strip()
     if not reply:
         logger.info("No reply, empty draft")
@@ -5299,7 +5306,42 @@ _SPACE_PROMISE_MARKERS = (
 
 def _looks_like_false_booking_confirmation(reply: str) -> bool:
     low = reply.lower()
-    return any(m in low for m in _FALSE_BOOKING_MARKERS) or any(m in low for m in _SPACE_PROMISE_MARKERS)
+    return any(m in low for m in _FALSE_BOOKING_MARKERS)
+
+
+_DECLINE_TEXT = {
+    "de": "Da muss ich dir leider absagen, an dem Tag ist bei uns schon etwas fest geplant. Passt dir vielleicht ein anderes Datum?",
+    "en": "I am sorry, that day does not work for us, something is already planned. Would another date suit you?",
+}
+
+
+def _space_promise_check(sender: str, text: str, reply: str, lang=None):
+    """Dan 12 Oct 2026, a reply may say a date or space is free, it just must
+    never be wrong. Returns ("ok", reply) when the reply makes no claim or the
+    calendar confirms it, ("decline", honest text) when the calendar shows the
+    date is taken or closed, ("block", "") when a claim cannot be verified, no
+    date found, so Dan gets an alert instead of a possibly false promise."""
+    low = (reply or "").lower()
+    if not any(m in low for m in _SPACE_PROMISE_MARKERS):
+        return ("ok", reply)
+    try:
+        now = datetime.now(BAR_TZ)
+        date_iso = _extract_de_date(text, now)
+        if not date_iso:
+            for h in reversed(conv_history(sender)[-8:]):
+                if h.get("role") == "user":
+                    date_iso = _extract_de_date(str(h.get("content", "")), now)
+                    if date_iso:
+                        break
+        if not date_iso:
+            return ("block", "")
+        status = _event_date_status(_calendar_service(), date_iso, sender)
+        if status["closed"] or status["collision"]:
+            return ("decline", _DECLINE_TEXT.get(lang or "de", _DECLINE_TEXT["de"]))
+        return ("ok", reply)
+    except Exception as e:
+        logger.warning("space promise check failed for %s: %s", sender, e)
+        return ("block", "")
 
 
 def _maybe_alert_api_failure(channel: str, sender: str, text: str):
@@ -5571,6 +5613,14 @@ def handle_email(svc, msg_id):
                       "email", from_addr, text, reply[:200])
             mark_handled()
             return
+        verdict, checked = _space_promise_check(sender_key, text, reply, lang)
+        if verdict == "block":
+            logger.error("Blocked an unverifiable date or space claim (email) from %s: %s", from_addr, reply[:300])
+            alert_dan("bot's draft claimed a date or space was free or held and the calendar could not verify it, "
+                      "not sent, please reply yourself (email)", "email", from_addr, text, reply[:200])
+            mark_handled()
+            return
+        reply = checked
     reply = (reply or "").strip()
     if not reply:
         logger.info("email empty draft from %s", from_addr)
