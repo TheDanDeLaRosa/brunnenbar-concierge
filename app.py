@@ -1762,6 +1762,10 @@ def _detect_space(text: str):
                    "exklusive bar", "whole bar", "exclusive bar", "komplette bar"):
         if phrase in low:
             return "ganze_bar"
+    # 12 Oct 2026, live eval found "Dan - Geschlossene" on 17.10.2026, a closed
+    # private party, read as nothing at all, tables were still offered that night.
+    if re.search(r"\bgeschlossene\b|geschlossene gesellschaft|private party|privatveranstaltung|privatfeier exklusiv", low):
+        return "ganze_bar"
     return None
 
 
@@ -3654,6 +3658,8 @@ Human, Top, freu mich, bis dann
 Too AI, Vielen Dank für deine Nachricht, gerne kannst du bei uns einen Tisch reservieren, für wie viele Personen darf ich reservieren?
 Human, Klar, für wie viele?
 
+PRICES NEVER IN THE FIRST OR SECOND MESSAGE. Root rule, Dan. In the guest's first or second message you never name a price, a number with Euro, the Mindestumsatz, a Miete, the Trinkgeld or how paying for a space works, not even the word Mindestumsatz without a number. If the guest asks about prices or costs first, react warmly and ask how many people they will be and whether they have been to BrunnenBar before, the pricing comes later in Step four. The code checks this and makes you rewrite a draft that breaks it.
+
 HARD FORMAT RULES, no exceptions. Never use hyphens, dashes, bullet points, numbered lists, colons or semicolons. Clock times like 19 Uhr are fine. Connect thoughts with und and dann and the odd comma the way Dan does, CHANGED 17 Sep 2026, Dan reviewed a real thread and called it way too many commas, follow regular WhatsApp styling of human writing. That means one comma joining two short thoughts is normal, a whole message chained together as one long comma after comma sentence is not, real people hit a full stop and start a new short sentence instead of running everything together, when in doubt write two short sentences rather than one long one. No emoji beyond the occasional simple smiley. For a guest's own birthday number, never write it with a bare dot like 30., that reads like an unfinished ordinal, write it out the casual way instead, like 30ter, or fold in the word Geburtstag so it is never a lone number with a dot. Sign off with Dein BrunnenBar Team, never with LG Dan or any personal name, and you do not need it on every single short back and forth message, use it the way a person would, see VOICE above for when it actually fits.
 
 LANGUAGE. Reply completely in the language the guest wrote in, and never mix two languages in one message. If the guest writes English, the whole reply must be natural English, so write inside or outside, not drinnen or draussen, and do not drop in German phrases like sehr gerne. The sign off also follows the reply language, Dein BrunnenBar Team in German, Your BrunnenBar Team in English, never LG Dan in either language. If the guest writes German, reply fully in German. The words drinnen and draussen only ever appear inside the book_table tool call, never in an English guest message. Also never drop a stray English business word into an otherwise German reply, like Pricing or Deal, plain German only, that is as jarring as switching languages mid sentence.
@@ -4452,7 +4458,7 @@ def _eval_next(weekday, min_days=3, need_free=False):
 
 def _eval_scenarios():
     fri = _eval_next(4, need_free=True)
-    sat = _eval_next(5)
+    sat = _eval_next(5, need_free=True)
     thu = _eval_next(3)
     tue = _eval_next(1)
     F = f"{fri.day}.{fri.month}."
@@ -4524,6 +4530,19 @@ def _eval_scenarios():
         {"id": "S39_alkoholfrei", "text": "Habt ihr auch alkoholfreie Cocktails?", "expect": ["reply"], "no_price": True, "reply_any": [r"alkoholfrei|ohne Alkohol"]},
         {"id": "S40_sunday_private", "text": "Können wir an einem Sonntag die ganze Bar für 40 Leute buchen?", "expect": ["handoff", "reply"], "no_claim": True, "no_book": True},
         {"id": "S41_name_missing", "text": f"Tisch für 3 am {F} um 19 Uhr drinnen, kein Anlass", "expect": ["reply", "book"], "must_not_book": True},
+        {"id": "S43_twenty_next_to_sofa", "text": "Tisch für 20 Leute am 31.10. um 20 Uhr bitte, Name Paul, kein Anlass, drinnen",
+         "expect": ["book", "reply"], "no_claim": True, "skip_if_past": "2026-10-31"},
+        {"id": "S44_back_exclusive_sofa_taken", "text": "Können wir am 31.10. den hinteren Bereich exklusiv für 30 Leute haben?",
+         "expect": ["reply", "handoff"], "no_claim": True, "no_book": True, "no_price": True, "skip_if_past": "2026-10-31"},
+        {"id": "S45_english_whole_bar_taken", "text": "Hi, could we rent the whole bar on October 31st for about 40 people?",
+         "expect": ["reply", "handoff"], "no_claim": True, "no_book": True, "english": True, "skip_if_past": "2026-10-31"},
+        {"id": "S46_private_party_night", "text": "Habt ihr am 17.10. abends noch Platz für 2?", "expect": ["reply", "book"],
+         "no_claim": True, "skip_if_past": "2026-10-17"},
+        {"id": "S47_accepts_alternative", "history": [("user", f"Tisch für 2 am {F} um 20 Uhr drinnen, Name Mia, kein Anlass"),
+                                                      ("assistant", "Um 20 Uhr sind wir drinnen leider schon voll. Um 21:30 Uhr hätten wir noch einen Tisch für euch, würde euch das passen?")],
+         "text": "Ja 21:30 passt perfekt", "expect": ["book"], "book": {"party": 2, "time": "21:30", "date": fri.isoformat()}},
+        {"id": "S48_headcount_change", "history": booked_hist, "ctx": booked_ctx, "text": "Wir sind am Freitag jetzt doch 6 statt 4, geht das?",
+         "expect": ["handoff"]},
         {"id": "S42_split_tables_ok", "text": f"Hi, wir sind 18 Leute und möchten am {F} um 20 Uhr einfach Tische, Name Paul, kein Anlass, drinnen",
          "expect": ["book", "reply"], "no_price": True},
     ]
@@ -4539,7 +4558,7 @@ def _eval_one(sc):
         return res
     hist = [{"role": r, "content": c} for r, c in sc.get("history", [])] + [{"role": "user", "content": sc["text"]}]
     sender = "eval:" + sc["id"]
-    action, val, lang = claude_decide(sender, sc["text"], history=hist, dry_run=True, extra_system=sc.get("ctx", ""))
+    action, val, lang = _decide_checked(sender, sc["text"], history=hist, dry_run=True, extra_system=sc.get("ctx", ""))
     if action != "raw":
         res["pass"] = False
         res["fails"].append("model returned no tool call")
@@ -4603,7 +4622,8 @@ def _eval_one(sc):
             if sc.get("no_claim"):
                 fail("claimed a date or space is free or held")
             verdict, _out = _space_promise_check(sender, sc["text"], msg, lang, history=hist)
-            if verdict != "ok" and not (verdict == "block" and inp.get("event_hold")):
+            backed = inp.get("event_hold") or "bestaetigte Reservierung" in sc.get("ctx", "")
+            if verdict != "ok" and not (verdict == "block" and backed):
                 res["warn"].append(f"promise guard would act ({verdict}), the prompt let a claim through")
                 if sc.get("hold_needs_event_hold") or sc.get("no_claim"):
                     fail(f"unbacked claim, guard verdict {verdict}")
@@ -5105,6 +5125,56 @@ def handle_later(channel: str, sender: str, text: str, mid: str = None, first_me
     finally:
         _pending_reply_clear(sender, mid)
 
+_EARLY_PRICE_RE = re.compile(r"\d+\s*(€|euro\b)|mindestumsatz|trinkgeld|servicegeb|\bmiete\b", re.I)
+_ALWAYS_BANNED_RE = re.compile(r"\bLG,? Dan\b|liebe grüße,? dan\b|servicegebühr|servicegebuehr", re.I)
+
+
+def _rule_violations(msg: str, user_turns: int):
+    """Hard house rules a draft can break. Root CLAUDE.md, no prices,
+    Mindestumsatz or Trinkgeld in the first or second message."""
+    out = []
+    if not msg:
+        return out
+    if user_turns <= 2 and _EARLY_PRICE_RE.search(msg):
+        out.append("it names a price, the Mindestumsatz, Miete or Trinkgeld in the guest's first or second message, "
+                   "which is never allowed, instead ask how many people and whether they have been to BrunnenBar before")
+    if _ALWAYS_BANNED_RE.search(msg):
+        out.append("it signs as Dan or says Servicegebühr, both never allowed")
+    return out
+
+
+def _draft_message(res, dry_run):
+    action, val, _lang = res
+    if dry_run and action == "raw":
+        inp = val.get("input") or {}
+        return (inp.get("message") or "") if val.get("tool") == "send_reply" else ""
+    return val if isinstance(val, str) else ""
+
+
+def _decide_checked(sender, text, history=None, dry_run=False, extra_system=""):
+    """claude_decide plus one self correction when a draft breaks a hard house
+    rule. A second broken draft is never sent, Dan gets it. 12 Oct 2026,
+    live eval found an early Mindestumsatz mention and an early price."""
+    res = claude_decide(sender, text, history=history, dry_run=dry_run, extra_system=extra_system)
+    hist = history if history is not None else conv_history(sender)
+    turns = sum(1 for h in hist if h.get("role") == "user") or 1
+    viol = _rule_violations(_draft_message(res, dry_run), turns)
+    if not viol:
+        return res
+    logger.warning("draft broke a hard rule for %s, retrying once: %s", sender, viol)
+    corr = ("KORREKTUR. Dein letzter Entwurf hat eine feste Hausregel verletzt, " + "; ".join(viol) +
+            ". Schreib die Antwort komplett neu und halte dich an die Regel.")
+    res2 = claude_decide(sender, text, history=history, dry_run=dry_run,
+                         extra_system=(extra_system + "\n\n" + corr).strip())
+    viol2 = _rule_violations(_draft_message(res2, dry_run), turns)
+    if not viol2:
+        return res2
+    if dry_run:
+        return res2
+    return ("handoff", {"reason": "the draft broke a hard house rule twice and was not sent, " + "; ".join(viol2),
+                        "message": ""}, res2[2])
+
+
 def _cancel_and_tell_dan(channel: str, sender: str, text: str):
     """Audit F12. Frees the guest's own bot made booking at once, everything
     else stays Dan's call. Dan always gets told what happened."""
@@ -5144,7 +5214,7 @@ def handle(channel: str, sender: str, text: str):
                   "Dan owned thread")
         conv_append(sender, "assistant", "")
         return
-    action, value, lang = claude_decide(sender, text)
+    action, value, lang = _decide_checked(sender, text)
     if action == "silent":
         conv_append(sender, "assistant", "")
         if channel == "whatsapp":
@@ -6265,11 +6335,22 @@ def _has_hold_claim(reply: str) -> bool:
 
 
 def _has_hold_for(sender: str, date_iso: str) -> bool:
+    """A real hold or a real booking for this guest on that date. 12 Oct 2026,
+    the live eval showed "wir halten den Tisch 20 Minuten" to a guest with a
+    confirmed table being blocked because only pending holds counted."""
     try:
         rec = _pending_hold_get(sender)
+        if rec and str(rec.get("date") or "") == date_iso:
+            return True
     except Exception:
-        return False
-    return bool(rec) and str(rec.get("date") or "") == date_iso
+        pass
+    try:
+        for b in _guest_bookings(sender):
+            if not b["viewing"] and str(_service_slot(datetime.fromisoformat(b["start"]))[0]) == date_iso:
+                return True
+    except Exception:
+        pass
+    return False
 
 
 def _looks_like_false_booking_confirmation(reply: str) -> bool:
@@ -6308,6 +6389,8 @@ def _space_promise_check(sender: str, text: str, reply: str, lang=None, history=
                         break
         if not date_iso:
             return ("block", "")
+        if _has_hold_claim(reply) and _has_hold_for(sender, date_iso):
+            return ("ok", reply)  # the guest's own hold or booking backs it
         _p, _sp = _party_space_from_text(sender, text, history)
         status = _event_date_status(_calendar_service(), date_iso, sender, _p, _sp)
         if not _p and not _sp and status.get("whole_bar_free") is False:
@@ -6532,7 +6615,7 @@ def handle_email(svc, msg_id):
     logger.info("Email in from %s: %s", from_addr, (subject or body)[:120])
     conv_append(sender_key, "user", text)
     _last_msg[sender_key] = msg_id
-    action, value, lang = claude_decide(sender_key, text)
+    action, value, lang = _decide_checked(sender_key, text)
     if action == "silent":
         conv_append(sender_key, "assistant", "")
         mark_handled()
