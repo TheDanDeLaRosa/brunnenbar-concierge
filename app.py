@@ -1313,6 +1313,33 @@ def _event_date_status(svc, date_iso: str, exclude_sender: str = ""):
                     "summary": f"real {PRIVATE_SPACES[space]['label']} booking already on the calendar that day",
                 }
                 break
+        # BUGFIX 12 Oct 2026, the bot told Sarah (Halloween party, 31.10.) the
+        # date was free and blocked it while "Evy Gel, Sofa, 20:00" already
+        # sat on the calendar. Dan: "the bot jumped again and confirmed
+        # another party without consulting me and us already having a
+        # reservation." An event inquiry only counts as free on a night with
+        # NO other evening entry at all, a table booking, a freeform entry,
+        # anything. Everything else is a silent handoff to Dan, who decides
+        # whether the party fits around it.
+        if not out["collision"] and not out["closed"]:
+            skip_words = _FREEFORM_SKIP_WORDS + ("bar wird",)
+            for ev in items:
+                summ = (ev.get("summary") or "").strip()
+                sl = summ.lower()
+                if not summ or sl.startswith("abgesagt") or any(w in sl for w in skip_words):
+                    continue
+                st = ev.get("start", {}).get("dateTime")
+                if not st:
+                    continue
+                en = ev.get("end", {}).get("dateTime") or st
+                evening = lo.replace(hour=17)
+                if datetime.fromisoformat(en) <= evening:
+                    continue  # a daytime entry such as a course, not the evening
+                phones = [_norm_phone(p) for p in re.findall(r"\+?\d[\d\s]{6,}\d", ev.get("description") or "")]
+                if exclude_norm and exclude_norm in phones:
+                    continue  # the guest's own earlier entry
+                out["collision"] = {"summary": f"another reservation is already on the calendar that evening, {summ}"}
+                break
         return out
     except Exception as e:
         logger.warning("Event date status check failed for %s: %s", date_iso, e)
