@@ -3233,28 +3233,29 @@ def _table_where(area, table, lang):
 
 
 def _table_confirmation(name, party, start_dt, area, table, sie, lang):
+    """Dan's own layout, 12.10.2026. Booking in one line, late arrival by phone,
+    changes via chat, the AGB as a separate last line."""
     hm = _fmt_hm(start_dt)
     if lang == "en":
         where = _table_where(area, table, "en")
-        return random.choice([
-            f"Done, we have you down for {party} on {_date_words(start_dt, 'en')} at {hm} {where}, under {name}, our terms apply, brunnenbar.com/agb.",
-            f"All set, {party} people on {_date_words(start_dt, 'en')} at {hm} {where}, under {name}, our terms apply, brunnenbar.com/agb.",
-        ]) + (" We hold the table for 20 minutes. If you are running more than 15 minutes late please call the bar on "
-              "0821 47019035, and if anything changes just message us here. See you then")
+        return (random.choice(["Perfect", "Great", "All set"]) +
+                f", you are booked for {party} on {_date_words(start_dt, 'en')} at {hm} {where}, under the name {name}. "
+                "If you are running more than 15 minutes late, please call the bar on 0821 47019035 (not via WhatsApp) "
+                "and we will keep your table for you. If anything changes, just message us here. Looking forward to seeing you"
+                "\n\nOur terms apply, brunnenbar.com/agb.")
     where = _table_where(area, table, "de")
     when = _date_words(start_dt, "de")
     if sie:
-        return (random.choice([
-            f"Sehr gerne, wir haben Sie für {party} Personen am {when} um {hm} Uhr {where} eingetragen, auf den Namen {name}, es gelten unsere AGB unter brunnenbar.com/agb.",
-            f"Perfekt, Sie sind für {party} Personen am {when} um {hm} Uhr {where} eingetragen, auf den Namen {name}, es gelten unsere AGB unter brunnenbar.com/agb.",
-        ]) + " Wir halten den Tisch 20 Minuten. Wird es später als 15 Minuten, rufen Sie bitte kurz in der Bar an unter "
-             "0821 47019035, und falls sich etwas ändert, schreiben Sie uns einfach hier. Wir freuen uns auf Sie")
-    return (random.choice([
-        f"Top, wir haben euch für {party} Leute am {when} um {hm} Uhr {where} eingetragen, auf den Namen {name}, es gelten unsere AGB unter brunnenbar.com/agb.",
-        f"Passt, {party} Leute am {when} um {hm} Uhr {where} sind eingetragen, auf den Namen {name}, es gelten unsere AGB unter brunnenbar.com/agb.",
-        f"Super, ihr seid am {when} um {hm} Uhr {where} eingetragen, {party} Leute auf den Namen {name}, es gelten unsere AGB unter brunnenbar.com/agb.",
-    ]) + " Wir halten den Tisch 20 Minuten. Wird es später als 15 Minuten, ruf bitte kurz in der Bar an unter "
-         "0821 47019035, und falls sich was ändert, schreib uns einfach hier. Wir freuen uns auf euch")
+        return (random.choice(["Perfekt", "Sehr gerne"]) +
+                f", dann sind Sie für {party} Personen am {when} um {hm} Uhr {where} eingetragen, auf den Namen {name}. "
+                "Falls Sie sich mehr als 15 Minuten verspäten, rufen Sie bitte kurz in der Bar an unter 0821 47019035 "
+                "(nicht über WhatsApp) und wir halten Ihnen den Platz frei. Falls sich etwas ändert, schreiben Sie uns einfach hier. "
+                "Wir freuen uns auf Sie\n\nEs gelten unsere AGB unter brunnenbar.com/agb.")
+    return (random.choice(["Perfekt", "Top", "Super"]) +
+            f", dann seid ihr für {party} Leute am {when} um {hm} Uhr {where} eingetragen, auf den Namen {name}. "
+            "Falls ihr euch mehr als 15 Minuten verspätet, ruf bitte kurz in der Bar an unter 0821 47019035 "
+            "(nicht über WhatsApp) und wir halten euch den Platz frei. Falls sich was ändert, schreib uns einfach hier. "
+            "Wir freuen uns auf euch\n\nEs gelten unsere AGB unter brunnenbar.com/agb.")
 
 
 def _space_confirmation(space, name, party, start_dt, sie, lang):
@@ -3262,18 +3263,18 @@ def _space_confirmation(space, name, party, start_dt, sie, lang):
     mu = PRIVATE_SPACES[space]["mindestumsatz"]
     if lang == "en":
         where = "the back room" if space == "hinterer_bereich" else "the whole bar exclusively"
-        return (f"You are booked in, {where} on {_date_words(start_dt, 'en')} at {hm} for about {party} guests, under {name}, our terms apply, brunnenbar.com/agb. "
-                f"The minimum spend is {mu} Euro and simply runs through your drinks. If anything changes just message us here. "
-                "See you then")
+        return (f"Perfect, {where} is booked for you on {_date_words(start_dt, 'en')} at {hm} for about {party} guests, "
+                f"under the name {name}. The minimum spend is {mu} Euro and simply runs through your drinks. If anything "
+                "changes, just message us here. Looking forward to it\n\nOur terms apply, brunnenbar.com/agb.")
     where = "der hintere Bereich" if space == "hinterer_bereich" else "die ganze Bar exklusiv"
     when = _date_words(start_dt, "de")
     if sie:
-        return (f"Sehr gerne, {where} ist für Sie eingetragen, am {when} um {hm} Uhr für etwa {party} Gäste auf den Namen {name}, es gelten unsere AGB unter brunnenbar.com/agb. "
+        return (f"Perfekt, dann ist {where} für Sie am {when} um {hm} Uhr eingetragen, für etwa {party} Gäste auf den Namen {name}. "
                 f"Der Mindestumsatz liegt bei {mu} Euro und läuft ganz normal über Ihre Getränke. Falls sich etwas ändert, "
-                "schreiben Sie uns einfach hier. Wir freuen uns auf Sie")
-    return (f"Top, {where} ist für euch eingetragen, am {when} um {hm} Uhr für etwa {party} Leute auf den Namen {name}, es gelten unsere AGB unter brunnenbar.com/agb. "
+                "schreiben Sie uns einfach hier. Wir freuen uns auf Sie\n\nEs gelten unsere AGB unter brunnenbar.com/agb.")
+    return (f"Perfekt, dann ist {where} für euch am {when} um {hm} Uhr eingetragen, für etwa {party} Leute auf den Namen {name}. "
             f"Der Mindestumsatz liegt bei {mu} Euro und läuft ganz normal über eure Getränke. Falls sich was ändert, "
-            "schreib uns einfach hier. Wir freuen uns auf euch")
+            "schreib uns einfach hier. Wir freuen uns auf euch\n\nEs gelten unsere AGB unter brunnenbar.com/agb.")
 
 
 # ---- F12, cancellation frees the table at once ------------------------------
