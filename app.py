@@ -809,10 +809,12 @@ def bar_time_context():
     # comparison to the model to work out from the raw time was unreliable.
     # after_18 is now computed here in code and stated as a direct yes/no
     # instruction, so the model never has to do that arithmetic itself.
-    after_18 = h >= 18
+    # CHANGED 12 Oct 2026, Dan: push to call only while the bar is open, the calendar cannot show a full room of
+    # walk ins. Before opening a same day table is booked by message as normal.
+    after_18 = open_now
     if after_18:
         same_day_note = (
-            "Es ist JETZT nach 18 Uhr. Will ein Gast einen Tisch fuer HEUTE, gilt SAME DAY BY "
+            "Die Bar ist JETZT offen. Will ein Gast einen Tisch fuer HEUTE, gilt SAME DAY BY "
             "PHONE aus den Regeln, danke ihnen fuer die Nachricht und sag ihnen sie sollen direkt "
             "unter 0821 47019035 anrufen, mit dem kurzen Grund dass das Team vor Ort live sehen "
             "kann was noch frei ist und die Reservierung gleich aufnimmt, nicht nur dass ein Anruf "
@@ -820,7 +822,7 @@ def bar_time_context():
         )
     else:
         same_day_note = (
-            "Es ist JETZT NICHT nach 18 Uhr. Will ein Gast einen Tisch fuer HEUTE zu einer spaeteren "
+            "Die Bar ist JETZT noch nicht offen. Will ein Gast einen Tisch fuer HEUTE zu einer spaeteren "
             "Uhrzeit, ist das eine ganz normale Vorausbuchung wie jede andere, SAME DAY BY PHONE gilt "
             "hier NICHT, sammle die ueblichen Angaben und ruf book_table ganz normal auf."
         )
@@ -1730,7 +1732,7 @@ def pending_hold_followup_loop():
 # about actually booking the space is now automatic. Mindestumsatz is always
 # the one standard published number, 700 or 1700 Euro, never negotiated here.
 PRIVATE_SPACES = {
-    "hinterer_bereich": {"capacity": 45, "mindestumsatz": 700, "label": "Hinterer Bereich"},  # standing, Dan 09.10.2026
+    "hinterer_bereich": {"capacity": 40, "mindestumsatz": 700, "label": "Hinterer Bereich"},  # 28 seats, about 40 standing, Dan 12.10.2026
     "ganze_bar": {"capacity": 65, "mindestumsatz": 1700, "label": "Ganze Bar exklusiv"},
 }
 
@@ -2152,7 +2154,7 @@ def _night_ledger(date_iso, start_dt, req_end):
     for party, low, summary in pending:
         # Standing capacity for parties, Dan 09.10.2026, back about 45, full
         # bar about 65. More than the back holds means it needs the whole bar.
-        if party > 45 and "draussen" not in low:
+        if party > PRIVATE_SPACES["hinterer_bereich"]["capacity"] and "draussen" not in low:
             occ |= INSIDE_POOL
             big_inside = True
             continue
@@ -2191,7 +2193,7 @@ SOFA_COMBO_SEATS = 5
 
 def _back_free_capacity(occ):
     """How many guests the back can still take given occupied tables. Whole
-    back free means standing capacity (about 45), otherwise the seats of the
+    back free means standing capacity (about 40, 28 seats), otherwise the seats of the
     free back tables. Dan 12 Oct 2026, Evy on the Sofa does not block HT1,
     HT2 and HT3, those still take 20 people."""
     if not (occ & BACK_POOL):
@@ -3103,7 +3105,7 @@ def _validate_booking(sender, party, space, start_dt, name, sie=False, lang="de"
     # Dan 20.08. and 12.10.2026, a table for tonight once the bar is open is taken by phone, never by message,
     # the team on site sees live what is free.
     now_slot = _service_slot(now)[0]
-    if _service_slot(start_dt)[0] == now_slot and (now.hour >= 18 or now.hour < 6):
+    if _service_slot(start_dt)[0] == now_slot and _bar_open_now():
         return ("same_day_phone", "For tonight please call the bar directly on 0821 47019035, the team can see live what is still free and takes your booking right away." if en else
                 ("Für heute Abend rufen Sie bitte direkt in der Bar an unter 0821 47019035, das Team sieht live was noch frei ist und nimmt Ihre Reservierung gleich auf." if sie else
                  "Für heute Abend ruf bitte direkt in der Bar an unter 0821 47019035, nicht per Nachricht. Das Team sieht live was noch frei ist und nimmt deine Reservierung gleich auf."))
@@ -3725,7 +3727,7 @@ For a group under about 20 people, default to only explaining the plain option, 
 
 Once a group is around 20 people or more, or the guest has asked about a private or closed off space at any size, explain the bar so they understand what they are choosing between. We have a hinterer Bereich, a separate and more private lounge section at the back, good for a partial private feel without closing the whole place. Or the whole bar can be closed exclusively just for them. Still mention the plain joined table option too if it is realistic for their size, never make a private area sound like their only choice. If someone booking the hinterer Bereich also wants outside seating for part or all of the evening, that is possible too, it is not tied only to the full exclusive bar, but it does not happen automatically like the hinterer Bereich itself, the outside tables have to actually be reserved for a specific time and a specific number of guests ahead of time, otherwise they stay open to walk in guests. If they mention wanting to start outside or spend time outside, ask for that specific headcount and time window so it can actually be reserved.
 
-Step four, explain how paying for the space works, in your own words, using the real examples below for phrasing. CHANGED 17 Sep 2026, a real guest (Olivia, 30th, 25 people, hinterer Bereich) handed over date, time, and headcount all in her very first message, and the bot's very first reply explained the space AND quoted the 700 Euro Mindestumsatz immediately, skipping Step two, asking if she had been before, entirely. Dan caught this live. A guest giving you everything at once in one message is not permission to skip steps, it only means you can move through them quickly across your next couple of replies, Step two still comes before Step three and Step four every time, no exceptions, even when the guest was unusually complete upfront. We do not charge a flat Miete for the room. Instead there is a Mindestumsatz, a minimum spend across the group that covers what the space would normally bring in on a night like that, and it runs through their drinks like any normal tab, it is not a separate fee on top. Once you reach this point in the conversation, and only once you reach this point, you may give the actual number for whichever area fits what they are asking for, hinterer Bereich is 700 Euro Mindestumsatz, the whole bar closed exclusively is 1700 Euro Mindestumsatz. Never give either number earlier in the conversation, and never give both numbers at once, only the one that matches their group size and what they want. The hinterer Bereich holds up to about 45 people standing, and about 30 guests is where its 700 Euro is comfortably reached, the whole bar holds about 65 and about 50 guests is where its 1700 Euro is comfortably reached. A group that fits the back does not need the whole bar for capacity reasons, the whole bar is about full exclusivity, you can say so if it helps them decide. RECOMMENDED SIZE, Dan 12 Oct 2026, there is no minimum group size, but below about 30 for the back or about 50 for the whole bar you never call book_table for the private space yourself, you explain it honestly and when the guest wants it anyway you call action handoff, Dan decides. If the group is under the roughly 20 person size and a normal joined table fits them, make clear that option has no Mindestumsatz and no number to quote at all, they simply pay for what they drink and eat like any other guests, that is exactly why it can be a real alternative to naming a price. WHOLE BAR AT ANY GROUP SIZE, clarified by Dan 01 Oct 2026. The whole bar has no minimum group size. Around 50 guests is only where the Mindestumsatz of 1700 Euro is easily reached through drinks. A smaller group that wants the whole bar privately can always have it, if exclusivity matters to them, and whatever part of the Mindestumsatz their drinks do not reach is simply charged as Raummiete, so the total is never below 1700 Euro. Say this plainly and without pressure when a smaller group asks about the whole bar or finds it a lot for their size, for example wenn euch das Private wichtig ist geht die ganze Bar auch fuer weniger Gaeste, was am Ende an Getraenken nicht an die 1700 Euro kommt berechnen wir dann als Raummiete. Still never offer a discount or any flexibility on the number itself, that stays Dan's call and is a HANDOFF, and still mention that the normal table option with no minimum or the hinterer Bereich exists if that fits them better.
+Step four, explain how paying for the space works, in your own words, using the real examples below for phrasing. CHANGED 17 Sep 2026, a real guest (Olivia, 30th, 25 people, hinterer Bereich) handed over date, time, and headcount all in her very first message, and the bot's very first reply explained the space AND quoted the 700 Euro Mindestumsatz immediately, skipping Step two, asking if she had been before, entirely. Dan caught this live. A guest giving you everything at once in one message is not permission to skip steps, it only means you can move through them quickly across your next couple of replies, Step two still comes before Step three and Step four every time, no exceptions, even when the guest was unusually complete upfront. We do not charge a flat Miete for the room. Instead there is a Mindestumsatz, a minimum spend across the group that covers what the space would normally bring in on a night like that, and it runs through their drinks like any normal tab, it is not a separate fee on top. Once you reach this point in the conversation, and only once you reach this point, you may give the actual number for whichever area fits what they are asking for, hinterer Bereich is 700 Euro Mindestumsatz, the whole bar closed exclusively is 1700 Euro Mindestumsatz. Never give either number earlier in the conversation, and never give both numbers at once, only the one that matches their group size and what they want. The hinterer Bereich has 28 seats and holds up to about 40 people standing comfortably, and about 30 guests is where its 700 Euro is comfortably reached, the whole bar holds about 65 and about 50 guests is where its 1700 Euro is comfortably reached. A group that fits the back does not need the whole bar for capacity reasons, the whole bar is about full exclusivity, you can say so if it helps them decide. RECOMMENDED SIZE, Dan 12 Oct 2026, there is no minimum group size, but below about 30 for the back or about 50 for the whole bar you never call book_table for the private space yourself, you explain it honestly and when the guest wants it anyway you call action handoff, Dan decides. If the group is under the roughly 20 person size and a normal joined table fits them, make clear that option has no Mindestumsatz and no number to quote at all, they simply pay for what they drink and eat like any other guests, that is exactly why it can be a real alternative to naming a price. WHOLE BAR AT ANY GROUP SIZE, clarified by Dan 01 Oct 2026. The whole bar has no minimum group size. Around 50 guests is only where the Mindestumsatz of 1700 Euro is easily reached through drinks. A smaller group that wants the whole bar privately can always have it, if exclusivity matters to them, and whatever part of the Mindestumsatz their drinks do not reach is simply charged as Raummiete, so the total is never below 1700 Euro. Say this plainly and without pressure when a smaller group asks about the whole bar or finds it a lot for their size, for example wenn euch das Private wichtig ist geht die ganze Bar auch fuer weniger Gaeste, was am Ende an Getraenken nicht an die 1700 Euro kommt berechnen wir dann als Raummiete. Still never offer a discount or any flexibility on the number itself, that stays Dan's call and is a HANDOFF, and still mention that the normal table option with no minimum or the hinterer Bereich exists if that fits them better.
 
 CHANGED 01 Oct 2026, Dan direct, ersetzt die alte Servicegebuehr Regel. Es gibt KEINE Servicegebuehr mehr, sag das Wort nie. Stattdessen ist es EINE einzige Frage, die Mindestumsatz und freiwilliges Trinkgeld zusammen enthaelt, damit der Gast nicht drei Mal antworten muss. Wenn du die Zahl nennst (700 Euro hinterer Bereich oder 1700 Euro ganze Bar), sag in derselben Nachricht, der Mindestumsatz laeuft ganz normal ueber eure Getraenke, und wir bitten dazu um 10 Prozent Trinkgeld fuer das Team, und erklaer kurz warum, an einem normalen Wochenende verdient unser Team in der Regel mehr als das, und so bleibt es fuer alle fair, egal wie eine einzelne Gruppe sonst trinkgeldet. Sag dazu klar dass es freiwillig ist und sie gerne darauf verzichten koennen. Beispiel, der Mindestumsatz liegt bei 700 Euro und laeuft ganz normal ueber eure Getraenke, dazu bitten wir um 10 Prozent Trinkgeld fuers Team, an einem normalen Wochenende verdient das Team in der Regel mehr als das, so bleibt es fuer alle fair, falls ihr das lieber nicht moechtet, sagt uns einfach Bescheid, passt das sonst so fuer euch. Der Satz zum Verzichten ist Pflicht und muss immer drin sein, in deinen eigenen Worten, aber klar als Einladung dass der Gast ablehnen kann, nie versteckt. Schliess mit genau dieser einen Frage ab. Nie als Pflicht oder Aufschlag formulieren, nie als schon vereinbart behandeln. Antwortet der Gast ja, nimm das Trinkgeld als Wunsch in den Handoff auf. Sagt er nein oder will darauf verzichten, ist das voellig in Ordnung, keine Diskussion, nicht nochmal nachfragen, ebenfalls im Handoff vermerken. Antwortet er gar nicht auf den Trinkgeld Teil, frag nicht nochmal nach und mach ohne weiter. In derselben Nachricht erwaehne kurz, dass abrechnen ganz flexibel geht, entweder uebernehmt ihr am Anfang ein paar Runden, setzt ein Budget oder jeder zahlt einfach selbst, damit sie wissen dass es die Optionen gibt, Step five fragt spaeter nach was sie wollen.
 
@@ -5375,22 +5377,18 @@ def _clean_messages(history):
 AI_DISCLOSE_MARKERS = ("ki concierge", "ai concierge")
 _DISCLOSE_DE = ("Kurz zu mir, ich bin der KI Concierge der BrunnenBar. Damit du nicht warten musst, antworte ich gleich, "
                 "und das Team kann jederzeit übernehmen. Ich kann dir alles von Reservierungen bis zu unseren Cocktails erklären. "
-                "Als KI kann ich mich auch mal irren, verbindlich ist erst unsere Bestätigung, und es gelten unsere AGB unter "
-                "brunnenbar.com/agb. Für einen Tisch am selben Abend ruf ab 18 Uhr bitte direkt in der Bar an unter 0821 47019035, "
-                "nicht per Nachricht, dann sieht das Team live was noch frei ist. Und wenn dir Old Fashioned lieber ist, schreib "
-                "einfach, dass du lieber direkt mit jemandem sprechen möchtest, dann meldet sich Dan oder jemand vom Team persönlich bei dir.")
+                "Und wenn dir Old Fashioned lieber ist, schreib einfach, dass du lieber direkt mit jemandem sprechen möchtest, "
+                "dann meldet sich Dan oder jemand vom Team persönlich bei dir.")
 _DISCLOSE_EN = ("A quick word about me, I am the AI concierge of BrunnenBar. So you do not have to wait, I answer right away, "
-                "and the team can step in at any time. I can help with everything from reservations to our cocktails. As an AI I "
-                "can make mistakes, only our confirmation is binding and our terms apply, brunnenbar.com/agb. For a table the same "
-                "evening, please call the bar directly from 6 pm on 0821 47019035 rather than messaging, the team can see live what "
-                "is still free. And if you prefer it old fashioned, just say you would rather talk to someone directly, and Dan or "
-                "someone from the team will get back to you personally.")
-# CHANGED 12 Oct 2026, Dan: the notice says the bot can make mistakes and points to the AGB (AGB § 3, § 1.6), and
-# tells guests to call the bar directly for a table the same evening, not by message. BUGFIX same day, the
+                "and the team can step in at any time. I can help with everything from reservations to our cocktails. And if "
+                "you prefer it old fashioned, just say you would rather talk to someone directly, and Dan or someone from the "
+                "team will get back to you personally.")
+# CHANGED 12 Oct 2026, Dan's wording, no mistake or AGB line, no phone line, the call the bar line only goes to a
+# guest who wants a table tonight while the bar is open, see _validate_booking and bar_time_context. BUGFIX same day, the
 # ("en", True) entry was missing, so an English guest's very first message raised a KeyError and got no reply.
 AI_DISCLOSE_TEXT = {("de", True): _DISCLOSE_DE, ("de", False): _DISCLOSE_DE,
                     ("en", True): _DISCLOSE_EN, ("en", False): _DISCLOSE_EN}
-AI_DISCLOSE_PHONE = {"de": "", "en": ""}  # the phone line is now always part of the notice
+AI_DISCLOSE_PHONE = {"de": "", "en": ""}  # Dan 12.10.2026, no phone line in the notice
 
 
 
