@@ -872,9 +872,20 @@ def _extract_de_date(text: str, now: datetime):
     m = re.search(r"\b(\d{1,2})\.\s*(\d{1,2})\.(?!\d)", t)
     if not m:
         m = re.search(r"\b(\d{1,2})\.?\s*(" + "|".join(_DE_MONTHS.keys()) + r")\b", t, re.IGNORECASE)
-        if not m:
-            return None
-        day, month = int(m.group(1)), _DE_MONTHS[m.group(2).lower()]
+        if m:
+            day, month = int(m.group(1)), _DE_MONTHS[m.group(2).lower()]
+        else:
+            # BUGFIX 12 Oct 2026, "31.10" or "14.11" with no trailing dot was
+            # not read at all, so no calendar check ran. Skips times like 19.30
+            # (month over 12) and amounts like 10.5 Euro.
+            day = month = None
+            for mm in re.finditer(r"(?<![\d.:])(\d{1,2})\.(\d{1,2})(?![\d.:])(?!\s*(?:uhr|euro|€|%|h\b))", t, re.IGNORECASE):
+                d_, mo_ = int(mm.group(1)), int(mm.group(2))
+                if 1 <= mo_ <= 12 and 1 <= d_ <= 31:
+                    day, month = d_, mo_
+                    break
+            if day is None:
+                return _relative_de_date(t, now)
     else:
         day, month = int(m.group(1)), int(m.group(2))
     try:
@@ -887,6 +898,30 @@ def _extract_de_date(text: str, now: datetime):
         except ValueError:
             return None
     return candidate.isoformat()
+
+
+_DE_WEEKDAYS = {"montag": 0, "dienstag": 1, "mittwoch": 2, "donnerstag": 3, "freitag": 4,
+                "samstag": 5, "sonnabend": 5, "sonntag": 6}
+
+
+def _relative_de_date(t: str, now: datetime):
+    """heute, morgen, uebermorgen and weekday names, so a guest writing
+    "Samstag" or "heute Abend" still triggers the calendar check. A weekday
+    resolves to its next occurrence from today on, including today."""
+    low = t.lower()
+    if re.search(r"\bübermorgen\b|\buebermorgen\b", low):
+        return (now.date() + timedelta(days=2)).isoformat()
+    if re.search(r"\bmorgen\b(?!\s*früh)", low):
+        return (now.date() + timedelta(days=1)).isoformat()
+    if re.search(r"\bheute\b", low):
+        return now.date().isoformat()
+    for name, wd in _DE_WEEKDAYS.items():
+        if re.search(r"\b" + name + r"s?\b", low):
+            delta = (wd - now.weekday()) % 7
+            if delta == 0 and re.search(r"n[aä]chste", low):
+                delta = 7
+            return (now.date() + timedelta(days=delta)).isoformat()
+    return None
 
 
 def event_date_context(sender: str, text: str) -> str:
@@ -5304,6 +5339,24 @@ _SPACE_PROMISE_MARKERS = (
 )
 
 
+_SPACE_PROMISE_PATTERNS = (
+    r"\bhalt(e|en|et)\b.{0,25}\b(euch|dir|uns|den|die|das)\b",       # ich halte euch den Abend
+    r"\b(hab|habe|haben)\b.{0,25}vorgemerkt", r"vorgemerkt",
+    r"\b(hab|habe|haben)\b.{0,25}(reserviert|blockiert|eingetragen|gebucht)",
+    r"\b(ist|sind|bleibt|bleiben|wird|wurde)\b.{0,20}\b(reserviert|blockiert|gebucht|vorgemerkt|frei|verf[uü]gbar|offen)\b",
+    r"\b(euch|dir)\b.{0,20}\b(reserviert|blockiert)\b",
+    r"\b(noch|weiterhin)\b.{0,12}\b(frei|verf[uü]gbar|offen)\b",
+    r"\bstill (free|available|open)\b", r"\bi('| wi)ll hold\b", r"\bis reserved\b",
+)
+
+
+def _has_space_promise(reply: str) -> bool:
+    low = (reply or "").lower()
+    if any(m in low for m in _SPACE_PROMISE_MARKERS):
+        return True
+    return any(re.search(p, low) for p in _SPACE_PROMISE_PATTERNS)
+
+
 def _looks_like_false_booking_confirmation(reply: str) -> bool:
     low = reply.lower()
     return any(m in low for m in _FALSE_BOOKING_MARKERS)
@@ -5321,8 +5374,7 @@ def _space_promise_check(sender: str, text: str, reply: str, lang=None):
     calendar confirms it, ("decline", honest text) when the calendar shows the
     date is taken or closed, ("block", "") when a claim cannot be verified, no
     date found, so Dan gets an alert instead of a possibly false promise."""
-    low = (reply or "").lower()
-    if not any(m in low for m in _SPACE_PROMISE_MARKERS):
+    if not _has_space_promise(reply):
         return ("ok", reply)
     try:
         now = datetime.now(BAR_TZ)
