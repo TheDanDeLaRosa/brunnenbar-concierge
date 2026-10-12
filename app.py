@@ -5560,6 +5560,31 @@ def _has_space_promise(reply: str) -> bool:
     return any(re.search(p, low) for p in _SPACE_PROMISE_PATTERNS)
 
 
+_HOLD_CLAIM_PATTERNS = (
+    r"blockiert", r"vorgemerkt", r"\bhalt(e|en|et)\b.{0,25}\b(euch|dir|uns|den|die|das)\b",
+    r"\b(hab|habe|haben)\b.{0,25}(reserviert|blockiert|eingetragen|gebucht)",
+    r"\b(ist|sind|bleibt|bleiben|wird|wurde)\b.{0,20}\b(reserviert|gebucht)\b",
+    r"f[uü]r (euch|dich|sie) reserviert", r"steht f[uü]r (euch|dich|sie)", r"i will hold", r"i'll hold",
+    r"is reserved for you", r"is blocked", r"is held",
+)
+
+
+def _has_hold_claim(reply: str) -> bool:
+    """The draft says a date or space is held, blocked or reserved. Dan
+    12.10.2026, Sarah was told "bleibt blockiert" while no calendar entry
+    existed, so a second guest could be told the same date was free."""
+    low = (reply or "").lower()
+    return any(re.search(p, low) for p in _HOLD_CLAIM_PATTERNS)
+
+
+def _has_hold_for(sender: str, date_iso: str) -> bool:
+    try:
+        rec = _pending_hold_get(sender)
+    except Exception:
+        return False
+    return bool(rec) and str(rec.get("date") or "") == date_iso
+
+
 def _looks_like_false_booking_confirmation(reply: str) -> bool:
     low = reply.lower()
     return any(m in low for m in _FALSE_BOOKING_MARKERS)
@@ -5602,6 +5627,9 @@ def _space_promise_check(sender: str, text: str, reply: str, lang=None):
             return ("ask", _ASK_PARTY_TEXT.get(lang or "de", _ASK_PARTY_TEXT["de"]))  # busy night, headcount unknown
         if status["closed"] or status["collision"]:
             return ("decline", _DECLINE_TEXT.get(lang or "de", _DECLINE_TEXT["de"]))
+        # a hold, block or reservation may only be claimed if a real calendar hold exists for this guest
+        if _has_hold_claim(reply) and not _has_hold_for(sender, date_iso):
+            return ("block", "")
         return ("ok", reply)
     except Exception as e:
         logger.warning("space promise check failed for %s: %s", sender, e)
