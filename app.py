@@ -1784,7 +1784,9 @@ def _ganze_bar_conflict(date_iso: str, start_dt: datetime, end_dt: datetime) -> 
     for fp, fs, fe, zone in _freeform_group_events_on(date_iso):
         if fs < end_dt and start_dt < max(fe, fs + turn):
             return True
-    return False
+    # table ledger, any held table at all, "Evy Gel - Sofa" included
+    occ, _big = _night_ledger(date_iso, start_dt, end_dt)
+    return bool(occ)
 
 
 def find_private_space(date_iso: str, start_dt: datetime, party: int, space: str) -> bool:
@@ -1813,6 +1815,10 @@ def find_private_space(date_iso: str, start_dt: datetime, party: int, space: str
     for fp, fs, fe, zone in _freeform_group_events_on(date_iso):
         if zone == "back" and fs < end_dt and start_dt < max(fe, fs + turn):
             return False
+    # table ledger, the back room tables (HT1, HT2, HT3, Sofa) must all be free
+    occ, _big = _night_ledger(date_iso, start_dt, end_dt)
+    if occ & BACK_POOL:
+        return False
     return True
 
 
@@ -2002,6 +2008,16 @@ def _pack_pool(party, free_tables):
     return None
 
 
+_TABLE_NAME_RE = re.compile(r"(?<![\w])(Stam|ST3|Rnd2|HT1|HT2|HT3|Sofa|30[1-9]|31[0-3])(?![\w])", re.IGNORECASE)
+_TABLE_CANON = {n.lower(): n for n in TABLES}
+
+
+def _tables_named_in(text: str):
+    """Table names written anywhere in a calendar title, canonical spelling."""
+    return {_TABLE_CANON[m.group(1).lower()] for m in _TABLE_NAME_RE.finditer(text or "")
+            if m.group(1).lower() in _TABLE_CANON}
+
+
 def _event_party(ev):
     low = ((ev.get("summary") or "") + " " + (ev.get("description") or "")).lower()
     m2 = re.search(r"(\d+)\s*bis\s*(\d+)\s*person", low)
@@ -2046,13 +2062,16 @@ def _night_ledger(date_iso, start_dt, req_end):
         segs = re.split(r"\s[–-]\s", summary)
         if segs and segs[-1].strip().lower().startswith("bar"):
             continue  # walk in bar seats, not bookable tables
-        # 1. exact tables the booking engine wrote
+        # 1. exact tables, written by the booking engine ("Tisch X") or typed
+        # by hand in the title, "Evy Gel - Sofa". Dan 12 Oct 2026, every
+        # entry in the reservation calendar is a reservation, a named table
+        # holds exactly that table, with or without a headcount.
         mt = _TABLE_FIELD_RE.search(desc) or _TABLE_FIELD_RE.search(summary)
-        if mt:
-            names = {x for x in mt.group(1).split("+") if x in TABLES}
-            if names:
-                occ |= names
-                continue
+        names = {x for x in mt.group(1).split("+") if x in TABLES} if mt else set()
+        names |= _tables_named_in(summary)
+        if names:
+            occ |= names
+            continue
         # 2. whole spaces
         space = _detect_space(summary)
         if not space:
@@ -2728,6 +2747,30 @@ def run_deposit_followups():
             logger.error("deposit followup failed for %s: %s", sender, e)
 
 
+_SILENT_BOOKING = "__SILENT__"
+PRIVATE_MIN_PARTY = {
+    "hinterer_bereich": int(os.environ.get("MIN_PARTY_HINTERER", "15")),
+    "ganze_bar": int(os.environ.get("MIN_PARTY_GANZE_BAR", "45")),
+}
+
+
+def _pricing_discussed(sender: str) -> bool:
+    """True once a message from the bar side (the bot or Dan by hand) named the
+    Mindestumsatz and the guest wrote something after it."""
+    try:
+        hist = conv_history(sender)
+    except Exception:
+        return False
+    idx = None
+    for i, h in enumerate(hist):
+        if h.get("role") == "assistant" and "mindestumsatz" in str(h.get("content", "")).lower():
+            idx = i
+            break
+    if idx is None:
+        return False
+    return any(h.get("role") == "user" for h in hist[idx + 1:])
+
+
 def process_booking(sender: str, data: dict, lang: str = "de", channel: str = "whatsapp") -> str:
     """Given the details the model gave the tool, check real availability, book
     if it is free, and return the guest reply in the guest's language. Never
@@ -2775,6 +2818,21 @@ def process_booking(sender: str, data: dict, lang: str = "de", channel: str = "w
         return _closed_day_line(sie, lang)
 
     if space in ("hinterer_bereich", "ganze_bar"):
+        # PRICING AND TERMS GATE, 12 Oct 2026, Dan: a private space is never
+        # booked or confirmed before the Mindestumsatz and the terms were
+        # explained and the guest reacted, and never for a group too small
+        # to reach the Mindestumsatz (25 guests cannot spend 1700 Euro, the
+        # whole bar is for about 45 and up, the back for about 15 and up).
+        # The bot says nothing, Dan decides.
+        if not _pricing_discussed(sender):
+            alert_dan(f"{space_label} requested but the Mindestumsatz and terms were never discussed in this "
+                      "thread, nothing was booked or promised, please take over", channel, sender, what)
+            return _SILENT_BOOKING
+        min_party = PRIVATE_MIN_PARTY.get(space, 0)
+        if party < min_party:
+            alert_dan(f"{space_label} requested for only {party} guests, too few to reach the Mindestumsatz "
+                      f"(minimum {min_party}), nothing was booked or promised, please take over", channel, sender, what)
+            return _SILENT_BOOKING
         with _book_lock:
             try:
                 free = find_private_space(date_iso, start_dt, party, space)
@@ -2979,6 +3037,8 @@ def _book_or_handoff(sender: str, data: dict, lang: str, channel: str, guest_tex
     duplicate ping to Dan is a nonissue, a silent miss is the whole bug. See
     [[project_brunnenbar_cloud_concierge]]."""
     reply = process_booking(sender, data, lang, channel)
+    if reply == _SILENT_BOOKING:
+        return reply
     if reply:
         return reply
     logger.warning("process_booking returned no confirmation, sending redundant alert as a backstop (%s, %s)", channel, sender)
@@ -4297,6 +4357,14 @@ def handle(channel: str, sender: str, text: str):
     if action == "book":
         logger.info("book_table called by model: %s", value)
         reply = _book_or_handoff(sender, value, lang, channel, text)
+        if reply == _SILENT_BOOKING:
+            conv_append(sender, "assistant", "")
+            if channel == "whatsapp":
+                try:
+                    mark_human_active(sender)
+                except Exception as e:
+                    logger.error("pause after gated booking failed for %s: %s", sender, e)
+            return
     elif action == "skip":
         logger.info("Classified as spam/non guest, no reply to sender, FYI to Dan")
         notify_dan_skip(channel, sender, text)
@@ -5617,6 +5685,10 @@ def handle_email(svc, msg_id):
     if action == "book":
         logger.info("book_table called by model from email: %s", value)
         reply = _book_or_handoff(sender_key, value, lang, "email", text)
+        if reply == _SILENT_BOOKING:
+            conv_append(sender_key, "assistant", "")
+            mark_handled()
+            return
     elif action == "skip":
         logger.info("email classified spam/non guest, no reply to sender, FYI to Dan, from %s", from_addr)
         notify_dan_skip("email", from_addr, text)
