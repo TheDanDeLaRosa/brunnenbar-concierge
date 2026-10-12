@@ -1989,19 +1989,27 @@ SMALL_PARTY_MAX = 8      # biggest single front table, Stam
 BIG_EVENT_PARTY = 12
 
 
+MAX_TABLE_WASTE = int(os.environ.get("MAX_TABLE_WASTE", "3"))
+MAX_COMBO_WASTE = int(os.environ.get("MAX_COMBO_WASTE", "4"))
+
+
 def _table_seats(name):
     return TABLES[name][0]
 
 
-def _pack_pool(party, free_tables):
+def _pack_pool(party, free_tables, strict=False):
     """Smallest single table that fits, else the smallest whitelisted combo
     (TABLE_COMBOS) fully free. Returns a set of table names or None."""
-    singles = sorted((t for t in free_tables if _table_seats(t) >= party), key=_table_seats)
+    # Dan 12 Oct 2026, a table must make sense for the group, never two guests
+    # on the eight seat Stam. At most MAX_TABLE_WASTE empty seats on a single
+    # table, MAX_COMBO_WASTE on a combo.
+    cap_s = (party + MAX_TABLE_WASTE) if strict else 10 ** 6
+    singles = sorted((t for t in free_tables if party <= _table_seats(t) <= cap_s), key=_table_seats)
     if singles:
         return {singles[0]}
     avail = set(free_tables) | {"Bar7", "Bar8", "Bar9"}  # stools only ever used inside the big combo
     cands = [(cap, combo) for combo, cap in TABLE_COMBOS.items()
-             if cap >= party and combo <= avail and (combo & set(TABLES)) <= set(free_tables)]
+             if party <= cap <= ((party + MAX_COMBO_WASTE) if strict else 10 ** 6) and combo <= avail and (combo & set(TABLES)) <= set(free_tables)]
     if cands:
         cands.sort(key=lambda x: (x[0], len(x[1])))
         return set(cands[0][1])
@@ -2138,10 +2146,10 @@ def find_free_table(date_iso: str, start_dt: datetime, party: int, area: str):
     if area == "draussen":
         if big_inside and (INSIDE_POOL <= occ):
             return None
-        got = _pack_pool(party, OUTSIDE_POOL - occ)
+        got = _pack_pool(party, OUTSIDE_POOL - occ, strict=True)
     else:
         pool = FRONT_POOL if party <= SMALL_PARTY_MAX else BACK_POOL
-        got = _pack_pool(party, pool - occ)
+        got = _pack_pool(party, pool - occ, strict=True)
     if not got:
         return None
     return "+".join(sorted(got))
@@ -2748,9 +2756,12 @@ def run_deposit_followups():
 
 
 _SILENT_BOOKING = "__SILENT__"
+# Dan 12 Oct 2026, no hard minimum, a group may be any size if it can reach the
+# Mindestumsatz. We RECOMMEND about 30 for the back and about 50 for the whole
+# bar. Below the recommendation the bot never books on its own, Dan decides.
 PRIVATE_MIN_PARTY = {
-    "hinterer_bereich": int(os.environ.get("MIN_PARTY_HINTERER", "15")),
-    "ganze_bar": int(os.environ.get("MIN_PARTY_GANZE_BAR", "45")),
+    "hinterer_bereich": int(os.environ.get("RECOMMENDED_PARTY_HINTERER", "30")),
+    "ganze_bar": int(os.environ.get("RECOMMENDED_PARTY_GANZE_BAR", "50")),
 }
 
 
@@ -2830,8 +2841,8 @@ def process_booking(sender: str, data: dict, lang: str = "de", channel: str = "w
             return _SILENT_BOOKING
         min_party = PRIVATE_MIN_PARTY.get(space, 0)
         if party < min_party:
-            alert_dan(f"{space_label} requested for only {party} guests, too few to reach the Mindestumsatz "
-                      f"(minimum {min_party}), nothing was booked or promised, please take over", channel, sender, what)
+            alert_dan(f"{space_label} requested for {party} guests, below the recommended size of about {min_party} "
+                      "for the Mindestumsatz, nothing was booked or promised, please decide", channel, sender, what)
             return _SILENT_BOOKING
         with _book_lock:
             try:
