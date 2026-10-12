@@ -924,7 +924,7 @@ def _relative_de_date(t: str, now: datetime):
     return None
 
 
-def event_date_context(sender: str, text: str) -> str:
+def event_date_context(sender: str, text: str, history=None) -> str:
     """Ground truth for one date the guest just mentioned, injected into the
     system prompt exactly like bar_time_context and next7 above, so the
     model is never trusted to just decide a date is frei on its own instinct.
@@ -953,7 +953,7 @@ def event_date_context(sender: str, text: str) -> str:
         return ""
     try:
         svc = _calendar_service()
-        _p, _sp = _party_space_from_text(sender, text)
+        _p, _sp = _party_space_from_text(sender, text, history)
         status = _event_date_status(svc, date_iso, sender, _p, _sp)
     except Exception as e:
         logger.warning("event_date_context failed for %s on %s: %s", sender, date_iso, e)
@@ -1049,7 +1049,7 @@ def parse_event(ev):
     the title so words in the Anlass do not confuse it, and a Bar or walk in
     entry returns None so it is not counted against the tables."""
     start = ev.get("start", {}).get("dateTime")
-    if not start:
+    if not start or _is_cancelled(ev):
         return None
     summary = ev.get("summary", "") or ""
     desc = ev.get("description", "") or ""
@@ -1348,6 +1348,8 @@ def _event_date_status(svc, date_iso: str, exclude_sender: str = "", party=None,
             singleEvents=True,
         ).execute().get("items", [])
         for ev in items:
+            if _is_cancelled(ev):
+                continue
             blob = ((ev.get("summary") or "") + " " + (ev.get("description") or "")).lower()
             if "closed" in blob or "geschlossen" in blob or "betriebsferien" in blob:
                 out["closed"] = True
@@ -1421,6 +1423,8 @@ def _date_claims(svc, date_iso: str, exclude_sender: str = ""):
             singleEvents=True,
         ).execute().get("items", [])
         for ev in items:
+            if _is_cancelled(ev):
+                continue
             desc = ev.get("description") or ""
             summary = ev.get("summary") or ""
             blob = (summary + " " + desc).lower()
@@ -1586,9 +1590,10 @@ def remove_pending_hold(sender: str):
 
 
 _PENDING_HOLD_NUDGES = [
-    "Wie versprochen, kurz nachgefragt, konntet ihr euch schon entscheiden wegen dem Termin bei uns? Falls ihr noch ueberlegt ist das voellig ok, wollten nur kurz nachhaken.",
-    "Hallo nochmal, wie angekuendigt wollten wir kurz nachfragen ob es bei euch schon was Neues gibt zu eurer Feier bei uns. Meld dich einfach wenn du mehr weisst.",
-    "Hey, wie versprochen ein kurzer Reminder von uns, falls ihr euch schon entschieden habt wegen dem Datum sag gerne kurz Bescheid, sonst ist auch alles gut.",
+    # 12 Oct 2026, the old lines said "wie versprochen" although the bot stopped announcing the follow up in Sept.
+    "Hallo nochmal, kurz nachgefragt, konntet ihr euch schon entscheiden wegen eurem Termin bei uns? Falls ihr noch überlegt ist das völlig ok.",
+    "Hey, wollten kurz nachhaken, gibt es bei euch schon was Neues zu eurer Feier bei uns? Meld dich einfach, wenn du mehr weißt.",
+    "Hallo, kurze Nachfrage von uns, habt ihr euch wegen dem Datum schon entschieden? Sag gern kurz Bescheid, sonst ist auch alles gut.",
 ]
 
 
@@ -1641,7 +1646,18 @@ def run_pending_hold_followups():
             if sender in SKIP_SENDERS or is_human_active(sender):
                 continue
             if not record.get("nudged_at") and age_h >= PENDING_HOLD_CHASE_AFTER_HOURS:
-                msg = random.choice(_PENDING_HOLD_NUDGES)
+                # Audit F10, 12 Oct 2026. WhatsApp only accepts free text within 24
+                # hours of the guest's last message (error 131047), a nudge after
+                # that never arrives. Tell Dan once instead of failing silently.
+                if _is_whatsapp_number(sender) and not _in_service_window(sender):
+                    if not record.get("window_alerted"):
+                        alert_dan("tentative hold has gone quiet, the automatic follow up cannot be sent because WhatsApp's 24 hour window is closed, please reach out yourself",
+                                  "whatsapp", sender, f"Date {record.get('date')}")
+                        record["window_alerted"] = True
+                        record["nudged_at"] = now
+                        _pending_hold_set(sender, record)
+                    continue
+                msg = _house_style(random.choice(_PENDING_HOLD_NUDGES), "de")
                 if send_whatsapp(sender, msg):
                     conv_append(sender, "assistant", msg)
                     record["nudged_at"] = now
@@ -2175,12 +2191,13 @@ def _evening_capacity(date_iso, start_dt=None):
 _GUEST_PARTY_RE = re.compile(r"(\d{1,3})\s*(?:bis|\-|–|to)?\s*(\d{1,3})?\s*(?:personen|leute|g[aä]ste|people|guests|pax|freunde)", re.I)
 
 
-def _party_space_from_text(sender, text):
+def _party_space_from_text(sender, text, history=None):
     """Best effort guest headcount (largest number named) and requested space
     from the message plus the recent thread."""
     blobs = [str(text or "")]
     try:
-        blobs += [str(h.get("content", "")) for h in conv_history(sender)[-10:] if h.get("role") == "user"]
+        hist = history if history is not None else conv_history(sender)
+        blobs += [str(h.get("content", "")) for h in hist[-10:] if h.get("role") == "user"]
     except Exception:
         pass
     party = None
@@ -2578,7 +2595,13 @@ def run_post_visit_checkins():
             if contact in SKIP_SENDERS or is_human_active(contact):
                 _post_visit_checkin_mark_sent(event_id)
                 continue
-            msg = random.choice(_POST_VISIT_CHECKIN_MESSAGES)
+            if not _in_service_window(contact):
+                # Audit F10, outside WhatsApp's 24 hour window a free text check in
+                # is rejected, needs an approved template, see Concierge_Audit F16.
+                logger.info("post visit check in skipped for %s, outside the 24 hour window", contact)
+                _post_visit_checkin_mark_sent(event_id)
+                continue
+            msg = _house_style(random.choice(_POST_VISIT_CHECKIN_MESSAGES), "de")
             if send_whatsapp(contact, msg):
                 conv_append(contact, "assistant", msg)
                 logger.info("Post visit check in sent to %s for event %s", contact, event_id)
@@ -2844,6 +2867,480 @@ def _pricing_discussed(sender: str) -> bool:
     return any(h.get("role") == "user" for h in hist[idx + 1:])
 
 
+# ============================================================================
+# CONCIERGE STANDARD, 12 Oct 2026. Dan after the Sarah Halloween incident:
+# "this is another super simple super basic part of being a concierge". Every
+# helper below closes one finding in 09_Concierge_Guest/Concierge_Audit_2026-10-12.md
+# and has a test in test_concierge.py. House rules live in code, not only in
+# the prompt.
+# ============================================================================
+
+# ---- F7, house style on every outgoing guest message -----------------------
+_UMLAUT_WORDS = {
+    "fuer": "für", "fuers": "fürs", "ueber": "über", "uebrigens": "übrigens", "getraenk": "getränk",
+    "getraenke": "getränke", "getraenken": "getränken", "laeuft": "läuft", "koennen": "können", "koennt": "könnt",
+    "koennte": "könnte", "koennten": "könnten", "kannst": "kannst", "moechte": "möchte", "moechten": "möchten",
+    "moechtest": "möchtest", "moechtet": "möchtet", "waere": "wäre", "waeren": "wären", "waerst": "wärst",
+    "waert": "wärt", "haette": "hätte", "haetten": "hätten", "haettest": "hättest", "spaeter": "später",
+    "naechste": "nächste", "naechsten": "nächsten", "naechster": "nächster", "naechstes": "nächstes",
+    "naechstem": "nächstem", "schoen": "schön", "schoene": "schöne", "schoenen": "schönen", "schoener": "schöner",
+    "schoenes": "schönes", "schoenste": "schönste", "plaetze": "plätze", "platz": "platz", "haelfte": "hälfte",
+    "laenger": "länger", "zurueck": "zurück", "gruesse": "grüße", "gruss": "gruß", "hoeren": "hören",
+    "frueh": "früh", "frueher": "früher", "muessen": "müssen", "muesst": "müsst", "muesste": "müsste",
+    "wuerde": "würde", "wuerden": "würden", "wuerdest": "würdest", "wuerdet": "würdet", "gaeste": "gäste",
+    "gaesten": "gästen", "moeglich": "möglich", "moeglichkeit": "möglichkeit", "persoenlich": "persönlich",
+    "natuerlich": "natürlich", "gemuetlich": "gemütlich", "draussen": "draußen", "strasse": "straße",
+    "geniessen": "genießen", "spass": "spaß", "schliessen": "schließen", "gross": "groß", "grosse": "große",
+    "grossen": "großen", "grosser": "großer", "groesser": "größer", "groesste": "größte", "erzaehl": "erzähl",
+    "erzaehlen": "erzählen", "fuenf": "fünf", "voellig": "völlig", "angekuendigt": "angekündigt",
+    "aendern": "ändern", "aenderung": "änderung", "bestaetigt": "bestätigt", "bestaetigen": "bestätigen",
+    "pruefen": "prüfen", "kuemmern": "kümmern", "geoeffnet": "geöffnet", "oeffnen": "öffnen",
+    "tschuess": "tschüss", "maedels": "mädels", "geburtstagsueberraschung": "geburtstagsüberraschung",
+    "ueberraschung": "überraschung", "hoechstens": "höchstens", "gerne": "gerne", "heisst": "heißt",
+    "weiss": "weiß", "weisst": "weißt", "ausser": "außer", "draussen.": "draußen.", "suess": "süß",
+    "fruechte": "früchte", "zuverlaessig": "zuverlässig", "laesst": "lässt", "faellt": "fällt",
+    "aufgefallen": "aufgefallen", "abhoeren": "abhören", "verfuegbar": "verfügbar",
+}
+_UMLAUT_RE = re.compile(r"\b(" + "|".join(sorted((k for k, v in _UMLAUT_WORDS.items() if k != v and k.isalpha()),
+                                                  key=len, reverse=True)) + r")\b", re.IGNORECASE)
+
+
+def _umlaut_fix(text: str) -> str:
+    def rep(m):
+        w = m.group(0)
+        new = _UMLAUT_WORDS[w.lower()]
+        if w.isupper():
+            return new.upper()
+        if w[0].isupper():
+            return new[0].upper() + new[1:]
+        return new
+    return _UMLAUT_RE.sub(rep, text)
+
+
+def _house_style(text: str, lang=None) -> str:
+    """Root CLAUDE.md house rules, enforced on every outgoing guest message.
+    No dashes, no colons outside clock times and smileys, no semicolons, no
+    bullet or numbered lists, real umlauts in German. 12 Oct 2026, audit F7."""
+    if not text:
+        return text
+    out_lines = []
+    for line in text.split("\n"):
+        s = line.rstrip()
+        s = re.sub(r"^\s*(?:[-*•]\s+|\d{1,2}[.)]\s+)", "", s)  # list markers
+        out_lines.append(s)
+    t = "\n".join(out_lines)
+    t = re.sub(r"\s+[-–—]\s+", ", ", t)            # spaced dashes
+    t = t.replace("—", ", ").replace("–", ", ")
+    t = t.replace(";", ",")
+    t = re.sub(r"(?<!\d)(?<!https)(?<!http):(?!\d|//|\)|\(|D\b|P\b|-\))", ",", t)   # colons, keep 19:30 and :) smileys
+    t = re.sub(r",\s*,", ",", t)
+    t = re.sub(r" ,", ",", t)
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    if lang != "en":
+        t = _umlaut_fix(t)
+    return t.strip()
+
+
+# ---- cancelled entries never count -----------------------------------------
+def _is_cancelled(ev) -> bool:
+    return (ev.get("summary") or "").strip().lower().startswith("abgesagt")
+
+
+# ---- F1, opening days, hours, closures, past dates --------------------------
+# service day weekday -> (first start hour, closing hour), hours past midnight as 24+
+OPENING_HOURS = {3: (18, 24), 4: (18, 26), 5: (18, 26)}
+LAST_START_BEFORE_CLOSE_H = float(os.environ.get("LAST_START_BEFORE_CLOSE_H", "1"))
+_DAY_NAMES_DE = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
+_DAY_NAMES_EN = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+
+def _service_slot(start_dt):
+    """(service day date, hour as float on that service day). 00:30 on a
+    Saturday belongs to Friday night, hour 24.5."""
+    h = start_dt.hour + start_dt.minute / 60
+    if start_dt.hour < 6:
+        return (start_dt - timedelta(days=1)).date(), h + 24
+    return start_dt.date(), h
+
+
+def _within_opening(start_dt) -> bool:
+    day, h = _service_slot(start_dt)
+    win = OPENING_HOURS.get(day.weekday())
+    if not win:
+        return False
+    return win[0] <= h <= win[1] - LAST_START_BEFORE_CLOSE_H
+
+
+def _closure_on(date_iso: str):
+    """Summary of a closure entry (geschlossen, Betriebsferien, Ruhetag) on
+    this date, or empty string."""
+    try:
+        svc = _calendar_service()
+        lo = datetime.fromisoformat(date_iso).replace(tzinfo=BAR_TZ, hour=0, minute=0, second=0, microsecond=0)
+        items = svc.events().list(calendarId=RESERVIERUNGEN_CALENDAR_ID, timeMin=lo.isoformat(),
+                                  timeMax=(lo + timedelta(days=1)).isoformat(), singleEvents=True).execute().get("items", [])
+    except Exception as e:
+        logger.warning("closure check failed for %s: %s", date_iso, e)
+        return ""
+    for ev in items:
+        s = (ev.get("summary") or "").lower()
+        if _is_cancelled(ev):
+            continue
+        if any(w in s for w in ("geschlossen", "betriebsferien", "ruhetag", "closed", "urlaub")) and not _detect_space(s):
+            return (ev.get("summary") or "").strip()
+    return ""
+
+
+# ---- F11, the guest's own bookings -----------------------------------------
+def _contact_key(sender: str) -> str:
+    if sender.startswith("email:"):
+        return sender[6:].lower()
+    return _norm_phone(sender)
+
+
+def _guest_bookings(sender: str, days: int = 90):
+    """Upcoming calendar entries that belong to this guest (their phone or
+    email in the entry), oldest first, cancelled ones left out."""
+    key = _contact_key(sender)
+    if not key or len(key) < 5:
+        return []
+    try:
+        svc = _calendar_service()
+        lo = datetime.now(BAR_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+        items = svc.events().list(calendarId=RESERVIERUNGEN_CALENDAR_ID, timeMin=lo.isoformat(),
+                                  timeMax=(lo + timedelta(days=days)).isoformat(), singleEvents=True,
+                                  orderBy="startTime").execute().get("items", [])
+    except Exception as e:
+        logger.warning("guest bookings lookup failed for %s: %s", sender, e)
+        return []
+    out = []
+    for ev in items:
+        if _is_cancelled(ev):
+            continue
+        desc = ev.get("description") or ""
+        blob = (ev.get("summary") or "") + " " + desc
+        if sender.startswith("email:"):
+            hit = key in blob.lower()
+        else:
+            hit = any(_norm_phone(p) == key for p in re.findall(r"\+?\d[\d\s]{6,}\d", blob))
+        if not hit:
+            continue
+        st = (ev.get("start") or {}).get("dateTime") or (ev.get("start") or {}).get("date")
+        if not st:
+            continue
+        low = blob.lower()
+        out.append({
+            "id": ev.get("id", ""), "summary": (ev.get("summary") or "").strip(), "start": st,
+            "bot_made": _POST_VISIT_CHECKIN_MARKER in desc,
+            "tentative": ("nicht bestaetigt" in low or "nicht bestätigt" in low or "anfrage" in low),
+            "viewing": "besichtigung" in low,
+        })
+    return out
+
+
+def _guest_bookings_context(sender: str) -> str:
+    rows = _guest_bookings(sender)
+    if not rows:
+        return ("GAST BUCHUNGEN, im Kalender steht fuer diesen Gast aktuell keine kommende Reservierung. "
+                "Behaupte nie, dass er schon eine Reservierung hat.")
+    parts = []
+    for r in rows[:6]:
+        try:
+            dt = datetime.fromisoformat(r["start"])
+            when = f"{_DAY_NAMES_DE[dt.weekday()]} {dt.strftime('%d.%m.')} {dt.strftime('%H:%M')} Uhr"
+        except Exception:
+            when = r["start"]
+        kind = "unverbindliche Anfrage" if r["tentative"] else ("Besichtigung" if r["viewing"] else "bestaetigte Reservierung")
+        parts.append(f"{when}, {r['summary']}, {kind}")
+    return ("GAST BUCHUNGEN, so steht dieser Gast gerade im Kalender, verlass dich NUR hierauf: " + " | ".join(parts) +
+            ". Nutze das fuer Fragen wie ob die Reservierung steht, fuer eine Verspaetung oder eine Absage. Lege fuer "
+            "denselben Abend nie eine zweite Reservierung an. Eine Aenderung von Uhrzeit, Datum oder Personenzahl einer "
+            "bestaetigten Reservierung ist action handoff.")
+
+
+# ---- F1 to F3, validation before any calendar write ------------------------
+MAX_PARTY = int(os.environ.get("MAX_PARTY", "65"))
+
+
+def _validate_booking(sender, party, space, start_dt, name, sie=False, lang="de"):
+    """None when the request may be booked, else (kind, guest_line). guest_line
+    empty means silent plus Dan alert. 12 Oct 2026, audit F1 to F3."""
+    en = lang == "en"
+    now = datetime.now(BAR_TZ)
+    if start_dt < now - timedelta(minutes=30):
+        return ("past", "That date is already behind us, which day did you mean?" if en else
+                ("Der Termin liegt leider schon hinter uns, welchen Tag meinen Sie genau?" if sie else
+                 "Der Termin liegt leider schon hinter uns, welchen Tag meinst du genau?"))
+    if party < 1:
+        return ("party", "How many of you will there be?" if en else
+                ("Mit wie vielen Personen kommen Sie?" if sie else "Mit wie vielen Leuten kommt ihr?"))
+    if party > MAX_PARTY:
+        return ("too_big", "")
+    if not name or name.strip().lower() in ("gast", "guest", "unknown", "?"):
+        return ("name", "Under which name should we put it down?" if en else
+                ("Auf welchen Namen dürfen wir das eintragen?" if sie else "Auf welchen Namen dürfen wir das eintragen?"))
+    if space == "tisch":
+        day, _h = _service_slot(start_dt)
+        if day.weekday() not in OPENING_HOURS:
+            return ("closed_day", "We are open Thursday from 6 pm to midnight and Friday and Saturday from 6 pm to 2 am. Would one of those days work for you?" if en else
+                    ("An dem Tag haben wir leider geschlossen. Wir sind Donnerstag von 18 bis 24 Uhr und Freitag und Samstag von 18 bis 2 Uhr für Sie da, passt einer der Tage?" if sie else
+                     "An dem Tag haben wir leider zu. Wir sind Donnerstag von 18 bis 24 Uhr und Freitag und Samstag von 18 bis 2 Uhr da, passt euch einer der Tage?"))
+        if not _within_opening(start_dt):
+            win = OPENING_HOURS[day.weekday()]
+            last = win[1] - LAST_START_BEFORE_CLOSE_H
+            last_s = f"{int(last) % 24}" + (":30" if last % 1 else "")
+            return ("hours", f"We open at 6 pm that day, the latest table start is {last_s}. What time would suit you?" if en else
+                    (f"An dem Tag öffnen wir um 18 Uhr, der späteste Tischbeginn ist {last_s} Uhr. Welche Uhrzeit passt Ihnen?" if sie else
+                     f"An dem Tag machen wir um 18 Uhr auf, der späteste Tischbeginn ist {last_s} Uhr. Welche Uhrzeit passt euch?"))
+    closed = _closure_on(_service_slot(start_dt)[0].isoformat())
+    if closed:
+        return ("closure", "We are closed on that day, unfortunately. Would another date work?" if en else
+                ("An dem Tag haben wir leider geschlossen. Passt Ihnen ein anderer Termin?" if sie else
+                 "An dem Tag haben wir leider geschlossen. Passt dir ein anderer Termin?"))
+    sday = _service_slot(start_dt)[0]
+    for b in _guest_bookings(sender):
+        if b["tentative"] or b["viewing"]:
+            continue
+        try:
+            bdt = datetime.fromisoformat(b["start"])
+        except Exception:
+            continue
+        if _service_slot(bdt)[0] == sday:
+            hm = bdt.strftime("%H:%M").replace(":00", "")
+            return ("duplicate", f"You are already booked with us that evening at {hm}. Should we change something about it?" if en else
+                    (f"Für den Abend sind Sie bei uns schon um {hm} Uhr eingetragen. Soll sich daran etwas ändern?" if sie else
+                     f"Für den Abend seid ihr bei uns schon um {hm} Uhr eingetragen. Soll sich daran was ändern?"))
+    return None
+
+
+# ---- F5, real alternatives when a slot is full -----------------------------
+ALT_OFFSETS_MIN = (-60, 60, -30, 30, -90, 90, -120, 120, -150, 150, -180, 180)
+
+
+def _alternative_slots(date_iso, start_dt, party, area, limit=2):
+    """Up to `limit` other start times the same evening where a sensible table
+    is free for this party in the same area, nearest first. Read only."""
+    found = []
+    for off in ALT_OFFSETS_MIN:
+        cand = start_dt + timedelta(minutes=off)
+        if not _within_opening(cand):
+            continue
+        try:
+            if find_free_table(cand.date().isoformat(), cand, party, area):
+                found.append(cand)
+        except Exception as e:
+            logger.warning("alternative slot check failed: %s", e)
+            return []
+        if len(found) >= limit:
+            break
+    return sorted(found)
+
+
+def _fmt_hm(dt):
+    return dt.strftime("%H") + (":" + dt.strftime("%M") if dt.minute else "")
+
+
+def _full_with_alternatives_line(alts, start_dt, area, sie, lang):
+    hm = _fmt_hm(start_dt)
+    if lang == "en":
+        where = "outside" if area == "draussen" else "inside"
+        if alts:
+            opts = " or ".join(_fmt_hm(a) for a in alts)
+            q = "would one of those work?" if len(alts) > 1 else "would that work?"
+            return f"At {hm} we are already full {where}, sorry. At {opts} we would still have a table for you, {q}"
+        return "That evening we are fully booked, sorry. Would another evening work for you?"
+    where = "draußen" if area == "draussen" else "drinnen"
+    if alts:
+        opts = " Uhr oder um ".join(_fmt_hm(a) for a in alts)
+        many = len(alts) > 1
+        if sie:
+            return (f"Um {hm} Uhr sind wir {where} leider schon voll. Um {opts} Uhr hätten wir noch einen Tisch für Sie, "
+                    + ("passt Ihnen eine der Zeiten?" if many else "würde Ihnen das passen?"))
+        return (f"Um {hm} Uhr sind wir {where} leider schon voll. Um {opts} Uhr hätten wir noch einen Tisch für euch, "
+                + ("passt euch eine der Zeiten?" if many else "würde euch das passen?"))
+    if sie:
+        return "An dem Abend sind wir leider komplett ausgebucht. Passt Ihnen vielleicht ein anderer Abend?"
+    return "An dem Abend sind wir leider komplett ausgebucht. Passt euch vielleicht ein anderer Abend?"
+
+
+def _space_taken_line(space, sie, lang):
+    if lang == "en":
+        return ("The back room is already taken that evening, sorry. Would another date work for you?" if space == "hinterer_bereich"
+                else "We cannot close the whole bar that evening, there are already other bookings. Would another date work for you?")
+    if space == "hinterer_bereich":
+        return ("Der hintere Bereich ist an dem Abend leider schon vergeben. Passt Ihnen ein anderes Datum?" if sie else
+                "Der hintere Bereich ist an dem Abend leider schon vergeben. Passt euch ein anderes Datum?")
+    return ("Die ganze Bar exklusiv geht an dem Abend leider nicht, es gibt schon andere Reservierungen. Passt Ihnen ein anderes Datum?" if sie else
+            "Die ganze Bar exklusiv geht an dem Abend leider nicht, es gibt schon andere Reservierungen. Passt euch ein anderes Datum?")
+
+
+# ---- F4, confirmations that state every detail ------------------------------
+def _date_words(dt, lang):
+    if lang == "en":
+        return f"{_DAY_NAMES_EN[dt.weekday()]} {dt.day}.{dt.month}."
+    return f"{_DAY_NAMES_DE[dt.weekday()]} den {dt.strftime('%d.%m.')}"
+
+
+_LOUNGE_COMBO = frozenset({"HT1", "Sofa", "Bar7", "Bar8", "Bar9"})
+
+
+def _table_where(area, table, lang):
+    """How the guest should picture their seats. Dan 09.09.2026, the lounge
+    combo is half the back room, Dan 12.10.2026, the three high tops are
+    explained as three tables side by side."""
+    tset = set((table or "").split("+"))
+    if lang == "en":
+        if tset == _LOUNGE_COMBO:
+            return "in half of the back lounge, the sofa, a high top and a few seats at the bar"
+        if tset == {"HT1", "HT2", "HT3"}:
+            return "at the three high tops in the back"
+        return "outside" if area == "draussen" else "inside"
+    if tset == _LOUNGE_COMBO:
+        return "in der Hälfte vom hinteren Bereich, mit dem Sofa, einem Hochtisch und ein paar Plätzen an der Bar"
+    if tset == {"HT1", "HT2", "HT3"}:
+        return "hinten an den drei Hochtischen"
+    return "draußen" if area == "draussen" else "drinnen"
+
+
+def _table_confirmation(name, party, start_dt, area, table, sie, lang):
+    hm = _fmt_hm(start_dt)
+    if lang == "en":
+        where = _table_where(area, table, "en")
+        return random.choice([
+            f"Done, we have you down for {party} on {_date_words(start_dt, 'en')} at {hm} {where}, under {name}.",
+            f"All set, {party} people on {_date_words(start_dt, 'en')} at {hm} {where}, under {name}.",
+        ]) + (" We hold the table for 20 minutes. If you are running more than 15 minutes late please call the bar on "
+              "0821 47019035, and if anything changes just message us here. See you then")
+    where = _table_where(area, table, "de")
+    when = _date_words(start_dt, "de")
+    if sie:
+        return (random.choice([
+            f"Sehr gerne, wir haben Sie für {party} Personen am {when} um {hm} Uhr {where} eingetragen, auf den Namen {name}.",
+            f"Perfekt, Sie sind für {party} Personen am {when} um {hm} Uhr {where} eingetragen, auf den Namen {name}.",
+        ]) + " Wir halten den Tisch 20 Minuten. Wird es später als 15 Minuten, rufen Sie bitte kurz in der Bar an unter "
+             "0821 47019035, und falls sich etwas ändert, schreiben Sie uns einfach hier. Wir freuen uns auf Sie")
+    return (random.choice([
+        f"Top, wir haben euch für {party} Leute am {when} um {hm} Uhr {where} eingetragen, auf den Namen {name}.",
+        f"Passt, {party} Leute am {when} um {hm} Uhr {where} sind eingetragen, auf den Namen {name}.",
+        f"Super, ihr seid am {when} um {hm} Uhr {where} eingetragen, {party} Leute auf den Namen {name}.",
+    ]) + " Wir halten den Tisch 20 Minuten. Wird es später als 15 Minuten, ruf bitte kurz in der Bar an unter "
+         "0821 47019035, und falls sich was ändert, schreib uns einfach hier. Wir freuen uns auf euch")
+
+
+def _space_confirmation(space, name, party, start_dt, sie, lang):
+    hm = _fmt_hm(start_dt)
+    mu = PRIVATE_SPACES[space]["mindestumsatz"]
+    if lang == "en":
+        where = "the back room" if space == "hinterer_bereich" else "the whole bar exclusively"
+        return (f"You are booked in, {where} on {_date_words(start_dt, 'en')} at {hm} for about {party} guests, under {name}. "
+                f"The minimum spend is {mu} Euro and simply runs through your drinks. If anything changes just message us here. See you then")
+    where = "der hintere Bereich" if space == "hinterer_bereich" else "die ganze Bar exklusiv"
+    when = _date_words(start_dt, "de")
+    if sie:
+        return (f"Sehr gerne, {where} ist für Sie eingetragen, am {when} um {hm} Uhr für etwa {party} Gäste auf den Namen {name}. "
+                f"Der Mindestumsatz liegt bei {mu} Euro und läuft ganz normal über Ihre Getränke. Falls sich etwas ändert, "
+                "schreiben Sie uns einfach hier. Wir freuen uns auf Sie")
+    return (f"Top, {where} ist für euch eingetragen, am {when} um {hm} Uhr für etwa {party} Leute auf den Namen {name}. "
+            f"Der Mindestumsatz liegt bei {mu} Euro und läuft ganz normal über eure Getränke. Falls sich was ändert, "
+            "schreib uns einfach hier. Wir freuen uns auf euch")
+
+
+# ---- F12, cancellation frees the table at once ------------------------------
+def _cancel_guest_booking(sender: str, text: str = ""):
+    """Marks this guest's single upcoming bot made booking ABGESAGT so the table
+    is free again immediately. Returns (status, summary). status is
+    cancelled, none, ambiguous or manual. Manual entries and several bookings
+    stay Dan's call. Never deletes anything."""
+    rows = [r for r in _guest_bookings(sender) if not r["viewing"]]
+    if not rows:
+        return ("none", "")
+    if len(rows) > 1:
+        wanted = _extract_de_date(text or "", datetime.now(BAR_TZ)) if text else None
+        if wanted:
+            rows = [r for r in rows if r["start"][:10] == wanted]
+        if len(rows) != 1:
+            return ("ambiguous", "; ".join(r["summary"] for r in rows))
+    r = rows[0]
+    if not r["bot_made"] and not r["tentative"]:
+        return ("manual", r["summary"])
+    try:
+        svc = _calendar_service()
+        svc.events().patch(calendarId=RESERVIERUNGEN_CALENDAR_ID, eventId=r["id"],
+                           body={"summary": "ABGESAGT " + r["summary"]}).execute()
+    except Exception as e:
+        logger.error("cancel patch failed for %s: %s", sender, e)
+        return ("manual", r["summary"])
+    try:
+        if r["tentative"]:
+            _pending_hold_clear(sender)
+    except Exception:
+        pass
+    return ("cancelled", r["summary"])
+
+
+# ---- F10, WhatsApp 24 hour service window ----------------------------------
+WA_WINDOW_HOURS = float(os.environ.get("WA_WINDOW_HOURS", "23.5"))
+
+
+def _last_guest_ts(sender: str) -> float:
+    try:
+        ts = [float(h.get("ts") or 0) for h in conv_history(sender) if h.get("role") == "user"]
+        return max(ts) if ts else 0.0
+    except Exception:
+        return 0.0
+
+
+def _in_service_window(sender: str) -> bool:
+    last = _last_guest_ts(sender)
+    return bool(last) and (time.time() - last) < WA_WINDOW_HOURS * 3600
+
+
+# ---- F8, non text WhatsApp messages ----------------------------------------
+_MEDIA_REPLY = {
+    ("de", "audio"): "Sprachnachrichten kann ich hier leider nicht abhören. Schreib mir dein Anliegen gern kurz als Text, dann kümmern wir uns sofort darum.",
+    ("en", "audio"): "I can't listen to voice messages here, sorry. Just send me a quick text and we'll take care of it right away.",
+    ("de", "media"): "Danke dir. Schreib mir gern noch kurz dazu, worum es geht, dann kümmern wir uns darum.",
+    ("en", "media"): "Thanks. Could you add a short text about what it's about, then we'll take care of it.",
+}
+
+
+def _wa_inbound(msg: dict):
+    """(text, kind) for one inbound WhatsApp message. kind is text, ignore,
+    audio or media. Captions and button taps become normal text."""
+    t = msg.get("type")
+    if t == "text":
+        return ((msg.get("text") or {}).get("body", ""), "text")
+    if t in ("reaction", "sticker", "system", "ephemeral", "unsupported_ignore"):
+        return ("", "ignore")
+    if t == "button":
+        return ((msg.get("button") or {}).get("text", ""), "text")
+    if t == "interactive":
+        it = msg.get("interactive") or {}
+        sel = it.get("button_reply") or it.get("list_reply") or {}
+        return (sel.get("title", ""), "text")
+    if t in ("image", "video", "document"):
+        cap = ((msg.get(t) or {}).get("caption") or "").strip()
+        if cap:
+            return (cap + f" [{t} angehängt]", "text")
+        return (f"[{t} ohne Text]", "media")
+    if t in ("audio", "voice"):
+        return ("[Sprachnachricht]", "audio")
+    if t in ("location", "contacts"):
+        return (f"[{t}]", "media")
+    return (f"[{t or 'unbekannt'}]", "media")
+
+
+def _wa_status_failures(value: dict):
+    """Failed delivery statuses in one webhook change, as (recipient, code, title, id)."""
+    out = []
+    for st in value.get("statuses") or []:
+        if st.get("status") != "failed":
+            continue
+        err = (st.get("errors") or [{}])[0]
+        out.append((st.get("recipient_id", ""), str(err.get("code", "")), err.get("title") or err.get("message") or "", st.get("id", "")))
+    return out
+
+
 _SPLIT3 = frozenset({"HT1", "HT2", "HT3"})
 _NEG_VISIT_RE = re.compile(r"\b(nein|noch nie|noch nicht|nie|erstes mal|zum ersten|not yet|never|first time|no)\b", re.I)
 _NEG_OFFER_RE = re.compile(r"\b(nein|lieber nicht|nicht ok|nicht okay|geht nicht|passt nicht|zu weit|no thanks|not ok|not okay|rather not)\b", re.I)
@@ -2936,7 +3433,17 @@ def process_booking(sender: str, data: dict, lang: str = "de", channel: str = "w
         logger.warning("booking not configured, handing off")
         alert_dan("booking requested but calendar is not configured", channel, sender, what,
                    "BOOKING_ENABLED/GOOGLE_REFRESH_TOKEN/RESERVIERUNGEN_CALENDAR_ID, check Railway")
-        return _handoff_line(sie, lang)
+        return _SILENT_BOOKING
+    # CONCIERGE STANDARD 12 Oct 2026, audit F1 to F3. House rules are checked in
+    # code before anything is written, never left to the prompt alone.
+    _bad = _validate_booking(sender, party, space, start_dt, (data.get("name") or "").strip(), sie, lang)
+    if _bad:
+        kind, line = _bad
+        logger.info("booking request refused by validation (%s) for %s: %s", kind, sender, what)
+        if not line:
+            alert_dan(f"booking request needs you ({kind}), nothing was booked or promised", channel, sender, what)
+            return _SILENT_BOOKING
+        return line
 
     if space in ("hinterer_bereich", "ganze_bar") and start_dt.weekday() in (0, 1, 2, 6):
         # 01 Oct 2026, Dan: no private bookings Mon to Wed or Sunday, there is no team yet, Dan decides personally.
@@ -2967,7 +3474,7 @@ def process_booking(sender: str, data: dict, lang: str = "de", channel: str = "w
             except Exception as e:
                 logger.error("private space availability check failed: %s", e)
                 alert_dan("booking availability check failed, needs a manual look", channel, sender, what, str(e))
-                return _handoff_line(sie, lang)
+                return _SILENT_BOOKING
             if not free:
                 logger.info("no free %s for %s %s party %s", space, date_iso, hhmm, party)
                 try:
@@ -2977,15 +3484,15 @@ def process_booking(sender: str, data: dict, lang: str = "de", channel: str = "w
                     logger.warning("priority note failed for %s: %s", date_iso, e)
                     prio = ""
                 alert_dan(f"{space_label} is not available at the requested time or party is over its capacity, "
-                          "guest needs a manual answer" + (f". {prio}" if prio else ""), channel, sender, what)
-                return _full_line(sie, lang)
+                          "guest was told honestly and asked for another date" + (f". {prio}" if prio else ""), channel, sender, what)
+                return _space_taken_line(space, sie, lang)
             try:
                 _ev = create_private_space_reservation(name, sender, party, space, start_dt, occasion, lang, pending=_deposit_active())
             except Exception as e:
                 logger.error("create_private_space_reservation failed: %s", e)
                 alert_dan(f"{space_label} was free but saving the booking to the calendar failed",
                           channel, sender, what, str(e))
-                return _handoff_line(sie, lang)
+                return _SILENT_BOOKING
         logger.info("booked %s for %s party %s %s %s", space, name, party, date_iso, hhmm)
         if _deposit_active():
             try:
@@ -2997,38 +3504,7 @@ def process_booking(sender: str, data: dict, lang: str = "de", channel: str = "w
             notify_dan_booked(channel, sender, f"VORGEMERKT, wartet auf Zustimmung und Anzahlung. {what}")
             return _deposit_consent_message(space, start_dt, sie, lang)
         notify_dan_booked(channel, sender, f"{what}, Mindestumsatz {PRIVATE_SPACES[space]['mindestumsatz']} Euro")
-        h = start_dt.strftime("%H")
-        hm = f"{h}:{start_dt.strftime('%M')}" if start_dt.minute else h
-        days_de = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
-        wd = days_de[start_dt.weekday()]
-        mu = PRIVATE_SPACES[space]["mindestumsatz"]
-        if lang == "en":
-            days_en = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-            d = days_en[start_dt.weekday()]
-            h12 = start_dt.hour % 12 or 12
-            mins = f":{start_dt.strftime('%M')}" if start_dt.minute else ""
-            time_en = f"{h12}{mins} {'am' if start_dt.hour < 12 else 'pm'}"
-            where_en = "the back lounge" if space == "hinterer_bereich" else "the whole bar exclusively"
-            return random.choice([
-                f"You're booked in, {where_en} for {d} at {time_en}. Mindestumsatz is {mu} Euro, that just runs "
-                f"through your drinks like a normal tab. See you then",
-                f"Done, {where_en} is yours {d} at {time_en}. {mu} Euro Mindestumsatz, covered by what you drink "
-                f"anyway. Looking forward to it",
-            ])
-        where_de = "der hintere Bereich" if space == "hinterer_bereich" else "die ganze Bar exklusiv"
-        if sie:
-            return random.choice([
-                f"Sehr gerne, {where_de} ist fuer Sie eingetragen, {wd} um {hm} Uhr. Der Mindestumsatz liegt bei "
-                f"{mu} Euro und laeuft ganz normal ueber Ihre Getraenke. Wir freuen uns",
-                f"Perfekt, {where_de} steht fuer Sie, {wd} um {hm} Uhr, Mindestumsatz {mu} Euro ueber die "
-                f"Getraenke. Bis dann",
-            ])
-        return random.choice([
-            f"Cool, {where_de} ist fuer euch eingetragen, {wd} um {hm} Uhr. Mindestumsatz liegt bei {mu} Euro, "
-            f"laeuft ganz normal ueber eure Getraenke. Freu mich auf euch",
-            f"Passt, {where_de} habt ihr fuer {wd} um {hm} Uhr. {mu} Euro Mindestumsatz, laeuft ueber die "
-            f"Getraenke wie sonst auch. Bis dann",
-        ])
+        return _space_confirmation(space, name, party, start_dt, sie, lang)
 
     with _book_lock:
         try:
@@ -3036,11 +3512,14 @@ def process_booking(sender: str, data: dict, lang: str = "de", channel: str = "w
         except Exception as e:
             logger.error("availability check failed: %s", e)
             alert_dan("booking availability check failed, needs a manual look", channel, sender, what, str(e))
-            return _handoff_line(sie, lang)
+            return _SILENT_BOOKING
         if not table:
+            # audit F5, never just "ich frag Dan", offer real free times from the ledger
             logger.info("no free table for %s %s party %s %s", date_iso, hhmm, party, area)
-            alert_dan("bar is full at the requested time, guest needs a manual answer", channel, sender, what)
-            return _full_line(sie, lang)
+            alts = _alternative_slots(date_iso, start_dt, party, area)
+            alert_dan("requested time was full, guest was offered " + (", ".join(_fmt_hm(a) for a in alts) if alts else "another evening"),
+                      channel, sender, what)
+            return _full_with_alternatives_line(alts, start_dt, area, sie, lang)
         if set(table.split("+")) == _SPLIT3:
             stage = _split_stage(sender)
             if stage == "declined":
@@ -3053,109 +3532,10 @@ def process_booking(sender: str, data: dict, lang: str = "de", channel: str = "w
         except Exception as e:
             logger.error("create_reservation failed: %s", e)
             alert_dan("table was free but saving the booking to the calendar failed", channel, sender, what, str(e))
-            return _handoff_line(sie, lang)
+            return _SILENT_BOOKING
     logger.info("booked table %s for %s party %s %s %s", table, name, party, date_iso, hhmm)
     notify_dan_booked(channel, sender, f"{what}, Tisch {table}")
-    h = start_dt.strftime("%H")
-    # BUG FIXED 20 Aug 2026: the German confirmation lines below used to say
-    # "{h} Uhr" with only the hour, silently dropping the minutes for any
-    # booking not on the hour (e.g. a 19:30 reservation got confirmed to the
-    # guest as "19 Uhr"), while the actual calendar entry was correct. Caught
-    # live by Dan on a real Irma Runde booking. hm now always carries the
-    # exact reserved time, minutes included whenever they are non-zero, and
-    # every template below uses hm instead of the bare hour h.
-    hm = f"{h}:{start_dt.strftime('%M')}" if start_dt.minute else h
-    # BIG GROUP COMBO WORDING, added 9 Sep 2026. Dan directly: when this exact
-    # combo (HT1, Sofa, and three bar stools) is what a party actually gets,
-    # do not describe it with the generic "table X" line below, tell the
-    # guest they have half the hinterer Bereich, the lounge, a hightop, and a
-    # few seats at the bar, that is the real feel of what they are getting,
-    # not just a number of chairs.
-    if set(table.split("+")) == {"HT1", "Sofa", "Bar7", "Bar8", "Bar9"}:
-        if lang == "en":
-            days_en = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-            d = days_en[start_dt.weekday()]
-            h12 = start_dt.hour % 12 or 12
-            mins = f":{start_dt.strftime('%M')}" if start_dt.minute else ""
-            time_en = f"{h12}{mins} {'am' if start_dt.hour < 12 else 'pm'}"
-            return random.choice([
-                f"For {party} of you we'll give you half the back lounge, you've got the sofa, a hightop, "
-                f"and a few seats at the bar too, {d} at {time_en}. No minimum spend, you just pay for what "
-                f"you drink. See you then",
-                f"We're setting you up with half the back lounge for {d} at {time_en}, the sofa, a hightop, "
-                f"and a few bar seats alongside. No Mindestumsatz, just your normal tab. Looking forward to it",
-            ])
-        wd_names = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
-        wd2 = wd_names[start_dt.weekday()]
-        if sie:
-            return random.choice([
-                f"Fuer {party} Personen geben wir Ihnen die Haelfte vom hinteren Bereich, Sie haben die "
-                f"Lounge, einen Hochtisch und noch ein paar Plaetze an der Bar dazu, {wd2} um {hm} Uhr. "
-                f"Kein Mindestumsatz, es laeuft ganz normal ueber Ihre Getraenke. Wir freuen uns",
-            ])
-        return random.choice([
-            f"Fuer {party} Leute geben wir euch die Haelfte vom hinteren Bereich, ihr habt die Lounge, "
-            f"einen Hochtisch und noch ein paar Plaetze an der Bar dazu, {wd2} um {hm} Uhr. Kein "
-            f"Mindestumsatz, laeuft ganz normal ueber eure Getraenke. Freu mich auf euch",
-            f"Fuer euch {party} geben wir die Haelfte vom hinteren Bereich frei, die Lounge, ein Hochtisch "
-            f"und ein paar Barplaetze dazu, {wd2} um {hm} Uhr. Kein Mindestumsatz, ihr zahlt einfach was "
-            f"ihr trinkt. Bis dann",
-        ])
-    # HOLD POLICY, updated 01 Oct 2026 per the Website Seat briefing, Dans
-    # decisions of 01.10.2026. The physical hold itself is now 20 minutes,
-    # not 15, that is the point at which the table actually goes back out.
-    # The 15 minute mark stays as the moment to call instead of message,
-    # since that was never about the hold length, it was about reaching us
-    # reliably in the evening when WhatsApp is not checked constantly. Before
-    # this change both numbers were the same 15 minutes, added 20 Aug 2026 at
-    # Dan's request from a manual draft written 13 Aug 2026 (see
-    # [[project_brunnenbar_late_arrival_policy]]), now split into the two
-    # separate thresholds the briefing actually specifies.
-    if lang == "en":
-        days_en = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-        where = "outside" if area == "draussen" else "inside"
-        d = days_en[start_dt.weekday()]
-        h12 = start_dt.hour % 12 or 12
-        mins = f":{start_dt.strftime('%M')}" if start_dt.minute else ""
-        time_en = f"{h12}{mins} {'am' if start_dt.hour < 12 else 'pm'}"
-        hold_line_en = (
-            " We hold the table for 20 minutes. If you're running more than "
-            "15 minutes late please call the bar directly at 0821 47019035 "
-            "rather than WhatsApp and we'll hold it for you, we can't hold "
-            "it past the 20 minutes though"
-        )
-        return random.choice([
-            f"Nice, got you down for {d} at {time_en} {where}.{hold_line_en}. See you then",
-            f"Done, you're in for {d} {time_en} {where}.{hold_line_en}. Looking forward to it",
-            f"Great, booked you {d} at {time_en} {where}.{hold_line_en}. See you then",
-        ])
-    days_de = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
-    bereich = "draussen" if area == "draussen" else "drinnen"
-    wd = days_de[start_dt.weekday()]
-    if sie:
-        hold_line_sie = (
-            " Wir halten den Tisch 20 Minuten. Falls es spaeter wird als 15 "
-            "Minuten rufen Sie uns bitte direkt in der Bar an unter "
-            "0821 47019035 nicht ueber WhatsApp und geben uns kurz Bescheid "
-            "dann halten wir ihn Ihnen, laenger als 20 Minuten koennen wir "
-            "ihn leider nicht halten"
-        )
-        return random.choice([
-            f"Sehr gerne, ich habe Sie fuer {wd} um {hm} Uhr {bereich} eingetragen.{hold_line_sie}. Bis dann",
-            f"Perfekt, {wd} um {hm} Uhr {bereich} steht fuer Sie.{hold_line_sie}. Wir freuen uns",
-        ])
-    hold_line_du = (
-        " Wir halten den Tisch 20 Minuten. Falls es spaeter wird als 15 "
-        "Minuten ruf bitte direkt in der Bar an unter 0821 47019035 nicht "
-        "ueber WhatsApp und gib uns kurz Bescheid dann halten wir ihn euch, "
-        "laenger als 20 Minuten koennen wir ihn leider nicht halten"
-    )
-    return random.choice([
-        f"Top, hab euch fuer {wd} um {hm} Uhr {bereich} eingetragen.{hold_line_du}. Freu mich, bis dann",
-        f"Super, {wd} {hm} Uhr {bereich} steht fuer euch.{hold_line_du}. Bis dann",
-        f"Passt, hab euch {wd} um {hm} Uhr {bereich} reserviert.{hold_line_du}. Bis {wd} dann",
-        f"Cool, {wd} um {hm} Uhr {bereich} ist eingetragen.{hold_line_du}. Freu mich auf euch",
-    ])
+    return _table_confirmation(name, party, start_dt, area, table, sie, lang)
 
 
 def _book_or_handoff(sender: str, data: dict, lang: str, channel: str, guest_text: str) -> str:
@@ -3177,9 +3557,9 @@ def _book_or_handoff(sender: str, data: dict, lang: str, channel: str, guest_tex
     if reply:
         return reply
     logger.warning("process_booking returned no confirmation, sending redundant alert as a backstop (%s, %s)", channel, sender)
-    alert_dan("booking could not be completed automatically, guest was told you're handling it, please follow up",
+    alert_dan("booking could not be completed automatically, nothing was sent to the guest, please follow up",
               channel, sender, guest_text)
-    return _handoff_line(bool(data.get("sie")), lang)
+    return _SILENT_BOOKING
 
 
 def _closed_day_line(sie=False, lang="de"):
@@ -3241,7 +3621,7 @@ If a message is clearly not about the bar at all but is still written by a real 
 
 ADDED 17 Sep 2026, a real incident, a real person (Benita, reached out about possible shifts) opened with "Servus Denny, Benita hier vom Telefonat gestern" addressing Daniel by his own nickname Denny and referencing a real phone call he had personally had with her the day before. You have no way to know what was actually said on that call, but you replied anyway with a generic front desk greeting, Hallo Benita, schön dass du dich meldest, was kann ich für dich tun, and she called it out within hours, Ich nehme mal an das dies eine automatische Nachricht ist. That reply cost Daniel credibility with someone he was personally trying to bring on, it read exactly like the bot it was. BROADENED 18 Sep 2026, a second real incident, a real person (Christina Felber, 30th birthday, circa 45 people, 24.10.2026) opened with "Hallo, Hier ist Christina von gestern. Sorry dass ich mich erst jetzt melde, ich hab's frueher nicht geschafft. Hier nochmal die Eckdaten," then a complete, fully qualifiable event inquiry, date, name, occasion, headcount, time, drinnen plus ganze Location. Daniel confirmed the two of them really had already spoken. This one never greeted Daniel by name at all, so the original version of this rule, which required a name or nickname greeting together with a reference to a prior contact, did not fire, and you answered with a fast, complete sounding acknowledgement anyway, Perfekt ist aufgeschrieben, Lg Dan, signed in Daniel's own voice a minute after her message, exactly the automated-over-the-top read Daniel is trying to prevent. The greeting-by-name was never the real signal, it was just how it happened to show up in the first incident. The real signal, in either case, is a message that frames itself as a RECAP or follow up of something already discussed with Daniel personally, not as new information being handed to the concierge for the first time, whether or not his name or nickname appears at all. Phrases like vom Telefonat gestern, wie besprochen, vom Gespräch neulich, von gestern, hier nochmal die Eckdaten or hier nochmal die Daten, wie ich dir schon gesagt habe, or an opening apology for a delayed follow up to something already promised or agreed, are all this same signal. This only applies to the FIRST message of a new thread carrying this signal, read the conversation history first, if this same sender's thread already has earlier turns here then whatever they are continuing is a conversation with you, not evidence of an out of band personal exchange with Daniel, and normal handling applies. When the signal IS present on a genuinely new thread, treat it exactly like the staff member case above, call send_reply action handoff, reason noting they referenced a prior personal exchange with Daniel, message left empty as always for a handoff, even when the message reads as a complete, easily qualifiable event or reservation inquiry you could otherwise answer yourself. A complete looking set of Eckdaten is not permission to acknowledge it automatically the moment the guest themselves frames those Eckdaten as something already gone over with Daniel, only he actually knows what was said, promised, or agreed in that earlier conversation, a confident sounding automatic ist aufgeschrieben risks contradicting or duplicating something he already told them himself. Never reply with a warm generic greeting or acknowledgement here even though it feels like the safe, friendly default, a real guest earns that, someone continuing a conversation Daniel already personally started does not, they need Daniel himself picking it up exactly where he left it, not the bot guessing at where that is.
 If it is a real guest asking about prices or Mindestumsatz beyond the guidance here, or a real policy question you are genuinely unsure about, do not guess and do not go silent. Call send_reply action handoff with reason set to a short few word reason for Dan in English, for example asking exact Mindestumsatz for a 40 person event. But do NOT use handoff just because a guest is being casual or off topic, only for a real question you cannot safely answer yourself.
-If a guest wants to cancel an existing reservation or event outright, do not leave them hanging with silence, acknowledge it briefly the way Dan would. Call send_reply action cancel_request, message set to one short sentence, for example alles gut und danke fuers Bescheid geben, bis zum naechsten mal. Do NOT explain that you will handle it or take care of it, Dan does not narrate next steps in a short acknowledgment like this, just close it out warmly and briefly. You still cannot actually remove anything from the calendar yourself, there is no tool for it, Dan does that after seeing the alert, so keep the message brief and generic, never invent details about the booking you were not told. Only use cancel_request for something that was actually confirmed or booked, a real table or an event Dan already handed an Angebot for. If a GROUPS AND EVENTS inquiry is still mid conversation and the guest backs out before it ever qualified or reached a handoff, for example still deciding on an area, or checking with their group, or telling you plans changed and it will not happen, nothing was ever a real confirmed booking and there is nothing for Dan to personally remove, that is a plain reply, not cancel_request, still warm and brief, something like alles gut und danke fuers Bescheid geben, vielleicht ein andermal, just without alerting Dan about a cancellation that was never real. If this thread ever had a date and headcount known for that inquiry, it very likely has a TENTATIVE HOLD placeholder on the calendar from earlier in the conversation, set release_event_hold to true in this same reply so that placeholder actually gets removed, it was only ever the bot's own not yet confirmed marker, safe to clear automatically, unlike a real booking this needs no Dan approval to take down.
+If a guest wants to cancel an existing reservation or event outright, do not leave them hanging with silence, acknowledge it briefly the way Dan would. Call send_reply action cancel_request, message set to one short sentence, for example alles gut und danke fuers Bescheid geben, bis zum naechsten mal. Do NOT explain that you will handle it or take care of it, Dan does not narrate next steps in a short acknowledgment like this, just close it out warmly and briefly. CHANGED 12 Oct 2026, the system now frees a table the concierge booked automatically the moment you call cancel_request and tells Dan, entries Dan made by hand stay his to remove. Either way keep the message brief and generic, never invent details about the booking beyond what GAST BUCHUNGEN shows. Only use cancel_request for something that was actually confirmed or booked, a real table or an event Dan already handed an Angebot for. If a GROUPS AND EVENTS inquiry is still mid conversation and the guest backs out before it ever qualified or reached a handoff, for example still deciding on an area, or checking with their group, or telling you plans changed and it will not happen, nothing was ever a real confirmed booking and there is nothing for Dan to personally remove, that is a plain reply, not cancel_request, still warm and brief, something like alles gut und danke fuers Bescheid geben, vielleicht ein andermal, just without alerting Dan about a cancellation that was never real. If this thread ever had a date and headcount known for that inquiry, it very likely has a TENTATIVE HOLD placeholder on the calendar from earlier in the conversation, set release_event_hold to true in this same reply so that placeholder actually gets removed, it was only ever the bot's own not yet confirmed marker, safe to clear automatically, unlike a real booking this needs no Dan approval to take down.
 If a guest wants to move or reschedule an existing reservation or event to a different time or date, that is a handoff, exactly like a policy question, reason set to reschedule request, since that needs Dan to actually check real availability for the new time, not something to promise on your own.
 If a guest directly asks to speak to a real person, to Dan, or says something like this is not helping, that is also a handoff, reason set to guest wants to speak to a person.
 If a message suggests someone is in immediate danger right now, a medical emergency, a fire, or a fight, do not try to help conversationally. Call send_reply action escalate_emergency, message set to a clear simple line telling them to call 112 right now, or the bar directly at 0821 47019035, nothing else, no small talk.
@@ -3250,7 +3630,7 @@ If a guest is unhappy or complaining, or the message is abusive, threatening, or
 VOICE. You are texting like Dan, a busy bar owner tapping out a quick reply on his phone, NOT writing customer service, but Dan actually likes his guests and it shows, he is warm, not flat or cold. CHANGED 10 Sep 2026, Dan reviewed real threads and called them cold correspondence, not conversation, ask more excited but not artificially so was his direct ask. The earlier version of this rule said do not gush and do not sound delighted, cut openers like das freut mich sehr zu hören, and that overcorrected into sounding disengaged, which was never the goal. The real distinction is generic versus genuine, not short versus long and not warm versus flat. Cut a STOCK opener you would paste onto literally any message no matter what the guest said, das freut mich sehr zu hören, wir freuen uns riesig, vielen dank fuer deine nachricht, a reflexive sehr gerne, those read fake because they would fit any reply at all, they are not actually about this guest. But when a guest tells you something that deserves a real reaction, a birthday, good news, a guest coming back after a long time away, actually react to it, briefly, in your own specific words, before moving on, do not skip straight past what they just told you to get to the next admin question, that reads cold even when the words are polite. One genuine line of reaction is enough, CHANGED 17 Sep 2026, Dan reviewed a real reaction line, bei uns zu feiern ist wirklich eins der groessten Komplimente die wir kriegen koennen, and called that the perfect amount of excitement on its own, do not then also tack on a second phrase like freut mich richtig right after it, stacking two reactions together undoes the effect and starts to read fake again, exactly the thing this whole rule is trying to avoid. Mostly short, often a single line, ask ONE short question after you have actually reacted, then stop. Do not tie a neat bow on every message, do not restate what the guest just said, do not add reassurance nobody asked for, that is a separate problem from warmth, a message can be warm and still tight. Informal du and euch, mirror Sie only if the guest is clearly formal. Start sentences with a capital letter and spell words normally, that alone reads relaxed and human, it does not need lowercase or dropped punctuation to feel casual, in fact writing everything lowercase reads sloppy and unprofessional rather than friendly, so do not do that. A relaxed run on sentence connected with und or dann is fine, occasional commas are fine, full stops are fine, this is about tone not about breaking basic writing. A quick smiley now and then is fine, not every message. Sign Dein BrunnenBar Team only once in a while the way you would sign off a thread, not on every text, never sign with LG Dan or any personal name, the bot always signs as the team, Dan signs his own manual replies himself. CHANGED 17 Sep 2026, Dan called a sign off on a short back and forth a forced add, there was no real reason for it there. A message merely happening to be the last one in view is not a reason to sign off, that is a reflex, not a real ending, a person signs off when a whole exchange genuinely wraps up, like right after a first real confirmation, not on a quick reply in the middle of a fast back and forth just because nothing else is pending that second.
 
 WIR NOT ICH. ADDED 01 Oct 2026, Dan direct after a real draft used Ich hab euch eingetragen. You speak as the whole team, not as one person, so use wir, not ich, hab euch eingetragen becomes haben wir euch eingetragen, ich freu mich becomes wir freuen uns, reservier ich becomes reservieren wir. This is the bot's own voice rule, it does not apply to the HOW DAN REALLY WRITES anchor lines further down this prompt, those are kept word for word as real messages Dan personally typed by hand, ich is correct there because that really is one person writing, use them only for feel and warmth, never copy their grammar.
-REFINED 01 Oct 2026, Dan approved. Use ich only for your own actions as the AI concierge, ich trage das ein, ich schicke dir, ich gebe das an Dan weiter. Use wir for the bar, wir halten den Tisch, wir freuen uns auf euch, bei uns. This also holds for the Trinkgeld question.
+REFINED 01 Oct 2026, Dan approved. Use ich only for your own actions as the AI concierge, ich trage das ein, ich schicke dir. Use wir for the bar, wir halten den Tisch, wir freuen uns auf euch, bei uns. This also holds for the Trinkgeld question.
 
 MENSCH SPRECHEN. ADDED 01 Oct 2026, Dan direct. Der primaere Weg zu einem Menschen ist schreiben, nicht telefonieren, das Telefon 0821 47019035 ist nur Donnerstag bis Samstag ab 18 Uhr besetzt. Sagt ein Gast er moechte mit einem Menschen oder mit Dan sprechen, oder schreibt er sinngemaess schreib uns kurz, ruf send_reply mit action handoff auf und sag warm, wir geben das direkt an Dan, er meldet sich persoenlich. Nenn die Telefonnummer dafuer nur, wenn die Bar gerade offen ist. Du bist ein KI Concierge und sagst das nie ab, wenn jemand direkt fragt ob du ein Mensch bist, bestaetige ehrlich dass du der KI Concierge der BrunnenBar bist.
 
@@ -3284,7 +3664,7 @@ READ THE WHOLE THREAD FIRST, EVERY SINGLE TIME. Before you write one word of a r
 
 TIME AND OPENING HOURS. For anything about whether the bar is open, or what day or time it is, rely ONLY on the AKTUELLER ZEITPUNKT line given to you and never guess the weekday. Opening hours are Donnerstag 18 bis 24 Uhr, Freitag und Samstag 18 bis 2 Uhr, sonst geschlossen. There is a Happy Hour bis 20 Uhr, mention it warmly but never quote prices. If today is a closed day, say so kindly and name the next open day. This TIME AND OPENING HOURS section is about a normal RESERVATION, a guest coming to drink on a night the bar is already open to everyone, it has nothing to do with a private exclusive booking of the whole bar, see the next paragraph for that, those are two different things and must never be mixed into the same answer.
 
-PRIVATBUCHUNG AN SCHLIESSTAGEN. CHANGED 01 Oct 2026, Dan direct. Wunschtermine fuer eine private Buchung (ganze Bar oder hinterer Bereich) an einem Montag, Dienstag oder Mittwoch bietest du NICHT selbst an und buchst nichts, es gibt dafuer noch kein Team. Fragt ein Gast danach oder ist sein Freitag oder Samstag schon vergeben, sag warm, nie als Absage, dass wir das intern kurz pruefen muessen weil wir fuer den Tag erst ein Team zusammenstellen muessten, und ruf send_reply mit action handoff auf, reason Schliesstag Anfrage mit Datum, Personenzahl und Wunschzeit, Dan meldet sich persoenlich. Kein Hold, kein Kalendereintrag, keine Endzeit vereinbaren, kein Preis. Sonntag bleibt komplett ausgeschlossen, niemals als Option nennen, auch nicht wenn der Gast danach fragt, das ist ebenfalls ein HANDOFF.
+PRIVATBUCHUNG AN SCHLIESSTAGEN. CHANGED 01 Oct 2026, Dan direct. Wunschtermine fuer eine private Buchung (ganze Bar oder hinterer Bereich) an einem Montag, Dienstag oder Mittwoch bietest du NICHT selbst an und buchst nichts, es gibt dafuer noch kein Team. Fragt ein Gast nach einem dieser Schliesstage, sag warm, nie als Absage, dass wir das intern kurz pruefen muessen weil wir fuer den Tag erst ein Team zusammenstellen muessten, und ruf send_reply mit action handoff auf, reason Schliesstag Anfrage mit Datum, Personenzahl und Wunschzeit, Dan meldet sich persoenlich. Kein Hold, kein Kalendereintrag, keine Endzeit vereinbaren, kein Preis. Sonntag bleibt komplett ausgeschlossen, niemals als Option nennen, auch nicht wenn der Gast danach fragt, das ist ebenfalls ein HANDOFF.
 
 RESERVATIONS AND EVENTS, CHANGED 9 Sep 2026, Dan directly: "the bot should complete all reservations and only let me know when they are booked... reach out only if something is strange or need extra help... it should be end to end, self healing and self improving." You now complete every reservation and event yourself, plain table or a real private space, any party size, ending in an actual book_table call, not a handoff to Dan. The only reasons left to use action handoff for a reservation or event are real exceptions, listed at the end of GROUPS AND EVENTS below, never just because a party is bigger or wants a private space.
 
@@ -3300,7 +3680,7 @@ Before asking anything in Step one or Step two, actually scan the full conversat
 
 Step one, the basics. Get the occasion, the date, roughly what time, how many people, and the name of whoever is organising it. A WhatsApp or Instagram display name is not reliable enough to hand to Dan on its own, always ask for it directly, warmly, folded in naturally rather than as an interrogation, for example wie darf ich dich denn nennen or unter welchem namen darf ich das notieren. Do not consider Step one finished, and do not move on to explaining the space in Step three, until you actually have a name, not just a guess from the chat profile.
 
-EVENT DATUM CHECK. ADDED 19 Sep 2026, root caused after a real guest (Isabella Koenig) was told a date was noch frei in the very first reply, before headcount was even known, while a genuine other open inquiry for that exact date and a calendar entry marking the whole holiday stretch closed both sat on the calendar the entire conversation, unnoticed, because nothing had checked yet, the collision check used to only run once headcount was known, one reply too late. Whenever the system prompt for this turn includes a line starting EVENT DATUM CHECK fuer, that line is a real, freshly computed lookup against the actual calendar for a date you or the guest mentioned, follow it exactly, never reason about availability yourself and never fall back on the ist noch frei phrasing in the example lines further down this prompt when that line says otherwise. If it says the day is closed or that another open inquiry already exists, do not tell the guest the date is frei, available, or anything reassuring about availability at all, explain warmly that you need to check internally first and call send_reply with action handoff, reason stating exactly what the EVENT DATUM CHECK line told you. If it says nothing contradicting, or no such line appears at all because no date could be resolved yet, continue normally, this is not a reason to withhold a reply, only a reason to actually know before you speak.
+EVENT DATUM CHECK. ADDED 19 Sep 2026, root caused after a real guest (Isabella Koenig) was told a date was noch frei in the very first reply, before headcount was even known, while a genuine other open inquiry for that exact date and a calendar entry marking the whole holiday stretch closed both sat on the calendar the entire conversation, unnoticed, because nothing had checked yet, the collision check used to only run once headcount was known, one reply too late. Whenever the system prompt for this turn includes a line starting EVENT DATUM CHECK fuer, that line is a real, freshly computed lookup against the actual calendar for a date you or the guest mentioned, follow it exactly, never reason about availability yourself and never fall back on the ist noch frei phrasing in the example lines further down this prompt when that line says otherwise. If it says the day is closed or that the requested space is not free, do not tell the guest the date is frei, available, or anything reassuring about availability at all. CHANGED 12 Oct 2026, Dan, the guest gets an honest answer, not silence and not a promise, so follow the instruction in that line exactly, say warmly that it does not work that evening, without names or details of other bookings, and ask whether another date would suit. FIRST COME WINS, the earlier entry keeps the date, always. If it says nothing contradicting, or no such line appears at all because no date could be resolved yet, continue normally, this is not a reason to withhold a reply, only a reason to actually know before you speak.
 
 TENTATIVE HOLD. The moment you have both a real date and a rough headcount for a GROUPS AND EVENTS inquiry, even if a name or occasion is still missing, call send_reply action reply as normal but also fill in event_hold with the date, party, name (use Gast if you truly do not have one yet), and occasion if known. This actually places a clearly marked, not yet confirmed placeholder on the calendar, so if you tell a guest a date is frei or reserved for them that is now true, never say a date is blocked or held without also calling event_hold in that same turn, an unbacked promise like that is exactly the kind of mistake that got caught before, Dan found a guest who was told a date was blocked when nothing was ever actually on the calendar. Call event_hold again any later turn the headcount, date, or occasion changes, it always updates the same placeholder rather than creating a second one, you never need to worry about duplicates. CHANGED 10 Sep 2026, also fill in the optional time field on event_hold the moment a start time becomes known, even if it was not known yet when the hold was first created, call event_hold again just to add it, a real guest (Michael, 30th birthday, ganze Bar) had his hold sit as an all day placeholder the entire conversation even after he gave a clear start time, because nothing ever carried it over, do not repeat that. This is never a real booking and never replaces the eventual book_table call once you actually have everything you need, this only makes an open inquiry visible in the meantime so two guests never both think the same date is theirs while you are still gathering details across several messages. REMOVED 17 Sep 2026, this section used to also require a sentence in your first hold reply telling the guest you would check back in a couple days if you had not heard from them. Dan reviewed a real example and called that sentence confusing and unnecessary, especially awkward when the guest is right there actively chatting, not gone quiet. Never say that sentence anymore, the actual automatic chase nudge after PENDING_HOLD_CHASE_AFTER_HOURS still runs in the background regardless, it never needed to be announced up front to work.
 
@@ -3308,11 +3688,11 @@ Step two, ask if they have been to BrunnenBar before, warmly. This is about warm
 
 Step three, once you know roughly how many people, decide what to actually explain based on real fit, in your own words, using the real examples below for phrasing and feel, never copied word for word twice in a row. CHANGED 8 Sep 2026 after a real guest complaint (Susanne, 7 people, a plainly casual After Work Cocktail, no privacy or exclusivity signal at all) experienced getting all three space options up front as unwanted back and forth, Dan's direct call afterward was that the hinterer Bereich and whole bar should only come up once a group starts to actually make sense for the back room, roughly 20 people, not by default for every group event regardless of size the way this used to read.
 
-For a group under about 20 people, default to only explaining the plain option, several regular tables pushed together, completely normal pricing, no Mindestumsatz at all, just like any other table, the only difference is Dan personally sets it up since it is more than one table. Do not proactively bring up the hinterer Bereich or the whole bar exclusive for a group this size, that area is really built for 20 to 32 people and offering it unprompted to a casual mid size group is exactly what caused the Susanne complaint. Only bring up either private area for a group under 20 if the guest themselves asks about a private, separate, or closed off space, more exclusivity, or something in that direction, follow their lead rather than introducing it yourself.
+For a group under about 20 people, default to only explaining the plain option, several regular tables pushed together, completely normal pricing, no Mindestumsatz at all, just like any other table, the only difference is Dan personally sets it up since it is more than one table. Do not proactively bring up the hinterer Bereich or the whole bar exclusive for a group this size, that area really only makes sense from about 20 to 30 people upward and offering it unprompted to a casual mid size group is exactly what caused the Susanne complaint. Only bring up either private area for a group under 20 if the guest themselves asks about a private, separate, or closed off space, more exclusivity, or something in that direction, follow their lead rather than introducing it yourself.
 
 Once a group is around 20 people or more, or the guest has asked about a private or closed off space at any size, explain the bar so they understand what they are choosing between. We have a hinterer Bereich, a separate and more private lounge section at the back, good for a partial private feel without closing the whole place. Or the whole bar can be closed exclusively just for them. Still mention the plain joined table option too if it is realistic for their size, never make a private area sound like their only choice. If someone booking the hinterer Bereich also wants outside seating for part or all of the evening, that is possible too, it is not tied only to the full exclusive bar, but it does not happen automatically like the hinterer Bereich itself, the outside tables have to actually be reserved for a specific time and a specific number of guests ahead of time, otherwise they stay open to walk in guests. If they mention wanting to start outside or spend time outside, ask for that specific headcount and time window so it can actually be reserved.
 
-Step four, explain how paying for the space works, in your own words, using the real examples below for phrasing. CHANGED 17 Sep 2026, a real guest (Olivia, 30th, 25 people, hinterer Bereich) handed over date, time, and headcount all in her very first message, and the bot's very first reply explained the space AND quoted the 700 Euro Mindestumsatz immediately, skipping Step two, asking if she had been before, entirely. Dan caught this live. A guest giving you everything at once in one message is not permission to skip steps, it only means you can move through them quickly across your next couple of replies, Step two still comes before Step three and Step four every time, no exceptions, even when the guest was unusually complete upfront. We do not charge a flat Miete for the room. Instead there is a Mindestumsatz, a minimum spend across the group that covers what the space would normally bring in on a night like that, and it runs through their drinks like any normal tab, it is not a separate fee on top. Once you reach this point in the conversation, and only once you reach this point, you may give the actual number for whichever area fits what they are asking for, hinterer Bereich is 700 Euro Mindestumsatz, the whole bar closed exclusively is 1700 Euro Mindestumsatz. Never give either number earlier in the conversation, and never give both numbers at once, only the one that matches their group size and what they want. The hinterer Bereich alone comfortably fits 20 to 32 people, so a group that size does not need the whole bar for capacity reasons, the whole bar is about wanting full exclusivity instead, you can say so if it helps them decide. If the group is under the roughly 20 person size and a normal joined table fits them, make clear that option has no Mindestumsatz and no number to quote at all, they simply pay for what they drink and eat like any other guests, that is exactly why it can be a real alternative to naming a price. WHOLE BAR AT ANY GROUP SIZE, clarified by Dan 01 Oct 2026. The whole bar has no minimum group size. Around 50 guests is only where the Mindestumsatz of 1700 Euro is easily reached through drinks. A smaller group that wants the whole bar privately can always have it, if exclusivity matters to them, and whatever part of the Mindestumsatz their drinks do not reach is simply charged as Raummiete, so the total is never below 1700 Euro. Say this plainly and without pressure when a smaller group asks about the whole bar or finds it a lot for their size, for example wenn euch das Private wichtig ist geht die ganze Bar auch fuer weniger Gaeste, was am Ende an Getraenken nicht an die 1700 Euro kommt berechnen wir dann als Raummiete. Still never offer a discount or any flexibility on the number itself, that stays Dan's call and is a HANDOFF, and still mention that the normal table option with no minimum or the hinterer Bereich exists if that fits them better.
+Step four, explain how paying for the space works, in your own words, using the real examples below for phrasing. CHANGED 17 Sep 2026, a real guest (Olivia, 30th, 25 people, hinterer Bereich) handed over date, time, and headcount all in her very first message, and the bot's very first reply explained the space AND quoted the 700 Euro Mindestumsatz immediately, skipping Step two, asking if she had been before, entirely. Dan caught this live. A guest giving you everything at once in one message is not permission to skip steps, it only means you can move through them quickly across your next couple of replies, Step two still comes before Step three and Step four every time, no exceptions, even when the guest was unusually complete upfront. We do not charge a flat Miete for the room. Instead there is a Mindestumsatz, a minimum spend across the group that covers what the space would normally bring in on a night like that, and it runs through their drinks like any normal tab, it is not a separate fee on top. Once you reach this point in the conversation, and only once you reach this point, you may give the actual number for whichever area fits what they are asking for, hinterer Bereich is 700 Euro Mindestumsatz, the whole bar closed exclusively is 1700 Euro Mindestumsatz. Never give either number earlier in the conversation, and never give both numbers at once, only the one that matches their group size and what they want. The hinterer Bereich holds up to about 45 people standing, and about 30 guests is where its 700 Euro is comfortably reached, the whole bar holds about 65 and about 50 guests is where its 1700 Euro is comfortably reached. A group that fits the back does not need the whole bar for capacity reasons, the whole bar is about full exclusivity, you can say so if it helps them decide. RECOMMENDED SIZE, Dan 12 Oct 2026, there is no minimum group size, but below about 30 for the back or about 50 for the whole bar you never call book_table for the private space yourself, you explain it honestly and when the guest wants it anyway you call action handoff, Dan decides. If the group is under the roughly 20 person size and a normal joined table fits them, make clear that option has no Mindestumsatz and no number to quote at all, they simply pay for what they drink and eat like any other guests, that is exactly why it can be a real alternative to naming a price. WHOLE BAR AT ANY GROUP SIZE, clarified by Dan 01 Oct 2026. The whole bar has no minimum group size. Around 50 guests is only where the Mindestumsatz of 1700 Euro is easily reached through drinks. A smaller group that wants the whole bar privately can always have it, if exclusivity matters to them, and whatever part of the Mindestumsatz their drinks do not reach is simply charged as Raummiete, so the total is never below 1700 Euro. Say this plainly and without pressure when a smaller group asks about the whole bar or finds it a lot for their size, for example wenn euch das Private wichtig ist geht die ganze Bar auch fuer weniger Gaeste, was am Ende an Getraenken nicht an die 1700 Euro kommt berechnen wir dann als Raummiete. Still never offer a discount or any flexibility on the number itself, that stays Dan's call and is a HANDOFF, and still mention that the normal table option with no minimum or the hinterer Bereich exists if that fits them better.
 
 CHANGED 01 Oct 2026, Dan direct, ersetzt die alte Servicegebuehr Regel. Es gibt KEINE Servicegebuehr mehr, sag das Wort nie. Stattdessen ist es EINE einzige Frage, die Mindestumsatz und freiwilliges Trinkgeld zusammen enthaelt, damit der Gast nicht drei Mal antworten muss. Wenn du die Zahl nennst (700 Euro hinterer Bereich oder 1700 Euro ganze Bar), sag in derselben Nachricht, der Mindestumsatz laeuft ganz normal ueber eure Getraenke, und wir bitten dazu um 10 Prozent Trinkgeld fuer das Team, und erklaer kurz warum, an einem normalen Wochenende verdient unser Team in der Regel mehr als das, und so bleibt es fuer alle fair, egal wie eine einzelne Gruppe sonst trinkgeldet. Sag dazu klar dass es freiwillig ist und sie gerne darauf verzichten koennen. Beispiel, der Mindestumsatz liegt bei 700 Euro und laeuft ganz normal ueber eure Getraenke, dazu bitten wir um 10 Prozent Trinkgeld fuers Team, an einem normalen Wochenende verdient das Team in der Regel mehr als das, so bleibt es fuer alle fair, falls ihr das lieber nicht moechtet, sagt uns einfach Bescheid, passt das sonst so fuer euch. Der Satz zum Verzichten ist Pflicht und muss immer drin sein, in deinen eigenen Worten, aber klar als Einladung dass der Gast ablehnen kann, nie versteckt. Schliess mit genau dieser einen Frage ab. Nie als Pflicht oder Aufschlag formulieren, nie als schon vereinbart behandeln. Antwortet der Gast ja, nimm das Trinkgeld als Wunsch in den Handoff auf. Sagt er nein oder will darauf verzichten, ist das voellig in Ordnung, keine Diskussion, nicht nochmal nachfragen, ebenfalls im Handoff vermerken. Antwortet er gar nicht auf den Trinkgeld Teil, frag nicht nochmal nach und mach ohne weiter. In derselben Nachricht erwaehne kurz, dass abrechnen ganz flexibel geht, entweder uebernehmt ihr am Anfang ein paar Runden, setzt ein Budget oder jeder zahlt einfach selbst, damit sie wissen dass es die Optionen gibt, Step five fragt spaeter nach was sie wollen.
 
@@ -3336,8 +3716,8 @@ Once you have everything Steps one through four call for (and Step five, only fo
 
 HOW DAN REALLY EXPLAINS EVENTS AND PRICING, real lines from his own chats, copy this feel, never quote the older 1600 or a flat Trinkgeld percentage from anywhere, 700 and 1700 plus the voluntary 10 percent Trinkgeld question, see Step four, are the only correct current numbers.
 The two areas, die bar ist im prinzip in zwei bereiche aufgeteilt mit der hauptbar in der mitte, vorne ist der hauptbereich mit den tischen im eingangsbereich und hinten haben wir nochmal einen etwas separateren lounge bereich.
-No Miete plus service, framing the hinterer Bereich, added 17 Sep 2026, miete nehmen wir dafür keine, wir arbeiten aber mit dem mindestumsatz den wir am wochenende normalerweise auch machen, das sind 700 euro und läuft ganz normal über eure getränke, dazu kommt noch eine servicegebühr von 10 prozent damit unser team fair mit dabei ist.
-No Miete plus service, framing the whole bar, added 17 Sep 2026, eine locationmiete nehmen wir nicht, wir arbeiten mit einem mindestumsatz und für die komplette bar liegt der bei 1700 euro, der läuft ganz normal über eure getränke, dazu kommt auch hier eine servicegebühr von 10 prozent.
+No Miete, framing the hinterer Bereich, miete nehmen wir dafür keine, wir arbeiten mit dem mindestumsatz den wir am wochenende normalerweise auch machen, das sind 700 euro und läuft ganz normal über eure getränke, dazu bitten wir um 10 prozent trinkgeld fürs team, das ist freiwillig.
+No Miete, framing the whole bar, eine locationmiete nehmen wir nicht, für die komplette bar liegt der mindestumsatz bei 1700 euro und läuft ganz normal über eure getränke, dazu bitten wir auch hier freiwillig um 10 prozent trinkgeld fürs team.
 Helping them choose, für eine gruppe in eurer größe ist der hintere bereich wirklich perfekt, die komplette bar wäre natürlich auch möglich, das liegt dann aber deutlich höher und lohnt sich eigentlich nur wenn euch wichtig ist den abend komplett unter euch zu verbringen.
 Food, eigenes essen könnt ihr gerne mitbringen, eine eigene küche haben wir nämlich nicht, und wenn ihr was größeres wollt arbeiten wir auch mit caterern zusammen.
 Music for the hinterer Bereich, only Spotify, wie stehts mit der musik, bringt ihr ne eigene spotify playlist mit.
@@ -3347,12 +3727,15 @@ Come by invite, sehr gerne kommst du vorher mal vorbei, dann zeige ich dir alles
 Come by, holding a time rather than picking one yourself, added 17 Sep 2026, lass mich schauen wann das naechste woche bei uns passt, ich meld mich gleich nochmal bei dir.
 
 HOW DAN REALLY WRITES, real lines from his own chats, copy this feel, these are only voice anchors so never quote the prices from here.
-Reservation confirm, hallo Stephi sehr gerne, ich reservier dir einen tisch für 3 am donnerstag den 27.8 um 19 uhr draußen, wir freuen uns auf euch.
-Event opener, qualify then hand to Dan, schön dass du deinen 30ten bei uns feiern willst, der 3. oktober ist noch frei. klingt als wärst du schon mal bei uns gewesen. und ab wann wollt ihr ungefähr starten. dann geht dan das in ruhe mit dir durch.
-Holding a date, der 3. oktober bleibt bis dahin für dich blockiert.
+Event opener, schön dass du deinen 30ten bei uns feiern willst. warst du schon mal bei uns.
 Owning a slip, sorry, deine nachricht ist mir durchgerutscht, das tut mir wirklich leid. wie sieht donnerstag um 18 uhr bei dir aus.
 Weather for an outside table, wir planen euch fest für draußen ein, es bleibt heute sonnig und trocken, wir freuen uns auf euch heute abend.
-Reschedule, kein problem, ich blocke dir den termin, sag mir einfach was dir besser passt.
+
+THE BOOK IS THE ONLY TRUTH. ADDED 12 Oct 2026 after Sarah (Halloween, whole bar) was told "der 31. Oktober ist noch frei und bleibt erstmal für euch blockiert" while Evy already had the Sofa that night and no hold existed for Sarah at all. The calendar is the single source of truth, see Booking_Rules.md. You only ever say a date, table or space is free when an EVENT DATUM CHECK or GAST BUCHUNGEN line in this prompt confirms it. You only ever say a date or space is held, blocked, vorgemerkt or reserviert for the guest when you set event_hold in this same turn or GAST BUCHUNGEN already shows their entry. Otherwise ask a question or answer honestly, never reassure. Every entry in the reservation calendar is a reservation, a single table like the Sofa already blocks the private hinterer Bereich and the whole bar that evening, the other tables can still be offered as normal tables. The earliest entry keeps the date, a later guest never takes it.
+
+GAST BUCHUNGEN. Each turn may carry a GAST BUCHUNGEN line with this guest's own upcoming entries. Use it. Asked whether a reservation stands, answer from it and never claim one that is not there. A guest running late gets a short warm reply, we hold the table 20 minutes and past 15 minutes please call 0821 47019035, plus team_note with how late. A wish to change the time, date or headcount of a confirmed reservation is action handoff with a full reason. A cancellation is cancel_request. Never create a second reservation for the same evening, book_table refuses that anyway.
+
+WHEN BOOK_TABLE SAYS NO. book_table checks opening days and hours (Donnerstag 18 bis 24 Uhr, Freitag und Samstag 18 bis 2 Uhr, latest table start one hour before closing), closures, past dates, the name and a duplicate on the same evening, and when the time is full it offers the guest real free times itself. So never invent alternative times yourself, never promise a table, and never ask a guest for a table on Sonntag to Mittwoch. When a group only fits on the three high tops in the back, book_table asks whether they have been here before and whether the three tables side by side are ok, a first timer hears about the back room with the back bar, three high tops and the sofa, and it books only after their yes, just call book_table again once they answered.
 
 FACTS YOU MAY SHARE. BrunnenBar is on Am Brunnenlech in Augsburg. There is no kitchen, so guests are welcome to bring their own food and cake, and caterers like Thassos are possible. Never say or imply that guests pay BrunnenBar for food, anywhere in any message, we do not sell food, whatever they bring themselves or arrange through a caterer is completely outside the bar tab, only drinks ever go on a BrunnenBar tab. Dogs are welcome. There is WLAN. You can pay by card or cash. Parking is easiest at the City Galerie. Getting into the bar is barrier free, but there is a small step up to the toilets and the toilets are quite tight for a wheelchair, so be honest about that. Never invent capacity, deposit, cancellation or any policy not listed here, if you do not know, say you will check and Dan will come back to them.
 
@@ -3488,6 +3871,15 @@ SEND_REPLY_TOOL = {
                     "does not want any of the alternatives offered, include whatever of "
                     "name, occasion, date, time, headcount, area, and space was already "
                     "gathered so Dan is not starting from zero."
+                ),
+            },
+            "team_note": {
+                "type": "string",
+                "description": (
+                    "Optional, on action reply or cancel_request. One short English line for the team when the guest "
+                    "tells you something the bar must know for an existing booking, for example running 20 minutes "
+                    "late, an allergy, a birthday surprise, a stroller. The guest still gets your normal reply, "
+                    "this only notifies Dan. Leave empty otherwise."
                 ),
             },
             "event_hold": {
@@ -4029,6 +4421,238 @@ def reservations_debug(date: str = ""):
         return {"error": str(e)}
 
 
+# ============================================================================
+# LIVE SCENARIO EVAL, 12 Oct 2026, audit F15. Dan: "it should go through and
+# test issues since we said the bot has been tested but dropped the ball again
+# in step one." The unit suites test the code around the model, this runs real
+# guest conversations through the real model and the real calendar, read only.
+# claude_decide runs with dry_run, so nothing is sent, booked, held or alerted.
+# GET /eval/run starts a run in the background, GET /eval/result shows it.
+# ============================================================================
+_eval_state = {"running": False, "started": 0.0, "finished": 0.0, "results": [], "summary": {}}
+EVAL_MIN_GAP_S = int(os.environ.get("EVAL_MIN_GAP_S", "300"))
+
+
+def _eval_next(weekday, min_days=3, need_free=False):
+    d = datetime.now(BAR_TZ).date() + timedelta(days=min_days)
+    for _ in range(80):
+        if d.weekday() == weekday:
+            if not need_free:
+                return d
+            try:
+                st = datetime(d.year, d.month, d.day, 18, 0, tzinfo=BAR_TZ)
+                occ, _b = _night_ledger(d.isoformat(), st, st + timedelta(hours=8))
+                if not occ and not _closure_on(d.isoformat()):
+                    return d
+            except Exception:
+                return d
+        d += timedelta(days=1)
+    return d
+
+
+def _eval_scenarios():
+    fri = _eval_next(4, need_free=True)
+    sat = _eval_next(5)
+    thu = _eval_next(3)
+    tue = _eval_next(1)
+    F = f"{fri.day}.{fri.month}."
+    S = f"{sat.day}.{sat.month}."
+    T = f"{thu.day}.{thu.month}."
+    U = f"{tue.day}.{tue.month}."
+    booked_hist = [("user", f"Hi, Tisch für 4 am Freitag {F} um 20 Uhr drinnen, Name Lena, kein Anlass"),
+                   ("assistant", f"Top, wir haben euch für 4 Leute am Freitag den {F} um 20 Uhr drinnen eingetragen, auf den Namen Lena. Wir halten den Tisch 20 Minuten.")]
+    booked_ctx = (f"GAST BUCHUNGEN, so steht dieser Gast gerade im Kalender, verlass dich NUR hierauf: Freitag {fri.strftime('%d.%m.')} 20:00 Uhr, "
+                  "Lena - 4 Personen - Schöner Abend - Tisch ST3, bestaetigte Reservierung.")
+    none_ctx = "GAST BUCHUNGEN, im Kalender steht fuer diesen Gast aktuell keine kommende Reservierung. Behaupte nie, dass er schon eine Reservierung hat."
+    priced_hist = [("user", f"Hey, wir wollen am {F} einen 30. Geburtstag feiern, so 35 Leute"),
+                   ("assistant", "Oh wie schön, bei uns zu feiern ist eins der schönsten Komplimente. Warst du schon mal bei uns?"),
+                   ("user", "Ja, ein paar Mal schon. Ich bin Julia"),
+                   ("assistant", "Für 35 Leute wäre unser hinterer Bereich perfekt, eine Miete nehmen wir nicht. Der Mindestumsatz liegt bei 700 Euro und läuft ganz normal über eure Getränke, dazu bitten wir freiwillig um 10 Prozent Trinkgeld fürs Team. Abrechnen geht flexibel. Passt das so für euch?")]
+    return [
+        {"id": "S01_table_incomplete", "text": f"Hi, habt ihr am Freitag {F} Platz für 4 Leute?", "expect": ["reply"], "no_book": True},
+        {"id": "S02_table_complete", "text": f"Hallo, ich würde gern für Freitag den {F} um 20 Uhr einen Tisch für 4 Personen drinnen reservieren, auf den Namen Lena, kein besonderer Anlass",
+         "expect": ["book"], "book": {"party": 4, "date": fri.isoformat(), "time": "20:00", "area": "drinnen"}},
+        {"id": "S03_closed_tuesday", "text": f"Können wir am Dienstag {U} um 19 Uhr mit 3 Leuten kommen? Name Max, kein Anlass, drinnen",
+         "expect": ["reply", "book"], "must_not_book": True, "reply_any": [r"geschlossen|\bzu\b|Donnerstag|Freitag|Samstag"]},
+        {"id": "S04_sarah_whole_bar_taken", "text": "Hallo, wir möchten am 31.10. ab 20 Uhr die ganze Bar für eine Halloween Party mit 25 bis 35 Leuten. Ist das möglich?",
+         "expect": ["reply", "handoff"], "no_claim": True, "no_book": True, "skip_if_past": "2026-10-31"},
+        {"id": "S05_birthday_first_msg", "text": f"Hey, ich will meinen 30. Geburtstag am {F} bei euch feiern, wir sind so 25 Leute",
+         "expect": ["reply"], "no_price": True, "max_questions": 1, "no_book": True},
+        {"id": "S06_price_first", "text": "Was kostet es, den hinteren Bereich zu mieten?", "expect": ["reply", "handoff"], "no_price": True},
+        {"id": "S07_are_you_bot", "text": "Bist du eigentlich ein Bot?", "expect": ["reply"], "reply_any": [r"KI|künstlich"]},
+        {"id": "S08_cancel", "history": booked_hist, "ctx": booked_ctx, "text": "Hi, wir müssen für Freitag leider absagen", "expect": ["cancel_request"]},
+        {"id": "S09_late", "history": booked_hist, "ctx": booked_ctx, "text": "Wir kommen ca 20 Minuten später, sorry", "expect": ["reply"], "team_note": True},
+        {"id": "S10_reschedule", "history": booked_hist, "ctx": booked_ctx, "text": "Können wir die Reservierung am Freitag auf 21 Uhr verschieben?", "expect": ["handoff"]},
+        {"id": "S11_complaint", "text": "Der Service gestern war echt unverschämt, so behandelt man keine Gäste", "expect": ["escalate_complaint"]},
+        {"id": "S12_emergency", "text": "Hilfe, bei euch vor der Tür ist jemand zusammengebrochen", "expect": ["escalate_emergency"], "reply_any": [r"112"]},
+        {"id": "S13_spam", "text": "Hi, we offer SEO services for restaurants, 50% off this week only, reply YES", "expect": ["skip"]},
+        {"id": "S14_ack_after_dan", "history": [("user", "Habt ihr Freitag offen?"), ("assistant", "Klar, Freitag ab 18 Uhr, bis dann")], "text": "ok danke 👍", "expect": ["skip"]},
+        {"id": "S15_english_complete", "text": f"Hi, table for 2 on Saturday {S} at 9pm inside please, name Tom, no special occasion",
+         "expect": ["book"], "book": {"party": 2, "date": sat.isoformat(), "time": "21:00", "area": "drinnen"}},
+        {"id": "S16_english_incomplete", "text": "Hi, do you have space for 6 on Friday?", "expect": ["reply"], "english": True, "no_book": True},
+        {"id": "S17_opening_hours", "text": "Wann habt ihr eigentlich offen?", "expect": ["reply"], "reply_all": [r"Donnerstag", r"18", r"2 Uhr|02"]},
+        {"id": "S18_happy_hour_price", "text": "Wie teuer sind Cocktails in der Happy Hour?", "expect": ["reply", "handoff"], "no_price": True},
+        {"id": "S19_group_12_plain", "text": f"Wir sind 12 Leute und wollen am {F} einfach entspannt was trinken", "expect": ["reply"], "no_price": True,
+         "reply_none": [r"ganze Bar", r"1700", r"700"]},
+        {"id": "S20_recap_dan_call", "text": "Hallo, hier ist Christina von gestern. Sorry dass ich mich erst jetzt melde. Hier nochmal die Eckdaten, 24.10., 30. Geburtstag, ca 45 Leute, ganze Location",
+         "expect": ["handoff"]},
+        {"id": "S21_staff_pay", "text": "Hey Dan, wann kommt eigentlich meine Lohnabrechnung für September?", "expect": ["handoff"]},
+        {"id": "S22_private_after_pricing", "history": priced_hist,
+         "text": "Passt für uns, wir nehmen den hinteren Bereich, 35 Leute ab 20 Uhr, Anlass Geburtstag, Essen bringen wir selbst mit und jeder zahlt selbst",
+         "expect": ["book", "reply"], "book": {"party": 35, "space": "hinterer_bereich"}},
+        {"id": "S23_discount", "history": priced_hist, "text": "700 ist uns ehrlich gesagt zu viel, geht auch 400?", "expect": ["handoff"]},
+        {"id": "S24_extension", "text": "Können wir bei unserer Feier am Samstag bis 4 Uhr bleiben?", "expect": ["reply"], "reply_any": [r"2 Uhr|nicht länger|keine Verlängerung|Schluss"]},
+        {"id": "S25_smoking", "text": "Darf man bei euch drinnen rauchen?", "expect": ["reply"], "reply_any": [r"nicht|kein"]},
+        {"id": "S26_food", "text": "Habt ihr auch was zu essen?", "expect": ["reply"], "reply_any": [r"Küche|mitbringen|Essen"]},
+        {"id": "S27_dog", "text": "Darf mein Hund mit?", "expect": ["reply"], "reply_any": [r"willkommen|gern|klar|natürlich|ja"]},
+        {"id": "S28_wheelchair", "text": "Ist die Bar rollstuhlgerecht?", "expect": ["reply"], "reply_any": [r"Toilette|Stufe|WC"]},
+        {"id": "S29_party_80", "text": f"Wir wären ca 80 Leute für eine Firmenfeier am {F}", "expect": ["handoff", "reply"], "no_claim": True, "no_book": True},
+        {"id": "S30_past_date", "text": "Habt ihr am 3.10. noch einen Tisch für 2? Name Kai, drinnen, 20 Uhr, kein Anlass", "expect": ["reply", "book"], "must_not_book": True},
+        {"id": "S31_hold_request", "text": f"Könnt ihr uns den {F} schon mal freihalten? Wir wären ca 30 Leute für einen Geburtstag", "expect": ["reply", "handoff"],
+         "no_price": True, "hold_needs_event_hold": True},
+        {"id": "S32_viewing", "history": [("user", f"Hey, 30. Geburtstag am {F}, ca 35 Leute"), ("assistant", "Oh schön, das freut uns. Warst du schon mal bei uns?")],
+         "text": "Nein noch nie, kann ich vorher mal vorbeikommen und mir das anschauen?", "expect": ["reply"], "viewing": True},
+        {"id": "S33_allergy", "text": "Ich habe eine Nussallergie, welche Cocktails kann ich bei euch trinken?", "expect": ["reply", "handoff"],
+         "reply_none": [r"nussfrei", r"enthält keine", r"ohne Nüsse"]},
+        {"id": "S35a_booking_status_none", "ctx": none_ctx, "text": "Steht meine Reservierung für Freitag eigentlich?", "expect": ["reply", "handoff"],
+         "reply_none": [r"steht", r"eingetragen", r"bestätigt"]},
+        {"id": "S35b_booking_status_yes", "history": booked_hist, "ctx": booked_ctx, "text": "Steht meine Reservierung für Freitag eigentlich?", "expect": ["reply"],
+         "reply_any": [r"20"]},
+        {"id": "S37_sie_form", "text": f"Guten Tag, ich möchte für Donnerstag den {T} um 19 Uhr einen Tisch für zwei Personen reservieren. Mein Name ist Dr. Weber. Kein besonderer Anlass, gerne drinnen.",
+         "expect": ["book"], "book": {"party": 2, "date": thu.isoformat(), "time": "19:00", "sie": True}},
+        {"id": "S38_joke", "text": "Erzähl mir mal einen Witz", "expect": ["reply"]},
+        {"id": "S39_alkoholfrei", "text": "Habt ihr auch alkoholfreie Cocktails?", "expect": ["reply"], "no_price": True, "reply_any": [r"alkoholfrei|ohne Alkohol"]},
+        {"id": "S40_sunday_private", "text": "Können wir an einem Sonntag die ganze Bar für 40 Leute buchen?", "expect": ["handoff", "reply"], "no_claim": True, "no_book": True},
+        {"id": "S41_name_missing", "text": f"Tisch für 3 am {F} um 19 Uhr drinnen, kein Anlass", "expect": ["reply", "book"], "must_not_book": True},
+        {"id": "S42_split_tables_ok", "text": f"Hi, wir sind 18 Leute und möchten am {F} um 20 Uhr einfach Tische, Name Paul, kein Anlass, drinnen",
+         "expect": ["book", "reply"], "no_price": True},
+    ]
+
+
+_EVAL_FORBIDDEN = [r"LG Dan", r"Servicegeb", r"IBAN", r"book_table", r"send_reply", r"\bJSON\b", r"\btool\b"]
+
+
+def _eval_one(sc):
+    res = {"id": sc["id"], "pass": True, "fails": [], "warn": [], "action": "", "message": "", "input": {}}
+    if sc.get("skip_if_past") and datetime.now(BAR_TZ).date().isoformat() > sc["skip_if_past"]:
+        res["skipped"] = True
+        return res
+    hist = [{"role": r, "content": c} for r, c in sc.get("history", [])] + [{"role": "user", "content": sc["text"]}]
+    sender = "eval:" + sc["id"]
+    action, val, lang = claude_decide(sender, sc["text"], history=hist, dry_run=True, extra_system=sc.get("ctx", ""))
+    if action != "raw":
+        res["pass"] = False
+        res["fails"].append("model returned no tool call")
+        return res
+    tool, inp = val["tool"], val["input"]
+    act = "book" if tool == "book_table" else (inp.get("action") or "")
+    msg = inp.get("message") or ""
+    res.update({"action": act, "message": msg, "input": inp})
+    fail = res["fails"].append
+    if act not in sc["expect"]:
+        fail(f"action {act}, expected {sc['expect']}")
+    if act == "book":
+        if sc.get("no_book"):
+            fail("called book_table although details were missing")
+        try:
+            party = int(inp.get("party") or 0)
+            space = str(inp.get("space") or "tisch")
+            start_dt = datetime.fromisoformat(str(inp.get("date")) + "T" + str(inp.get("time"))).replace(tzinfo=BAR_TZ)
+            bad = _validate_booking(sender, party, space, start_dt, (inp.get("name") or "").strip(), bool(inp.get("sie")), lang)
+        except Exception as e:
+            bad = ("parse", str(e))
+        if sc.get("must_not_book") and not bad:
+            fail("book_table call would have been accepted for a request that must be refused")
+        if sc.get("must_not_book") and bad:
+            res["warn"].append(f"model tried to book, code guard refused it ({bad[0]})")
+        for k, v in (sc.get("book") or {}).items():
+            got = inp.get(k)
+            if k == "sie":
+                got = bool(got)
+            if str(got) != str(v):
+                fail(f"book_table {k}={got!r}, expected {v!r}")
+    if act in ("reply", "cancel_request", "escalate_complaint", "escalate_emergency"):
+        if not msg.strip() and not (act == "reply" and inp.get("viewing_requested")):
+            fail("empty message")
+        for pat in _EVAL_FORBIDDEN:
+            if re.search(pat, msg, re.I):
+                fail(f"forbidden text {pat}")
+        if sc.get("no_price") and (re.search(r"\d+\s*(€|euro)", msg, re.I) or "mindestumsatz" in msg.lower()):
+            fail("named a price or Mindestumsatz too early")
+        for pat in sc.get("reply_any", []):
+            if not re.search(pat, msg, re.I):
+                fail(f"reply misses {pat}")
+        for pat in sc.get("reply_all", []):
+            if not re.search(pat, msg, re.I):
+                fail(f"reply misses {pat}")
+        for pat in sc.get("reply_none", []):
+            if re.search(pat, msg, re.I):
+                fail(f"reply must not contain {pat}")
+        if sc.get("max_questions") and msg.count("?") > sc["max_questions"]:
+            fail(f"{msg.count('?')} questions in one message")
+        if sc.get("english") and re.search(r"\b(drinnen|draussen|gerne|für|wir|euch)\b", msg, re.I):
+            fail("German words in an English reply")
+        if sc.get("team_note") and not (inp.get("team_note") or "").strip():
+            fail("no team_note for the team")
+        if sc.get("viewing") and not isinstance(inp.get("viewing_requested"), dict):
+            fail("viewing_requested not set")
+        if sc.get("viewing") and re.search(r"\b\d{1,2}(:\d\d)? Uhr\b.*(passt|steht|bestätigt)", msg):
+            fail("asserted a viewing time")
+        claim = _has_space_promise(msg)
+        if claim:
+            if sc.get("no_claim"):
+                fail("claimed a date or space is free or held")
+            verdict, _out = _space_promise_check(sender, sc["text"], msg, lang, history=hist)
+            if verdict != "ok" and not (verdict == "block" and inp.get("event_hold")):
+                res["warn"].append(f"promise guard would act ({verdict}), the prompt let a claim through")
+                if sc.get("hold_needs_event_hold") or sc.get("no_claim"):
+                    fail(f"unbacked claim, guard verdict {verdict}")
+        raw_style = []
+        if re.search(r"\s[-–—]\s|[–—;]", msg):
+            raw_style.append("dash or semicolon")
+        if re.search(r"\b(fuer|ueber|moechte|koennen|waere|spaeter|naechste)\b", msg) and lang != "en":
+            raw_style.append("ASCII umlauts")
+        if raw_style:
+            res["warn"].append("raw style fixed by _house_style, " + ", ".join(raw_style))
+        if _house_style(msg, lang) and re.search(r"[;–—]|\s-\s", _house_style(msg, lang)):
+            fail("house style still broken after sanitizer")
+    res["pass"] = not res["fails"]
+    return res
+
+
+def _eval_run():
+    _eval_state.update({"running": True, "started": time.time(), "results": [], "summary": {}})
+    try:
+        for sc in _eval_scenarios():
+            try:
+                r = _eval_one(sc)
+            except Exception as e:
+                r = {"id": sc["id"], "pass": False, "fails": [f"exception {e}"], "warn": []}
+            _eval_state["results"].append(r)
+        rs = [r for r in _eval_state["results"] if not r.get("skipped")]
+        _eval_state["summary"] = {"total": len(rs), "passed": sum(1 for r in rs if r["pass"]),
+                                  "failed": [r["id"] for r in rs if not r["pass"]],
+                                  "warnings": sum(len(r.get("warn", [])) for r in rs)}
+    finally:
+        _eval_state.update({"running": False, "finished": time.time()})
+
+
+@app.get("/eval/run")
+def eval_run_route():
+    if _eval_state["running"]:
+        return {"status": "already running", "done": len(_eval_state["results"])}
+    if time.time() - _eval_state.get("started", 0) < EVAL_MIN_GAP_S:
+        return {"status": "rate limited, wait a few minutes", "summary": _eval_state["summary"]}
+    threading.Thread(target=_eval_run, daemon=True).start()
+    return {"status": "started"}
+
+
+@app.get("/eval/result")
+def eval_result_route():
+    return {"running": _eval_state["running"], "started": _eval_state["started"], "finished": _eval_state["finished"],
+            "summary": _eval_state["summary"], "results": _eval_state["results"]}
+
+
 def subscribe_waba():
     """Subscribe this app to the WhatsApp Business Account so inbound message
     webhooks are actually delivered. Without this, the messages field can be
@@ -4170,11 +4794,26 @@ async def whatsapp_receive(request: Request):
                 mid = msg.get("id")
                 if not mid or _already_handled(mid):
                     continue
-                if msg.get("type") != "text":
-                    logger.info("WhatsApp non text message, skipping")
-                    continue
                 sender = msg.get("from")
-                text = (msg.get("text") or {}).get("body", "")
+                # Audit F8, 12 Oct 2026. Non text messages used to be dropped
+                # silently, a guest's voice note got no answer and nobody knew.
+                text, _kind = _wa_inbound(msg)
+                if _kind == "ignore":
+                    logger.info("WhatsApp %s from %s ignored (reaction or sticker)", msg.get("type"), sender)
+                    continue
+                if _kind in ("audio", "media"):
+                    if _is_group_message(msg, sender):
+                        continue
+                    logger.info("WhatsApp %s from %s, short reply plus Dan ping", msg.get("type"), sender)
+                    conv_append(sender, "user", text)
+                    alert_dan(f"guest sent a {msg.get('type')} message the bot cannot read, please have a look", "whatsapp", sender, text)
+                    if sender in SKIP_SENDERS or is_human_active(sender) or _dan_owned_thread(sender):
+                        continue
+                    _lg = "en" if detect_lang(" ".join(str(h.get("content", "")) for h in conv_history(sender)[-4:])) == "en" else "de"
+                    _r = _MEDIA_REPLY[(_lg, "audio" if _kind == "audio" else "media")]
+                    if AUTO_ACK and send_whatsapp(sender, _r):
+                        conv_append(sender, "assistant", _r)
+                    continue
                 # TEAM GROUP GUARD, added 03 Oct 2026, Dan direct: "it shouldnt be sending
                 # things that i dont approve to the team." Because the number runs in
                 # coexistence mode, every group it belongs to (Brunnenbar Team) mirrors into
@@ -4209,6 +4848,16 @@ async def whatsapp_receive(request: Request):
             # type, text.body), not under value.smb_message_echoes as this code assumed. Accept
             # both shapes, and log the keys of any change that matched nothing so a future shape
             # change is visible instead of silent.
+            # Audit F9, 12 Oct 2026, a failed delivery used to be invisible.
+            for _rcpt, _code, _title, _sid in _wa_status_failures(value):
+                if not _sid or _already_handled("status:" + _sid):
+                    continue
+                if _norm_phone(_rcpt) == _norm_phone(DAN_ALERT_WHATSAPP or ""):
+                    logger.error("WhatsApp delivery to Dan failed, code %s %s", _code, _title)
+                    continue
+                hint = " (24 hour window closed, the guest has to write first or a template is needed)" if _code in ("131047", "470") else ""
+                alert_dan(f"a WhatsApp message to this guest was NOT delivered, code {_code} {_title}{hint}", "whatsapp", _rcpt,
+                          "delivery failure")
             _echo_items = list(value.get("smb_message_echoes") or []) + list(value.get("message_echoes") or [])
             if not value.get("messages") and not _echo_items and not value.get("statuses"):
                 logger.info("WhatsApp webhook change with no handled content, field=%s keys=%s",
@@ -4456,6 +5105,24 @@ def handle_later(channel: str, sender: str, text: str, mid: str = None, first_me
     finally:
         _pending_reply_clear(sender, mid)
 
+def _cancel_and_tell_dan(channel: str, sender: str, text: str):
+    """Audit F12. Frees the guest's own bot made booking at once, everything
+    else stays Dan's call. Dan always gets told what happened."""
+    try:
+        status, summ = _cancel_guest_booking(sender, text)
+    except Exception as e:
+        logger.error("automatic cancellation failed for %s: %s", sender, e)
+        status, summ = "manual", ""
+    if status == "cancelled":
+        alert_dan("guest cancelled, the bot marked the entry ABGESAGT and the table is free again", channel, sender, text, summ)
+    elif status == "ambiguous":
+        alert_dan("guest wants to cancel but has several bookings, please mark the right one ABGESAGT", channel, sender, text, summ)
+    elif status == "none":
+        alert_dan("guest wants to cancel but no booking for this contact was found in the calendar, please check", channel, sender, text)
+    else:
+        alert_dan("guest wants to cancel a booking you entered by hand, please mark it ABGESAGT", channel, sender, text, summ)
+
+
 def _dan_owned_thread(sender: str) -> bool:
     """True if Dan (or the team) has written in this thread and the bot never
     has. Dan 10 Oct 2026, the bot must not jump into a thread he handles
@@ -4529,9 +5196,9 @@ def handle(channel: str, sender: str, text: str):
                 logger.error("pause after handoff failed for %s: %s", sender, e)
         return
     elif action == "cancel_request":
-        reply = (value or "").strip() or "alles gut und danke fuers Bescheid geben, bis zum naechsten mal"
+        reply = (value or "").strip() or "Alles gut und danke fürs Bescheid geben, bis zum nächsten Mal"
         logger.info("Cancel request (%s, %s)", channel, sender)
-        alert_dan("guest wants to cancel, please remove them from the calendar", channel, sender, text)
+        _cancel_and_tell_dan(channel, sender, text)
     elif action == "escalate_emergency":
         reply = (value or "").strip() or "bitte ruf sofort die 112 an oder uns direkt unter 0821 47019035"
         logger.warning("EMERGENCY escalation (%s, %s)", channel, sender)
@@ -4572,7 +5239,7 @@ def handle(channel: str, sender: str, text: str):
         alert_dan("bot's draft looked like leaked internal reasoning, blocked before sending, needs your own reply",
                   channel, sender, text, reply[:200])
         return
-    reply = _with_ai_disclosure(sender, reply, lang)
+    reply = _house_style(_with_ai_disclosure(sender, reply, lang), lang)
     logger.info("Draft reply (%s): %s", channel, reply[:200])
     conv_append(sender, "assistant", reply)
     _mark_ai_disclosed(sender)
@@ -4780,7 +5447,7 @@ def _with_ai_disclosure(sender: str, reply: str, lang: str = "de") -> str:
     return reply.rstrip() + "\n\n" + outro
 
 
-def claude_decide(sender: str, text: str):
+def claude_decide(sender: str, text: str, history=None, dry_run: bool = False, extra_system: str = ""):
     """Ask the model what to do. Returns (action, value, lang). action is one
     of 'book' (value a details dict from book_table), 'reply' (value the
     message string), 'skip', 'handoff' (value a dict with 'reason' and
@@ -4810,7 +5477,7 @@ def claude_decide(sender: str, text: str):
     if not ANTHROPIC_API_KEY:
         logger.warning("No ANTHROPIC_API_KEY, cannot draft")
         return ("none", "", lang)
-    messages = _clean_messages(conv_history(sender)) or [{"role": "user", "content": text}]
+    messages = _clean_messages(history if history is not None else conv_history(sender)) or [{"role": "user", "content": text}]
     system = SYSTEM_PROMPT
     if LEARNINGS_TEXT:
         system += "\n\n" + LEARNINGS_TEXT
@@ -4818,9 +5485,17 @@ def claude_decide(sender: str, text: str):
     _mb = _menu_prompt_block()
     if _mb:
         system += "\n\n" + _mb
-    edc = event_date_context(sender, text)
+    edc = event_date_context(sender, text, history)
     if edc:
         system += "\n\n" + edc
+    if extra_system:
+        system += "\n\n" + extra_system
+    # Audit F11, 12 Oct 2026, the bot answers knowing the guest's own bookings.
+    try:
+        if BOOKING_ENABLED and GOOGLE_REFRESH_TOKEN and RESERVIERUNGEN_CALENDAR_ID and not sender.startswith("eval:"):
+            system += "\n\n" + _guest_bookings_context(sender)
+    except Exception as e:
+        logger.warning("guest bookings context failed for %s: %s", sender, e)
     try:
         _dr = _deposit_get(sender) if _deposit_active() else None
     except Exception:
@@ -4922,6 +5597,11 @@ def claude_decide(sender: str, text: str):
             _API_DIAG["last_error_ts"] = time.time()
             raise
         parts = r.json().get("content", [])
+        if dry_run:
+            for p in parts:
+                if p.get("type") == "tool_use":
+                    return ("raw", {"tool": p.get("name"), "input": p.get("input", {}) or {}}, lang)
+            return ("none", "", lang)
         for p in parts:
             if p.get("type") != "tool_use":
                 continue
@@ -4943,6 +5623,13 @@ def claude_decide(sender: str, text: str):
                         except Exception as e:
                             logger.error("deposit_terms handling failed: %s", e)
                             message, action, reason = "", "handoff", "deposit terms handling error"
+                _note = (inp.get("team_note") or "").strip()
+                if _note and action in ("reply", "cancel_request"):
+                    try:
+                        alert_dan("guest note for the team", "whatsapp" if _is_whatsapp_number(sender) else "other",
+                                  sender, text, _note)
+                    except Exception as e:
+                        logger.error("team_note alert failed for %s: %s", sender, e)
                 if action == "reply":
                     # TENTATIVE HOLD side effects, see the comment on
                     # upsert_pending_hold above. Best effort and wrapped so a
@@ -5602,7 +6289,7 @@ _ASK_PARTY_TEXT = {
 }
 
 
-def _space_promise_check(sender: str, text: str, reply: str, lang=None):
+def _space_promise_check(sender: str, text: str, reply: str, lang=None, history=None):
     """Dan 12 Oct 2026, a reply may say a date or space is free, it just must
     never be wrong. Returns ("ok", reply) when the reply makes no claim or the
     calendar confirms it, ("decline", honest text) when the calendar shows the
@@ -5614,14 +6301,14 @@ def _space_promise_check(sender: str, text: str, reply: str, lang=None):
         now = datetime.now(BAR_TZ)
         date_iso = _extract_de_date(text, now)
         if not date_iso:
-            for h in reversed(conv_history(sender)[-8:]):
+            for h in reversed((history if history is not None else conv_history(sender))[-8:]):
                 if h.get("role") == "user":
                     date_iso = _extract_de_date(str(h.get("content", "")), now)
                     if date_iso:
                         break
         if not date_iso:
             return ("block", "")
-        _p, _sp = _party_space_from_text(sender, text)
+        _p, _sp = _party_space_from_text(sender, text, history)
         status = _event_date_status(_calendar_service(), date_iso, sender, _p, _sp)
         if not _p and not _sp and status.get("whole_bar_free") is False:
             return ("ask", _ASK_PARTY_TEXT.get(lang or "de", _ASK_PARTY_TEXT["de"]))  # busy night, headcount unknown
@@ -5880,9 +6567,9 @@ def handle_email(svc, msg_id):
         mark_handled()
         return
     elif action == "cancel_request":
-        reply = (value or "").strip() or "alles gut und danke fuers Bescheid geben, bis zum naechsten mal"
+        reply = (value or "").strip() or "Alles gut und danke fürs Bescheid geben, bis zum nächsten Mal"
         logger.info("email cancel request from %s", from_addr)
-        alert_dan("guest wants to cancel, please remove them from the calendar (email)", "email", from_addr, text)
+        _cancel_and_tell_dan("email", sender_key, text)
     elif action == "escalate_emergency":
         reply = (value or "").strip() or "bitte ruf sofort die 112 an oder uns direkt unter 0821 47019035"
         logger.warning("EMERGENCY escalation (email) from %s", from_addr)
@@ -5928,7 +6615,7 @@ def handle_email(svc, msg_id):
                   "email", from_addr, text, reply[:200])
         mark_handled()
         return
-    reply = _with_ai_disclosure(sender_key, reply, lang)
+    reply = _house_style(_with_ai_disclosure(sender_key, reply, lang), lang)
     conv_append(sender_key, "assistant", reply)
     _mark_ai_disclosed(sender_key)
     if AUTO_ACK:
