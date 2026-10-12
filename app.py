@@ -885,7 +885,18 @@ def _extract_de_date(text: str, now: datetime):
                     day, month = d_, mo_
                     break
             if day is None:
-                return _relative_de_date(t, now)
+                # 12 Oct 2026, live eval S45, "October 31st" was never read, so an
+                # English guest got no calendar check at all.
+                em = (re.search(r"\b(" + _EN_MONTH_RE + r")\.?\s+(\d{1,2})(?:st|nd|rd|th)?\b", t, re.IGNORECASE)
+                      or re.search(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?(" + _EN_MONTH_RE + r")\b", t, re.IGNORECASE))
+                if em:
+                    a, b = em.group(1), em.group(2)
+                    if a.isdigit():
+                        day, month = int(a), _EN_MONTHS[b.lower()[:3]]
+                    else:
+                        day, month = int(b), _EN_MONTHS[a.lower()[:3]]
+                else:
+                    return _relative_de_date(t, now)
     else:
         day, month = int(m.group(1)), int(m.group(2))
     try:
@@ -900,6 +911,10 @@ def _extract_de_date(text: str, now: datetime):
     return candidate.isoformat()
 
 
+_EN_MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6, "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+_EN_MONTH_RE = ("january|february|march|april|may|june|july|august|september|october|november|december|"
+                "jan|feb|mar|apr|jun|jul|aug|sept|sep|oct|nov|dec")
+_EN_WEEKDAYS = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3, "friday": 4, "saturday": 5, "sunday": 6}
 _DE_WEEKDAYS = {"montag": 0, "dienstag": 1, "mittwoch": 2, "donnerstag": 3, "freitag": 4,
                 "samstag": 5, "sonnabend": 5, "sonntag": 6}
 
@@ -913,12 +928,14 @@ def _relative_de_date(t: str, now: datetime):
         return (now.date() + timedelta(days=2)).isoformat()
     if re.search(r"\bmorgen\b(?!\s*früh)", low):
         return (now.date() + timedelta(days=1)).isoformat()
-    if re.search(r"\bheute\b", low):
+    if re.search(r"\bheute\b|\btoday\b|\btonight\b", low):
         return now.date().isoformat()
-    for name, wd in _DE_WEEKDAYS.items():
+    if re.search(r"\btomorrow\b", low):
+        return (now.date() + timedelta(days=1)).isoformat()
+    for name, wd in list(_DE_WEEKDAYS.items()) + list(_EN_WEEKDAYS.items()):
         if re.search(r"\b" + name + r"s?\b", low):
             delta = (wd - now.weekday()) % 7
-            if delta == 0 and re.search(r"n[aä]chste", low):
+            if delta == 0 and re.search(r"n[aä]chste|\bnext\b", low):
                 delta = 7
             return (now.date() + timedelta(days=delta)).isoformat()
     return None
@@ -4521,7 +4538,7 @@ def _eval_scenarios():
         {"id": "S33_allergy", "text": "Ich habe eine Nussallergie, welche Cocktails kann ich bei euch trinken?", "expect": ["reply", "handoff"],
          "reply_none": [r"nussfrei", r"enthält keine", r"ohne Nüsse"]},
         {"id": "S35a_booking_status_none", "ctx": none_ctx, "text": "Steht meine Reservierung für Freitag eigentlich?", "expect": ["reply", "handoff"],
-         "reply_none": [r"steht", r"eingetragen", r"bestätigt"]},
+         "reply_any": [r"keine|nicht"], "reply_none": [r"\bja,? (die |deine )?(reservierung )?steht", r"seid (ihr )?(für|am) .* eingetragen"]},
         {"id": "S35b_booking_status_yes", "history": booked_hist, "ctx": booked_ctx, "text": "Steht meine Reservierung für Freitag eigentlich?", "expect": ["reply"],
          "reply_any": [r"20"]},
         {"id": "S37_sie_form", "text": f"Guten Tag, ich möchte für Donnerstag den {T} um 19 Uhr einen Tisch für zwei Personen reservieren. Mein Name ist Dr. Weber. Kein besonderer Anlass, gerne drinnen.",
