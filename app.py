@@ -2654,7 +2654,7 @@ BANK_HOLDER = os.environ.get("BANK_HOLDER", "")
 BANK_IBAN = os.environ.get("BANK_IBAN") or os.environ.get("Bank_IBAN", "")  # Railway var was created as Bank_IBAN, accept both
 BANK_BIC = os.environ.get("BANK_BIC", "")
 BANK_NAME = os.environ.get("BANK_NAME", "")
-AGB_URL = os.environ.get("AGB_URL", "brunnenbar.com/AGB")
+AGB_URL = os.environ.get("AGB_URL", "brunnenbar.com/agb")
 DEPOSITS = {"hinterer_bereich": 150, "ganze_bar": 350}
 _deposit_local = {}
 
@@ -3100,6 +3100,13 @@ def _validate_booking(sender, party, space, start_dt, name, sie=False, lang="de"
     if not name or name.strip().lower() in ("gast", "guest", "unknown", "?"):
         return ("name", "Under which name should we put it down?" if en else
                 ("Auf welchen Namen dürfen wir das eintragen?" if sie else "Auf welchen Namen dürfen wir das eintragen?"))
+    # Dan 20.08. and 12.10.2026, a table for tonight once the bar is open is taken by phone, never by message,
+    # the team on site sees live what is free.
+    now_slot = _service_slot(now)[0]
+    if _service_slot(start_dt)[0] == now_slot and (now.hour >= 18 or now.hour < 6):
+        return ("same_day_phone", "For tonight please call the bar directly on 0821 47019035, the team can see live what is still free and takes your booking right away." if en else
+                ("Für heute Abend rufen Sie bitte direkt in der Bar an unter 0821 47019035, das Team sieht live was noch frei ist und nimmt Ihre Reservierung gleich auf." if sie else
+                 "Für heute Abend ruf bitte direkt in der Bar an unter 0821 47019035, nicht per Nachricht. Das Team sieht live was noch frei ist und nimmt deine Reservierung gleich auf."))
     if space == "tisch":
         day, _h = _service_slot(start_dt)
         if day.weekday() not in OPENING_HOURS:
@@ -3231,7 +3238,7 @@ def _table_confirmation(name, party, start_dt, area, table, sie, lang):
             f"Done, we have you down for {party} on {_date_words(start_dt, 'en')} at {hm} {where}, under {name}.",
             f"All set, {party} people on {_date_words(start_dt, 'en')} at {hm} {where}, under {name}.",
         ]) + (" We hold the table for 20 minutes. If you are running more than 15 minutes late please call the bar on "
-              "0821 47019035, and if anything changes just message us here. See you then")
+              "0821 47019035, and if anything changes just message us here. Our terms apply, brunnenbar.com/agb. See you then")
     where = _table_where(area, table, "de")
     when = _date_words(start_dt, "de")
     if sie:
@@ -3239,13 +3246,15 @@ def _table_confirmation(name, party, start_dt, area, table, sie, lang):
             f"Sehr gerne, wir haben Sie für {party} Personen am {when} um {hm} Uhr {where} eingetragen, auf den Namen {name}.",
             f"Perfekt, Sie sind für {party} Personen am {when} um {hm} Uhr {where} eingetragen, auf den Namen {name}.",
         ]) + " Wir halten den Tisch 20 Minuten. Wird es später als 15 Minuten, rufen Sie bitte kurz in der Bar an unter "
-             "0821 47019035, und falls sich etwas ändert, schreiben Sie uns einfach hier. Wir freuen uns auf Sie")
+             "0821 47019035, und falls sich etwas ändert, schreiben Sie uns einfach hier. Es gelten unsere AGB unter "
+             "brunnenbar.com/agb. Wir freuen uns auf Sie")
     return (random.choice([
         f"Top, wir haben euch für {party} Leute am {when} um {hm} Uhr {where} eingetragen, auf den Namen {name}.",
         f"Passt, {party} Leute am {when} um {hm} Uhr {where} sind eingetragen, auf den Namen {name}.",
         f"Super, ihr seid am {when} um {hm} Uhr {where} eingetragen, {party} Leute auf den Namen {name}.",
     ]) + " Wir halten den Tisch 20 Minuten. Wird es später als 15 Minuten, ruf bitte kurz in der Bar an unter "
-         "0821 47019035, und falls sich was ändert, schreib uns einfach hier. Wir freuen uns auf euch")
+         "0821 47019035, und falls sich was ändert, schreib uns einfach hier. Es gelten unsere AGB unter "
+         "brunnenbar.com/agb. Wir freuen uns auf euch")
 
 
 def _space_confirmation(space, name, party, start_dt, sie, lang):
@@ -3254,16 +3263,17 @@ def _space_confirmation(space, name, party, start_dt, sie, lang):
     if lang == "en":
         where = "the back room" if space == "hinterer_bereich" else "the whole bar exclusively"
         return (f"You are booked in, {where} on {_date_words(start_dt, 'en')} at {hm} for about {party} guests, under {name}. "
-                f"The minimum spend is {mu} Euro and simply runs through your drinks. If anything changes just message us here. See you then")
+                f"The minimum spend is {mu} Euro and simply runs through your drinks. If anything changes just message us here. "
+                "Our terms apply, brunnenbar.com/agb. See you then")
     where = "der hintere Bereich" if space == "hinterer_bereich" else "die ganze Bar exklusiv"
     when = _date_words(start_dt, "de")
     if sie:
         return (f"Sehr gerne, {where} ist für Sie eingetragen, am {when} um {hm} Uhr für etwa {party} Gäste auf den Namen {name}. "
                 f"Der Mindestumsatz liegt bei {mu} Euro und läuft ganz normal über Ihre Getränke. Falls sich etwas ändert, "
-                "schreiben Sie uns einfach hier. Wir freuen uns auf Sie")
+                "schreiben Sie uns einfach hier. Es gelten unsere AGB unter brunnenbar.com/agb. Wir freuen uns auf Sie")
     return (f"Top, {where} ist für euch eingetragen, am {when} um {hm} Uhr für etwa {party} Leute auf den Namen {name}. "
             f"Der Mindestumsatz liegt bei {mu} Euro und läuft ganz normal über eure Getränke. Falls sich was ändert, "
-            "schreib uns einfach hier. Wir freuen uns auf euch")
+            "schreib uns einfach hier. Es gelten unsere AGB unter brunnenbar.com/agb. Wir freuen uns auf euch")
 
 
 # ---- F12, cancellation frees the table at once ------------------------------
@@ -5363,18 +5373,24 @@ def _clean_messages(history):
 # including the roughly 98 running threads gets it once at the next bot reply.
 # Deterministic, not left to the model. Marker is the phrase KI Concierge / AI concierge.
 AI_DISCLOSE_MARKERS = ("ki concierge", "ai concierge")
-AI_DISCLOSE_TEXT = {
-    # CHANGED 05 Oct 2026, Dan direct. The disclosure now FOLLOWS the answer instead of leading, so the guest
-    # gets what they asked for first, then one warm paragraph about who is writing (Art. 50 KI-VO needs the
-    # information in the first message, not at its start). Wording is Dan's own draft.
-    ("de", True): "Kurz zu mir, ich bin der KI Concierge der BrunnenBar. Damit du nicht warten musst, antworte ich gleich, und das Team kann jederzeit übernehmen. Ich kann dir alles von Reservierungen bis zu unseren Cocktails erklären. Aber wenn dir Old Fashioned lieber ist, schreib einfach, dass du lieber direkt mit jemandem sprechen möchtest, dann meldet sich Dan oder jemand vom Team persönlich bei dir.",
-    ("de", False): "Kurz zu mir, ich bin der KI Concierge der BrunnenBar. Damit du nicht warten musst, antworte ich gleich, und das Team kann jederzeit übernehmen. Ich kann dir alles von Reservierungen bis zu unseren Cocktails erklären. Aber wenn dir Old Fashioned lieber ist, schreib einfach, dass du lieber direkt mit jemandem sprechen möchtest, dann meldet sich Dan oder jemand vom Team persönlich bei dir.",
-    ("en", False): "A quick word about me, I am the AI concierge of BrunnenBar. So you do not have to wait, I answer right away, and the team can step in at any time. I can help with everything from reservations to our cocktails. But if you prefer it old fashioned, just say you would rather talk to someone directly, and Dan or someone from the team will get back to you personally.",
-}
-AI_DISCLOSE_PHONE = {
-    "de": " Donnerstag bis Samstag ab 18 Uhr erreichst du uns auch unter 0821 47019035.",
-    "en": " Thursday to Saturday from 6 pm you can also call us on 0821 47019035.",
-}
+_DISCLOSE_DE = ("Kurz zu mir, ich bin der KI Concierge der BrunnenBar. Damit du nicht warten musst, antworte ich gleich, "
+                "und das Team kann jederzeit übernehmen. Ich kann dir alles von Reservierungen bis zu unseren Cocktails erklären. "
+                "Als KI kann ich mich auch mal irren, verbindlich ist erst unsere Bestätigung, und es gelten unsere AGB unter "
+                "brunnenbar.com/agb. Für einen Tisch am selben Abend ruf ab 18 Uhr bitte direkt in der Bar an unter 0821 47019035, "
+                "nicht per Nachricht, dann sieht das Team live was noch frei ist. Und wenn dir Old Fashioned lieber ist, schreib "
+                "einfach, dass du lieber direkt mit jemandem sprechen möchtest, dann meldet sich Dan oder jemand vom Team persönlich bei dir.")
+_DISCLOSE_EN = ("A quick word about me, I am the AI concierge of BrunnenBar. So you do not have to wait, I answer right away, "
+                "and the team can step in at any time. I can help with everything from reservations to our cocktails. As an AI I "
+                "can make mistakes, only our confirmation is binding and our terms apply, brunnenbar.com/agb. For a table the same "
+                "evening, please call the bar directly from 6 pm on 0821 47019035 rather than messaging, the team can see live what "
+                "is still free. And if you prefer it old fashioned, just say you would rather talk to someone directly, and Dan or "
+                "someone from the team will get back to you personally.")
+# CHANGED 12 Oct 2026, Dan: the notice says the bot can make mistakes and points to the AGB (AGB § 3, § 1.6), and
+# tells guests to call the bar directly for a table the same evening, not by message. BUGFIX same day, the
+# ("en", True) entry was missing, so an English guest's very first message raised a KeyError and got no reply.
+AI_DISCLOSE_TEXT = {("de", True): _DISCLOSE_DE, ("de", False): _DISCLOSE_DE,
+                    ("en", True): _DISCLOSE_EN, ("en", False): _DISCLOSE_EN}
+AI_DISCLOSE_PHONE = {"de": "", "en": ""}  # the phone line is now always part of the notice
 
 
 
@@ -5525,7 +5541,7 @@ def _with_ai_disclosure(sender: str, reply: str, lang: str = "de") -> str:
         return reply
     lg = "en" if lang == "en" else "de"
     first = len(conv_history(sender)) <= 1
-    outro = AI_DISCLOSE_TEXT[(lg, first)]
+    outro = AI_DISCLOSE_TEXT.get((lg, first)) or AI_DISCLOSE_TEXT[("de", True)]
     try:
         if _bar_open_now():
             outro += AI_DISCLOSE_PHONE[lg]
