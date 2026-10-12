@@ -981,7 +981,12 @@ def event_date_context(sender: str, text: str) -> str:
         )
     cap = status.get("back_capacity")
     cap_txt = ""
-    if cap is not None:
+    if cap is not None and not status.get("back_exclusive_free", True):
+        cap_txt = (f" Der hintere Bereich ist an diesem Abend NICHT exklusiv frei, ein Tisch dort ist schon vergeben, "
+                   f"bieten kannst du ihn nicht als privaten Bereich an. Einzelne Tische hinten sind noch frei fuer hoechstens {cap} Personen, "
+                   "das ist eine normale Tischreservierung ohne Exklusivitaet und ohne Mindestumsatz, die entscheidet Dan. "
+                   "Nenne den Termin nie als frei fuer die ganze Bar. Frage zuerst nach der Personenzahl.")
+    elif cap is not None:
         cap_txt = (f" Im hinteren Bereich ist an diesem Abend Platz fuer hoechstens {cap} Personen"
                    f"{'' if status.get('whole_bar_free') else ', die ganze Bar ist nicht komplett frei'}. "
                    "Nenne den Termin nie als frei fuer mehr Personen oder fuer die ganze Bar wenn sie nicht frei ist, "
@@ -1367,12 +1372,15 @@ def _event_date_status(svc, date_iso: str, exclude_sender: str = "", party=None,
         # tables, see _back_free_capacity.
         if not out["collision"] and not out["closed"]:
             try:
-                back_cap, bar_free = _evening_capacity(date_iso)
+                back_cap, bar_free, back_free = _evening_capacity(date_iso)
                 out["back_capacity"] = back_cap
                 out["whole_bar_free"] = bar_free
+                out["back_exclusive_free"] = back_free
                 need_whole = space == "ganze_bar" or (party or 0) > PRIVATE_SPACES["hinterer_bereich"]["capacity"]
                 if need_whole and not bar_free:
                     out["collision"] = {"summary": "other reservations already on the calendar that evening, the whole bar is not free"}
+                elif space == "hinterer_bereich" and not back_free:
+                    out["collision"] = {"summary": "the exclusive back room is not free that evening, a table is already booked in it"}
                 elif party and party > back_cap and not need_whole:
                     out["collision"] = {"summary": f"the back has room for about {back_cap} guests that evening, not {party}"}
                 elif back_cap <= 0:
@@ -1815,11 +1823,12 @@ def find_private_space(date_iso: str, start_dt: datetime, party: int, space: str
         if s < end_dt and start_dt < e:
             return False
     # freeform large group entries sit in the back too, added 09 Oct 2026
-    # (freeform back groups are placed on tables by the ledger below)
-    # table ledger, the free back tables must hold the party. Partial is fine,
-    # Evy on the Sofa leaves HT1, HT2 and HT3 for 20, Dan 12.10.2026.
+    # HARD RULE, Dan 12.10.2026. The exclusive hinterer Bereich needs the
+    # WHOLE back free, HT1, HT2, HT3 and Sofa. One entry on any back table,
+    # Evy on the Sofa included, means the private space is not available.
+    # The remaining tables can still be booked as plain table reservations.
     occ, _big = _night_ledger(date_iso, start_dt, end_dt)
-    return party <= _back_free_capacity(occ)
+    return not (occ & BACK_POOL)
 
 
 FRONT_TAKEOVER_PARTY = int(os.environ.get("FRONT_TAKEOVER_PARTY", "12"))
@@ -2155,7 +2164,7 @@ def _evening_capacity(date_iso, start_dt=None):
     st = start_dt or day.replace(hour=18)
     en = (st + timedelta(hours=TURN_HOURS)) if start_dt else day.replace(hour=23) + timedelta(hours=4)
     occ, _big = _night_ledger(date_iso, st, en)
-    return _back_free_capacity(occ), (not occ)
+    return _back_free_capacity(occ), (not occ), (not (occ & BACK_POOL))
 
 
 _GUEST_PARTY_RE = re.compile(r"(\d{1,3})\s*(?:bis|\-|–|to)?\s*(\d{1,3})?\s*(?:personen|leute|g[aä]ste|people|guests|pax|freunde)", re.I)
