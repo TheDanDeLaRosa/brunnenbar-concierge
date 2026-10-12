@@ -984,7 +984,10 @@ def event_date_context(sender: str, text: str) -> str:
     if cap is not None and not status.get("back_exclusive_free", True):
         cap_txt = (f" Der hintere Bereich ist an diesem Abend NICHT exklusiv frei, ein Tisch dort ist schon vergeben, "
                    f"bieten kannst du ihn nicht als privaten Bereich an. Einzelne Tische hinten sind noch frei fuer hoechstens {cap} Personen, "
-                   "das ist eine normale Tischreservierung ohne Exklusivitaet und ohne Mindestumsatz, die entscheidet Dan. "
+                   "das ist eine normale Tischreservierung ohne Exklusivitaet und ohne Mindestumsatz. Bei bis zu 20 Personen geht das nur verteilt auf die drei Hochtische hinten, "
+                   "das MUSS dem Gast erklaert werden. Frage zuerst ob die Gruppe schon mal bei uns war, dann ob drei Hochtische ok waeren, "
+                   "wer noch nie da war bekommt vorher erklaert dass wir hinten einen eigenen Raum mit Hinterbar, drei Hochtischen und einem Sofa haben. "
+                   "Gebucht wird erst nach dem Ja des Gastes. "
                    "Nenne den Termin nie als frei fuer die ganze Bar. Frage zuerst nach der Personenzahl.")
     elif cap is not None:
         cap_txt = (f" Im hinteren Bereich ist an diesem Abend Platz fuer hoechstens {cap} Personen"
@@ -2841,6 +2844,61 @@ def _pricing_discussed(sender: str) -> bool:
     return any(h.get("role") == "user" for h in hist[idx + 1:])
 
 
+_SPLIT3 = frozenset({"HT1", "HT2", "HT3"})
+_NEG_VISIT_RE = re.compile(r"\b(nein|noch nie|noch nicht|nie|erstes mal|zum ersten|not yet|never|first time|no)\b", re.I)
+_NEG_OFFER_RE = re.compile(r"\b(nein|lieber nicht|nicht ok|nicht okay|geht nicht|passt nicht|zu weit|no thanks|not ok|not okay|rather not)\b", re.I)
+
+
+def _split_stage(sender: str) -> str:
+    """Where the three high top offer stands in the thread. ask, returning
+    (has been here, offer still to make), new (first visit, offer with the
+    room explained), offer (offer made, no answer yet), agreed, declined.
+    Dan 12.10.2026, a group split over HT1, HT2 and HT3 is only booked after
+    the guest said the three high tops are fine."""
+    try:
+        hist = conv_history(sender)
+    except Exception:
+        return "ask"
+    last_offer = None
+    for i, h in enumerate(hist):
+        if h.get("role") == "assistant" and re.search(r"drei hochtische|three high ?tops", str(h.get("content", "")), re.I):
+            last_offer = i
+    if last_offer is not None:
+        replies = [str(h.get("content", "")) for h in hist[last_offer + 1:] if h.get("role") == "user"]
+        if not replies:
+            return "offer"
+        return "declined" if _NEG_OFFER_RE.search(replies[0]) else "agreed"
+    last_ask = None
+    for i, h in enumerate(hist):
+        if h.get("role") == "assistant" and re.search(r"schon mal bei uns|been to us before|been here before", str(h.get("content", "")), re.I):
+            last_ask = i
+    if last_ask is None:
+        return "ask"
+    replies = [str(h.get("content", "")) for h in hist[last_ask + 1:] if h.get("role") == "user"]
+    if not replies:
+        return "ask"
+    return "new" if _NEG_VISIT_RE.search(replies[0]) else "returning"
+
+
+def _split_question(stage: str, party: int, sie: bool, lang: str) -> str:
+    if lang == "en":
+        if stage in ("ask",):
+            return "Have you been to us before?"
+        room = ("" if stage in ("returning", "offer") else
+                "In the back we have our own room with the back bar, three high tops and a sofa. ")
+        return (f"{room}For {party} of you we could give you the three high tops in the back, so you would be spread "
+                "over three tables next to each other. Would that work for you?")
+    if stage == "ask":
+        return "Wart Sie schon mal bei uns?" if sie else "Wart ihr schon mal bei uns?"
+    room = ("" if stage in ("returning", "offer") else
+            "Hinten bei uns gibt es einen eigenen Raum mit Hinterbar, drei Hochtischen und einem Sofa. ")
+    if sie:
+        return (f"{room}Für {party} Personen hätten wir die drei Hochtische hinten frei, Sie wären also auf drei "
+                "Tische nebeneinander verteilt. Wäre das für Sie in Ordnung?")
+    return (f"{room}Für {party} Leute hätten wir die drei Hochtische hinten frei, ihr wärt also auf drei "
+            "Tische nebeneinander verteilt. Wäre das für euch ok?")
+
+
 def process_booking(sender: str, data: dict, lang: str = "de", channel: str = "whatsapp") -> str:
     """Given the details the model gave the tool, check real availability, book
     if it is free, and return the guest reply in the guest's language. Never
@@ -2983,6 +3041,13 @@ def process_booking(sender: str, data: dict, lang: str = "de", channel: str = "w
             logger.info("no free table for %s %s party %s %s", date_iso, hhmm, party, area)
             alert_dan("bar is full at the requested time, guest needs a manual answer", channel, sender, what)
             return _full_line(sie, lang)
+        if set(table.split("+")) == _SPLIT3:
+            stage = _split_stage(sender)
+            if stage == "declined":
+                alert_dan("guest does not want the three high tops, needs a manual answer", channel, sender, what)
+                return _SILENT_BOOKING
+            if stage != "agreed":
+                return _split_question(stage, party, sie, lang)
         try:
             create_reservation(name, sender, party, area, start_dt, occasion, table)
         except Exception as e:
