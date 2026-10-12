@@ -1128,6 +1128,8 @@ TABLE_COMBOS = {
     frozenset({"HT2", "HT3"}): 13,
     frozenset({"HT1", "Sofa"}): 12,
     frozenset({"HT1", "Sofa", "Bar7", "Bar8", "Bar9"}): 15,
+    # Dan 12.10.2026, the three high tops together hold 20, leaves the Sofa free
+    frozenset({"HT1", "HT2", "HT3"}): 20,
 }
 
 _TABLE_FIELD_RE = re.compile(r"Tisch\s+([A-Za-z0-9+]+)")
