@@ -1018,6 +1018,26 @@ def _free_nights_context(sender, text, history=None):
             "aktuell frei, ohne Garantie bis er sich entscheidet, und frag welcher passt. Sag nie, dass du keine Liste geben kannst, "
             "und beschreib nie wie du den Kalender pruefst.")
 
+def _thread_date(sender, history, now, look_back=8):
+    """The most recent concrete date a guest named earlier in this thread,
+    newest first, or None."""
+    try:
+        hist = history if history is not None else conv_history(sender)
+    except Exception:
+        return None
+    seen = 0
+    for h in reversed(hist or []):
+        if h.get("role") != "user":
+            continue
+        seen += 1
+        if seen > look_back:
+            break
+        d = _extract_de_date(str(h.get("content") or ""), now)
+        if d:
+            return d
+    return None
+
+
 def event_date_context(sender: str, text: str, history=None) -> str:
     """Ground truth for one date the guest just mentioned, injected into the
     system prompt exactly like bar_time_context and next7 above, so the
@@ -1043,11 +1063,23 @@ def event_date_context(sender: str, text: str, history=None) -> str:
         return ""
     now = datetime.now(BAR_TZ)
     date_iso = _extract_de_date(text, now)
+    from_thread = False
     if not date_iso:
         try:
-            return _free_nights_context(sender, text, history)
+            fn = _free_nights_context(sender, text, history)
+            if fn:
+                return fn
         except Exception as e:
             logger.warning("free nights context failed: %s", e)
+        # BUGFIX 13 Oct 2026, conversation simulator. The check only ran for a
+        # date in the newest message, so on the next turn without a date the
+        # bot lost the fact, read the normal opening hours and "corrected"
+        # itself, a guest asking for 17.10. (closed party) was told closed,
+        # open, closed, open across four messages. The date under discussion
+        # now stays checked for the whole thread.
+        date_iso = _thread_date(sender, history, now)
+        from_thread = bool(date_iso)
+        if not date_iso:
             return ""
     _p, _sp = None, None
     try:
@@ -1059,6 +1091,7 @@ def event_date_context(sender: str, text: str, history=None) -> str:
         return ""
     if status["closed"]:
         return (
+            ("Dieser Check gilt fuer das Datum, ueber das ihr im Verlauf sprecht, bleib dabei, widersprich dir nicht mit den normalen Oeffnungszeiten. " if from_thread else "") +
             f"EVENT DATUM CHECK fuer {date_iso}, verlass dich NUR hierauf, nicht auf eigene Vermutung "
             f"oder auf das Beispiel weiter unten im Prompt. Dieser Tag ist im Kalender als GESCHLOSSEN "
             f"markiert (\"{status['closed_summary']}\"). Sag dem Gast NIEMALS dass dieser Termin frei "
@@ -1070,6 +1103,9 @@ def event_date_context(sender: str, text: str, history=None) -> str:
     try:
         _d = date.fromisoformat(date_iso)
         _wd_line = f"WOCHENTAG, der {_d.strftime('%d.%m.%Y')} ist ein {_DAY_NAMES_DE[_d.weekday()]}, verlass dich nur hierauf. "
+        if from_thread:
+            _wd_line = ("Dieser Check gilt fuer das Datum, ueber das ihr im Verlauf sprecht, es bleibt gueltig bis der Gast ein anderes nennt, "
+                        "widersprich ihm nie mit den normalen Oeffnungszeiten. ") + _wd_line
     except Exception:
         pass
     if status["collision"]:
@@ -5489,7 +5525,11 @@ def handle(channel: str, sender: str, text: str):
         reply = checked
     reply = (reply or "").strip()
     if not reply:
-        logger.info("No reply, empty draft")
+        # 13 Oct 2026, conversation simulator, an empty draft left the guest
+        # with nothing and nobody was told. Never again silent and unreported.
+        logger.warning("No reply, empty draft (%s, %s, action %s)", channel, sender, action)
+        alert_dan("bot produced an empty reply, guest got nothing, please answer yourself", channel, sender, text,
+                  f"action {action}")
         return
     if _looks_like_leaked_internal_text(reply):
         logger.error("Blocked a reply that looks like leaked internal reasoning (%s, %s): %s", channel, sender, reply[:300])
@@ -5547,6 +5587,20 @@ _DISCLOSE_EN = ("A quick word about me, I am the AI concierge of BrunnenBar. So 
 AI_DISCLOSE_TEXT = {("de", True): _DISCLOSE_DE, ("de", False): _DISCLOSE_DE,
                     ("en", True): _DISCLOSE_EN, ("en", False): _DISCLOSE_EN}
 AI_DISCLOSE_PHONE = {"de": "", "en": ""}  # Dan 12.10.2026, no phone line in the notice
+# 13 Oct 2026, conversation simulator, a guest writing with Sie got a Sie reply followed by a du notice.
+# Same wording as Dan's text, only the address changed.
+_DISCLOSE_DE_SIE = ("Kurz zu mir, ich bin der KI Concierge der BrunnenBar. Damit Sie nicht warten müssen, antworte ich gleich, "
+                    "und das Team kann jederzeit übernehmen. Ich kann Ihnen alles von Reservierungen bis zu unseren Cocktails erklären. "
+                    "Und wenn Ihnen Old Fashioned lieber ist, schreiben Sie einfach, dass Sie lieber direkt mit jemandem sprechen möchten, "
+                    "dann meldet sich Dan oder jemand vom Team persönlich bei Ihnen.")
+_SIE_RE = re.compile(r"(?<![.!?]\s)(?<!^)\b(Sie|Ihnen|Ihre[nmrs]?|Ihr)\b")
+_DU_RE = re.compile(r"\b(du|dich|dir|dein[e]?[nmrs]?|euch|euer|eure[nmrs]?)\b", re.I)
+
+
+def _reply_is_formal(reply: str) -> bool:
+    """True when a German reply addresses the guest with Sie and never with du."""
+    r = reply or ""
+    return bool(_SIE_RE.search(r)) and not _DU_RE.search(r)
 
 
 
@@ -5698,6 +5752,8 @@ def _with_ai_disclosure(sender: str, reply: str, lang: str = "de") -> str:
     lg = "en" if lang == "en" else "de"
     first = len(conv_history(sender)) <= 1
     outro = AI_DISCLOSE_TEXT.get((lg, first)) or AI_DISCLOSE_TEXT[("de", True)]
+    if lg == "de" and _reply_is_formal(reply):
+        outro = _DISCLOSE_DE_SIE
     try:
         if _bar_open_now():
             outro += AI_DISCLOSE_PHONE[lg]
@@ -6601,11 +6657,16 @@ def _maybe_alert_api_failure(channel: str, sender: str, text: str):
     just gets silence and Dan never finds out, since this looks identical to an
     intentional SKIP from the outside. Rate limited by API_FAILURE_ALERT_COOLDOWN
     so an extended outage pages Dan once, not on every single guest message."""
+    # BUGFIX 13 Oct 2026, conversation simulator. The cooldown was global, so
+    # once any guest triggered it every other guest who got no reply in the
+    # next window was silent AND unreported. The cooldown is now per guest,
+    # every guest left without an answer reaches Dan at least once.
     now = time.time()
-    if now - _last_api_failure_alert["ts"] < API_FAILURE_ALERT_COOLDOWN:
-        logger.warning("Claude API failure alert suppressed (cooldown), %s %s", channel, sender)
+    key = "ts:" + str(sender)
+    if now - _last_api_failure_alert.get(key, 0.0) < API_FAILURE_ALERT_COOLDOWN:
+        logger.warning("Claude API failure alert suppressed (cooldown for this guest), %s %s", channel, sender)
         return
-    _last_api_failure_alert["ts"] = now
+    _last_api_failure_alert[key] = now
     alert_dan(
         "bot could not draft any reply at all, guest got no reply",
         channel, sender, text,
@@ -7429,7 +7490,7 @@ def _sim_one(p, max_turns=6):
                 res["transcript"].append(("bar", reply))
             else:
                 why = "; ".join(_SIM.alerts[before_a:])[:240] or "NO ALERT"
-                logs = " || ".join(l for l in _SIM.logs[before_l:] if not l.startswith("I "))[:600]
+                logs = " || ".join(_SIM.logs[before_l:])[:900]
                 res["transcript"].append(("bar", f"[silent, Dan pinged: {why}] [log: {logs}]"))
             for iss in _sim_check_turn(sender, g, reply, turn, conv_history(sender)):
                 res["issues"].append({"turn": len(res["transcript"]) - 1, "problem": iss})
