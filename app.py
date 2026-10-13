@@ -782,6 +782,33 @@ def live_service_stale_watchdog_loop():
         time.sleep(LIVE_SERVICE_STALE_CHECK_INTERVAL_SECONDS)
 
 
+def _week_closures(now):
+    """Dates in the next eight days the bar is not open to guests, closures
+    and closed private parties, read with one calendar call. Best effort."""
+    out = {}
+    if not (BOOKING_ENABLED and GOOGLE_REFRESH_TOKEN and RESERVIERUNGEN_CALENDAR_ID):
+        return out
+    try:
+        lo = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        items = _calendar_service().events().list(calendarId=RESERVIERUNGEN_CALENDAR_ID, timeMin=lo.isoformat(),
+                                                  timeMax=(lo + timedelta(days=9)).isoformat(), singleEvents=True).execute().get("items", [])
+    except Exception as e:
+        logger.warning("week closures failed: %s", e)
+        return out
+    for ev in items:
+        s_ = (ev.get("summary") or "").lower()
+        if _is_cancelled(ev) or not any(w in s_ for w in ("geschlossen", "betriebsferien", "ruhetag", "closed", "urlaub")):
+            continue
+        st = (ev.get("start") or {}).get("dateTime") or (ev.get("start") or {}).get("date") or ""
+        try:
+            d = _service_slot(datetime.fromisoformat(st))[0] if "T" in st else date.fromisoformat(st[:10])
+        except Exception:
+            continue
+        out[str(d)] = ("geschlossene Gesellschaft, für Gäste geschlossen, keine Tische" if _detect_space(s_) == "ganze_bar"
+                       else "geschlossen")
+    return out
+
+
 def bar_time_context():
     """A German sentence stating the real current day, date and time in Augsburg
     and whether the bar is open right now, so the model never guesses the weekday.
@@ -834,8 +861,14 @@ def bar_time_context():
     # the whole coming week so book_table's date field never depends on the
     # model doing day of week math itself, only on picking the right line
     # from a list already given the correct date.
+    # 13 Oct 2026, conversation simulator, the bot offered Saturday 17.10.
+    # (closed private party) as an option for "nächstes Wochenende" because
+    # this list showed every day as a normal day. Closed days are marked now.
+    _cl = _week_closures(now)
     next7 = ", ".join(
         f"{days[(now + timedelta(days=i)).weekday()]} {(now + timedelta(days=i)).strftime('%d.%m.%Y')}"
+        + (f" ({_cl[(now + timedelta(days=i)).date().isoformat()]})" if (now + timedelta(days=i)).date().isoformat() in _cl
+           else ("" if (now + timedelta(days=i)).weekday() in (3, 4, 5) else " (Ruhetag)"))
         for i in range(1, 8)
     )
     return (
@@ -2913,7 +2946,8 @@ def _deposit_consent_message(space: str, start_dt, sie: bool, lang: str) -> str:
     mu = PRIVATE_SPACES[space]["mindestumsatz"]
     dep = DEPOSITS[space]
     hm = start_dt.strftime("%H") if not start_dt.minute else start_dt.strftime("%H:%M")
-    wd = _DAYS_DE[start_dt.weekday()]
+    # 13 Oct 2026, conversation simulator, "Samstag um 20 Uhr" without the date
+    wd = _DAYS_DE[start_dt.weekday()] + (" " if lang == "en" else " den ") + start_dt.strftime("%d.%m.%Y")
     where = "der hintere Bereich" if space == "hinterer_bereich" else "die ganze Bar exklusiv"
     if lang == "en":
         where_en = "the back lounge" if space == "hinterer_bereich" else "the whole bar exclusively"
@@ -5392,8 +5426,10 @@ def _rule_violations(msg: str, user_turns: int):
     if not msg:
         return out
     if user_turns <= 2 and _EARLY_PRICE_RE.search(msg):
-        out.append("it names a price, the Mindestumsatz, Miete or Trinkgeld in the guest's first or second message, "
-                   "which is never allowed, instead ask how many people and whether they have been to BrunnenBar before")
+        out.append("it names a price, an amount in Euro, the Mindestumsatz, Miete or Trinkgeld in the guest's first or second message, "
+                   "which is never allowed. Remove every amount. For drink prices point to brunnenbar.com/cocktailkarte, for event costs "
+                   "say you explain them in a moment and, for a group, ask whether they have been to BrunnenBar before. "
+                   "Answer everything else the guest asked as before")
     if _ALWAYS_BANNED_RE.search(msg):
         out.append("it signs as Dan or says Servicegebühr, both never allowed")
     return out
@@ -5405,6 +5441,11 @@ def _draft_message(res, dry_run):
         inp = val.get("input") or {}
         return (inp.get("message") or "") if val.get("tool") == "send_reply" else ""
     return val if isinstance(val, str) else ""
+
+
+def _strip_price_sentences(msg: str) -> str:
+    parts = re.split(r"(?<=[.!?])\s+", msg or "")
+    return " ".join(p for p in parts if not _EARLY_PRICE_RE.search(p)).strip()
 
 
 def _decide_checked(sender, text, history=None, dry_run=False, extra_system=""):
@@ -5419,7 +5460,10 @@ def _decide_checked(sender, text, history=None, dry_run=False, extra_system=""):
     # reply with an empty message right when the guest asked about costs,
     # the guest got nothing. One retry with the reason, then Dan.
     if not dry_run and res[0] == "reply" and not str(res[1] or "").strip():
-        viol = viol + ["the message was empty, the guest would get nothing, write the actual answer to every question the guest asked"]
+        viol = viol + ["the message was empty, the guest would get nothing. Write the actual answer to every question the guest asked. "
+                       + ("This is the guest's first or second message, so if they ask about costs say warmly that you explain the costs "
+                          "in a moment and ask one question, for a group whether they have been to BrunnenBar before, never name an amount"
+                          if turns <= 2 else "Answer the cost questions with the documented figures")]
     if not viol:
         return res
     logger.warning("draft broke a hard rule for %s, retrying once: %s", sender, viol)
@@ -5434,6 +5478,17 @@ def _decide_checked(sender, text, history=None, dry_run=False, extra_system=""):
         return res2
     if dry_run:
         return res2
+    # 13 Oct 2026, conversation simulator, a guest who asked the price of an
+    # Aperol in message one got silence. When the only problem left is an
+    # early amount, the sentences with the amount are dropped and the rest is
+    # sent with the menu link, instead of leaving the guest waiting.
+    if res2[0] == "reply" and viol2 and all("names a price" in v for v in viol2):
+        kept = _strip_price_sentences(str(res2[1] or ""))
+        if len(kept) >= 40 and not _rule_violations(kept, turns):
+            if "cocktailkarte" not in kept.lower():
+                kept = kept.rstrip(". ") + (". The full menu with all prices is at brunnenbar.com/cocktailkarte." if res2[2] == "en"
+                                            else ". Die ganze Karte mit allen Preisen findest du auf brunnenbar.com/cocktailkarte.")
+            return ("reply", kept, res2[2])
     return ("handoff", {"reason": "the draft broke a hard house rule twice and was not sent, " + "; ".join(viol2),
                         "message": ""}, res2[2])
 
@@ -5557,6 +5612,19 @@ def handle(channel: str, sender: str, text: str):
                       channel, sender, text, reply[:200])
             return
         verdict, checked = _space_promise_check(sender, text, reply, lang)
+        if verdict == "block":
+            # 13 Oct 2026, conversation simulator, a draft claiming "vorgemerkt"
+            # without setting event_hold left the guest with silence. One
+            # rewrite first, the claim must be backed or dropped.
+            logger.warning("Unverifiable claim, one rewrite (%s, %s): %s", channel, sender, reply[:200])
+            a2, v2, _l2 = _decide_checked(sender, text, extra_system=(
+                "KORREKTUR. Dein letzter Entwurf hat behauptet, ein Termin oder Bereich sei frei, vorgemerkt oder reserviert, "
+                "ohne dass es im Kalender steht. Wenn du etwas vormerkst, fülle event_hold in diesem Zug aus. Sonst schreib "
+                "die Antwort ohne diese Behauptung neu, beantworte alles andere wie vorher."))
+            if a2 == "reply" and isinstance(v2, str) and v2.strip():
+                verdict, checked = _space_promise_check(sender, text, v2, lang)
+                if verdict != "block":
+                    reply = v2
         if verdict == "block":
             logger.error("Blocked an unverifiable date or space claim (%s, %s): %s", channel, sender, reply[:300])
             alert_dan("bot's draft claimed a date or space was free or held and the calendar could not verify it, "
@@ -7500,9 +7568,9 @@ _SIM_FACTS = (
     "Mindestumsatz 700 Euro, whole bar 51 seats and up to 65 standing, Mindestumsatz 1700 Euro, no Raummiete, voluntary 10 percent Trinkgeld, never a Servicegebühr. "
     "No prices, Mindestumsatz or Trinkgeld in the guest's first two messages. No kitchen, own food welcome, caterer mainly Thassos im Stadtmarkt, fingerfood recommended. "
     "Tables held 20 minutes, call the bar if more than 15 minutes late. Tonight's table while the bar is open, by phone 0821 47019035. Happy Hour until 20 Uhr, no prices quoted. "
-    "Dogs welcome, card and cash, parking City Galerie, entrance barrier free but a step to the toilets. No smoking inside, no extension past closing. "
+    "Tables exist inside and outside (outdoor tables are real), the menu with prices and the allergen list is at brunnenbar.com/cocktailkarte. Dogs welcome, card and cash, parking City Galerie, entrance barrier free but a step to the toilets. No smoking inside, no extension past closing. "
     "Private spaces are only confirmed after the Mindestumsatz was explained and accepted, a group below about 30 for the back or 50 for the whole bar goes to Dan. "
-    "The concierge never invents availability, dates, prices or policies, never promises a viewing time, answers every question the guest asked, asks at most one question per message, "
+    "The concierge never invents availability, dates, prices or policies, never promises a viewing time, answers every question the guest asked, asks one main question per message (asking area and name together while booking a table is Dan's normal pattern and fine), "
     "writes warm informal German with du unless the guest uses Sie, no dashes, colons or lists, and hands off silently to Dan for complaints, discounts, staff, recaps of a talk with Dan, groups over 65 and changes to confirmed bookings. "
     "A silent turn (no reply) is correct for spam, a handoff to Dan, a viewing request or a pure thanks or emoji. Handoff to Dan by design, silent to the guest: "
     "allergy questions, vouchers, minors, job applications, complaints, a guest asking for a human, groups over 65, changes to a confirmed booking. "
@@ -7532,7 +7600,12 @@ def _sim_truth(transcript, sender):
                          ("" if dd.weekday() in OPENING_HOURS else ", normally closed weekday"))
         except Exception as e:
             lines.append(f"{d}: check failed {e}")
-    return "CALENDAR TRUTH, checked by code, the concierge sees the same data: " + "; ".join(lines) if lines else ""
+    own = ""
+    try:
+        own = " GUEST'S OWN BOOKINGS (real, not invented): " + _guest_bookings_context(sender)[:600]
+    except Exception:
+        pass
+    return ("CALENDAR TRUTH, checked by code with the guest's own entries hidden, the concierge sees the same data: " + "; ".join(lines) if lines else "") + own
 
 
 def _sim_judge(transcript, sender=""):
