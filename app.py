@@ -6978,6 +6978,497 @@ def run_stale_thread_watchdog_route():
         return {"error": str(e)}
 
 
+
+
+# ============================================================================
+# CONVERSATION SIMULATOR, 13 Oct 2026. Dan: "we said that all variety of
+# responses would be tested and another one fell through ... come up with a
+# massive list of potential different responses then do a deep run of
+# testing." Nathalie broke on her fourth message because of a hold the bot
+# itself placed on her second, single message evals can never see that.
+# This runs whole conversations, a guest persona played by a model against
+# the real concierge pipeline (handle, claude_decide, process_booking, holds,
+# guards), on the real calendar for reads and a private sandbox for every
+# write. Nothing is sent, booked, held or alerted for real, all of that is
+# captured per conversation. Every bot turn is checked against hard
+# invariants in code, then each whole conversation is graded by a judge.
+# GET /sim/run?n=60 starts it, GET /sim/result shows it.
+# ============================================================================
+_SIM = threading.local()
+SIM_GUEST_MODEL = os.environ.get("SIM_GUEST_MODEL", "claude-haiku-5-5")
+SIM_JUDGE_MODEL = os.environ.get("SIM_JUDGE_MODEL", CONCIERGE_MODEL)
+_sim_state = {"running": False, "started": 0.0, "finished": 0.0, "done": 0, "total": 0, "results": [], "summary": {}}
+
+
+def _sim_on():
+    return bool(getattr(_SIM, "on", False))
+
+
+class _SimReq:
+    def __init__(self, fn): self.fn = fn
+    def execute(self): return self.fn()
+
+
+class _SimEvents:
+    def __init__(self, cal): self.cal = cal
+
+    def list(self, **kw):
+        def run():
+            items = []
+            try:
+                items = self.cal.real().events().list(**kw).execute().get("items", [])
+            except Exception as e:
+                logger.warning("sim real list failed: %s", e)
+            out = []
+            for ev in items:
+                if ev.get("id") in self.cal.deleted:
+                    continue
+                ev = dict(ev)
+                ev.update(self.cal.over.get(ev.get("id"), {}))
+                out.append(ev)
+            lo, hi = kw.get("timeMin"), kw.get("timeMax")
+            for ev in self.cal.items:
+                if ev.get("_cal") != kw.get("calendarId"):
+                    continue
+                st = (ev.get("start") or {}).get("dateTime") or (ev.get("start") or {}).get("date") or ""
+                try:
+                    sdt = datetime.fromisoformat(st) if "T" in st else datetime.fromisoformat(st + "T00:00:00").replace(tzinfo=BAR_TZ)
+                    if lo and sdt < datetime.fromisoformat(lo):
+                        continue
+                    if hi and sdt >= datetime.fromisoformat(hi):
+                        continue
+                except Exception:
+                    pass
+                out.append(dict(ev))
+            out.sort(key=lambda e: ((e.get("start") or {}).get("dateTime") or (e.get("start") or {}).get("date") or ""))
+            return {"items": out}
+        return _SimReq(run)
+
+    def insert(self, calendarId=None, body=None, **kw):
+        def run():
+            self.cal.n += 1
+            ev = dict(body or {})
+            ev["id"] = f"sim{self.cal.n}"
+            ev["_cal"] = calendarId
+            self.cal.items.append(ev)
+            self.cal.log.append(("insert", ev.get("summary", ""), (ev.get("start") or {}).get("dateTime", "")))
+            return dict(ev)
+        return _SimReq(run)
+
+    def _find(self, eid):
+        for ev in self.cal.items:
+            if ev.get("id") == eid:
+                return ev
+        return None
+
+    def patch(self, calendarId=None, eventId=None, body=None, **kw):
+        def run():
+            ev = self._find(eventId)
+            if ev is not None:
+                ev.update(body or {})
+            else:
+                self.cal.over.setdefault(eventId, {}).update(body or {})
+            self.cal.log.append(("patch", eventId, str(body)[:120]))
+            return {"id": eventId}
+        return _SimReq(run)
+
+    def update(self, calendarId=None, eventId=None, body=None, **kw):
+        def run():
+            ev = self._find(eventId)
+            if ev is not None:
+                cal_ = ev.get("_cal")
+                ev.clear(); ev.update(body or {}); ev["id"] = eventId; ev["_cal"] = cal_
+            else:
+                self.cal.over[eventId] = dict(body or {})
+            self.cal.log.append(("update", eventId, (body or {}).get("summary", "")))
+            return {"id": eventId}
+        return _SimReq(run)
+
+    def delete(self, calendarId=None, eventId=None, **kw):
+        def run():
+            ev = self._find(eventId)
+            if ev is not None:
+                self.cal.items.remove(ev)
+            else:
+                self.cal.deleted.add(eventId)
+            self.cal.log.append(("delete", eventId, ""))
+            return {}
+        return _SimReq(run)
+
+    def get(self, calendarId=None, eventId=None, **kw):
+        def run():
+            ev = self._find(eventId)
+            if ev is not None:
+                return dict(ev)
+            return self.cal.real().events().get(calendarId=calendarId, eventId=eventId).execute()
+        return _SimReq(run)
+
+
+class _SimCal:
+    def __init__(self, real_factory):
+        self._real_factory, self._real = real_factory, None
+        self.items, self.over, self.deleted, self.n, self.log = [], {}, set(), 0, []
+
+    def real(self):
+        if self._real is None:
+            self._real = self._real_factory()
+        return self._real
+
+    def events(self):
+        return _SimEvents(self)
+
+
+def _sim_install():
+    """Wrap every side effecting function once, the wrapper only diverts when
+    the current thread runs a simulation, live traffic is never affected."""
+    if globals().get("_SIM_INSTALLED"):
+        return
+    g = globals()
+    real_cal = g["_calendar_service"]
+
+    def wrap(name, fn):
+        orig = g[name]
+        def w(*a, **k):
+            if _sim_on():
+                return fn(*a, **k)
+            return orig(*a, **k)
+        w.__name__ = name
+        w._orig = orig
+        g[name] = w
+
+    wrap("_calendar_service", lambda *a, **k: _SIM.cal)
+    wrap("conv_history", lambda s: [dict(x) for x in _SIM.conv.get(s, [])])
+    wrap("conv_append", lambda s, r, c: _SIM.conv.setdefault(s, []).append({"role": r, "content": c, "ts": time.time()}))
+    wrap("_pending_hold_get", lambda s: _SIM.holds.get(s))
+    wrap("_pending_hold_set", lambda s, rec: _SIM.holds.__setitem__(s, dict(rec)))
+    wrap("_pending_hold_clear", lambda s: _SIM.holds.pop(s, None))
+    wrap("_pending_hold_all_senders", lambda: list(_SIM.holds))
+    wrap("mark_human_active", lambda s: _SIM.paused.add(s))
+    wrap("is_human_active", lambda s: s in _SIM.paused)
+    wrap("clear_human_active", lambda s: _SIM.paused.discard(s))
+    wrap("_ai_disclosed", lambda s: s in _SIM.disclosed)
+    wrap("_mark_ai_disclosed", lambda s: _SIM.disclosed.add(s))
+    def _alert(*a, **k):
+        _SIM.alerts.append(" | ".join(str(x)[:160] for x in a))
+    for nm in ("alert_dan", "notify_dan_booked", "notify_dan_skip", "notify_dan_viewing_times_needed",
+               "notify_dan_viewing_scheduled", "_deliver_to_dan"):
+        wrap(nm, _alert)
+    def _send(to, text, *a, **k):
+        _SIM.sent.append(text)
+        return True
+    for nm in ("send_whatsapp", "send_instagram", "send_messenger"):
+        wrap(nm, _send)
+    wrap("_upstash", lambda *a, **k: None)
+    wrap("_send_plain_email", lambda *a, **k: False)
+    g["_SIM_INSTALLED"] = True
+    g["_SIM_REAL_CAL"] = real_cal
+
+
+def _sim_llm(model, system, messages, max_tokens=400):
+    r = httpx.post("https://api.anthropic.com/v1/messages",
+                   headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                   json={"model": model, "max_tokens": max_tokens, "system": system, "messages": messages}, timeout=60)
+    if r.status_code >= 400 and model != CONCIERGE_MODEL:
+        return _sim_llm(CONCIERGE_MODEL, system, messages, max_tokens)
+    r.raise_for_status()
+    return "".join(p.get("text", "") for p in r.json().get("content", []) if p.get("type") == "text").strip()
+
+
+# ---- persona library -------------------------------------------------------
+def _sim_dates():
+    fri = _eval_next(4, need_free=True)
+    sat = _eval_next(5, need_free=True)
+    thu = _eval_next(3, need_free=True)
+    tue = _eval_next(1)
+    far_sat = _eval_next(5, min_days=90)
+    return {"fri": fri, "sat": sat, "thu": thu, "tue": tue, "far_sat": far_sat,
+            "busy": date(2026, 10, 31), "closed_party": date(2026, 10, 17), "past": date(2026, 10, 3)}
+
+
+_SIM_STYLES = [
+    "Du schreibst kurz und locker wie auf WhatsApp, eine Info pro Nachricht.",
+    "Du schreibst alles auf einmal in eine lange freundliche Nachricht.",
+    "Du schreibst förmlich mit Sie.",
+    "Du bist etwas chaotisch, machst Tippfehler und vergisst Details.",
+    "Du stellst gern mehrere Fragen in einer Nachricht.",
+    "You write in English, casual and short.",
+]
+
+
+def _sim_personas(n=60):
+    D = _sim_dates()
+    f = lambda d: f"{d.day}.{d.month}."
+    base = [
+        ("table_small", f"Du willst einen Tisch für 2 am {f(D['fri'])} um 20 Uhr, Name Lea, kein Anlass. Wenn alles klar ist, bedankst du dich."),
+        ("table_four_vague", "Du willst 'nächstes Wochenende' mit 4 Freunden kommen, sagst erst auf Nachfrage Tag, Uhrzeit und Namen Max."),
+        ("table_six_birthday", f"Tisch für 6 am {f(D['sat'])} um 21 Uhr, Geburtstag deiner Schwester, Name Jana. Du fragst ob man Kuchen mitbringen darf."),
+        ("table_twelve", f"Ihr seid 12 Leute, wollt am {f(D['fri'])} ab 20 Uhr einfach was trinken, Name Tobi. Kein privater Bereich nötig."),
+        ("table_eighteen", f"18 Leute, Firmen Afterwork am {f(D['thu'])} um 19 Uhr, Name Kim. Ihr wollt einfach Tische."),
+        ("birthday_back_first_timer", f"30. Geburtstag am {f(D['far_sat'])}, ca 30 Gäste, du warst noch nie in der Bar, fragst nach Kosten, Essen und wie die Getränke laufen, und bist noch mit einer anderen Location im Gespräch. Du willst noch nichts fest buchen."),
+        ("birthday_back_returning", f"Geburtstag am {f(D['sat'])}, 35 Leute, ihr wart schon oft da, du willst den hinteren Bereich, akzeptierst den Mindestumsatz und willst fest buchen, Start 20 Uhr, Name Julia, ihr bringt Essen selbst mit, jeder zahlt selbst."),
+        ("whole_bar_50", f"Firmenfeier am {f(D['fri'])}, ca 50 Leute, ganze Bar exklusiv, Start 19 Uhr, Name Herr Bauer. Du fragst nach DJ und Musik."),
+        ("busy_date_whole_bar", f"Halloween Party am 31.10., 30 Leute, ganze Bar. Wenn es nicht geht, fragst du nach Alternativen im November."),
+        ("busy_date_back", "Hinterer Bereich am 31.10. für 25 Leute zum Geburtstag."),
+        ("busy_date_tables_20", "Tische für 20 Leute am 31.10. um 20 Uhr, Name Paul, kein privater Bereich nötig."),
+        ("private_party_night_table", "Tisch für 2 am 17.10. abends."),
+        ("closed_day_table", f"Tisch für 3 am Dienstag {f(D['tue'])} um 19 Uhr, Name Max."),
+        ("past_date", "Tisch für 2 am 3.10. um 20 Uhr, Name Kai. Wenn der Bot nachfragt, meinst du doch nächsten Freitag."),
+        ("price_first", "Deine erste Nachricht ist nur: Was kostet der hintere Bereich? Danach erzählst du von einem Geburtstag mit 25 Leuten im Dezember."),
+        ("free_dates_question", "Du planst einen 40. Geburtstag mit etwa 30 Gästen und fragst welcher Samstag im Januar noch frei ist. Dann suchst du dir einen aus."),
+        ("weekday_question", f"Du fragst wann am {f(D['far_sat'])} Schluss ist und welcher Wochentag das eigentlich ist, für eine Feier mit 25 Leuten."),
+        ("discount_push", f"Hinterer Bereich am {f(D['sat'])} für 20 Leute, nach dem Mindestumsatz fragst du ob 400 statt 700 gehen."),
+        ("extension_smoking", f"Feier am {f(D['sat'])}, 30 Leute, du fragst ob ihr bis 4 Uhr bleiben könnt und ob man drinnen rauchen darf."),
+        ("catering", f"Geburtstag am {f(D['far_sat'])} mit 30 Leuten, du fragst wie es mit externem Caterer läuft und ob ihr Pizza bestellen dürft."),
+        ("minors", f"Private Feier am {f(D['sat'])}, 25 Leute, einige Gäste sind 16, du fragst ob das geht."),
+        ("allergy", "Du hast eine Nussallergie und fragst welche Cocktails du trinken kannst."),
+        ("hours", "Du fragst nur nach den Öffnungszeiten und ob Happy Hour ist und was die Cocktails dann kosten."),
+        ("menu_alcfree", "Du fragst ob es alkoholfreie Cocktails gibt und welche du empfehlen würdest."),
+        ("dog_wheelchair", "Du fragst ob dein Hund mit darf und ob die Bar barrierefrei ist."),
+        ("parking_payment", "Du fragst wo man parken kann und ob man mit Karte zahlen kann."),
+        ("voucher", "Du willst einen Gutschein verschenken und fragst wie das geht."),
+        ("is_bot", "Du fragst ob du mit einem Bot schreibst und willst dann mit einem Menschen reden."),
+        ("complaint", "Du beschwerst dich, dass ihr letzten Samstag 40 Minuten auf Drinks gewartet habt."),
+        ("recap_dan", "Du schreibst: Hallo, hier ist Lisa von gestern, wie besprochen hier nochmal die Daten, 22.11., 40 Leute, ganze Bar."),
+        ("staff_applicant", "Du suchst einen Job als Barkeeper und fragst ob ihr Leute sucht."),
+        ("spam", "Du bist ein Vertriebler für SEO Dienstleistungen und bietest Rabatte an."),
+        ("english_table", f"You want a table for 3 on {D['sat'].strftime('%B')} {D['sat'].day} at 9pm, name Tom, inside."),
+        ("english_event", f"You plan a birthday for 30 people on {D['far_sat'].strftime('%B')} {D['far_sat'].day} and ask about prices and food."),
+        ("sie_formal_table", f"Sie möchten förmlich einen Tisch für 2 Personen am {f(D['thu'])} um 19:30 Uhr reservieren, Name Dr. Weber."),
+        ("change_mind_date", f"Du fragst erst nach dem {f(D['fri'])} für 4 Leute, änderst dann auf den {f(D['sat'])}, Name Ben, 20 Uhr."),
+        ("change_headcount", f"Tisch am {f(D['sat'])} um 20 Uhr, erst 4 Leute, dann sagst du es werden doch 7, Name Ana."),
+        ("decline_split_tables", "Tische für 18 Leute am 31.10. um 20 Uhr, Name Paul. Wenn es auf mehrere Hochtische verteilt wird, sagst du das ist euch zu getrennt."),
+        ("multi_question_flood", f"Du fragst in einer Nachricht nach Platz für 25 am {f(D['far_sat'])}, Essen, Musik, Preisen und ob ihr dekorieren dürft."),
+        ("emoji_ack", f"Du reservierst einen Tisch für 2 am {f(D['fri'])} um 19 Uhr, Name Mia, und antwortest am Ende nur mit 👍."),
+        ("viewing_wish", f"Feier am {f(D['far_sat'])}, 35 Leute, warst noch nie da, du willst vorher vorbeikommen und dir alles anschauen, am liebsten Freitag 19 Uhr."),
+        ("comparing_cold", f"Du fragst knapp nach Preis und Kapazität für 40 Leute am {f(D['far_sat'])}, du vergleichst gerade 5 Locations und bist ungeduldig."),
+        ("thursday_late", f"Tisch für 4 am {f(D['thu'])} um 23:30 Uhr, Name Lars."),
+        ("after_midnight", f"Tisch für 2 Samstagnacht um 0:30, also nach Mitternacht, Name Nils."),
+        ("huge_group", f"Ihr seid 90 Leute, Hochzeitsfeier am {f(D['far_sat'])}."),
+        ("outside_table", f"Tisch für 4 draußen am {f(D['sat'])} um 19 Uhr, Name Eva."),
+        ("same_name_two_bookings", f"Du hast schon einen Tisch für 4 am {f(D['fri'])} um 20 Uhr und willst noch einen zweiten Tisch für 3 am selben Abend."),
+    ]
+    existing = [
+        ("existing_late", "Du hast einen Tisch heute Abend und schreibst, dass ihr 20 Minuten später kommt.", "today"),
+        ("existing_cancel", "Du willst deine Reservierung für Freitag absagen.", "fri"),
+        ("existing_status", "Du fragst ob deine Reservierung für Freitag wirklich steht.", "fri"),
+        ("existing_more_people", "Du fragst ob ihr am Freitag statt 4 jetzt 6 sein dürft.", "fri"),
+        ("existing_move", "Du willst deine Reservierung am Freitag auf 21 Uhr verschieben.", "fri"),
+    ]
+    out = []
+    for i, (pid, goal) in enumerate(base):
+        out.append({"id": pid, "goal": goal, "style": _SIM_STYLES[i % len(_SIM_STYLES)] if not pid.startswith(("english", "sie_")) else ""})
+    for pid, goal, when in existing:
+        out.append({"id": pid, "goal": goal, "style": _SIM_STYLES[0], "existing": when})
+    return out[:n]
+
+
+def _sim_seed_existing(sender, when):
+    D = _sim_dates()
+    day = datetime.now(BAR_TZ).date() if when == "today" else D["fri"]
+    st = datetime(day.year, day.month, day.day, 20, 0, tzinfo=BAR_TZ)
+    body = {"summary": f"Lena - 4 Personen - Schöner Abend - Tisch ST3",
+            "description": f"Name: Lena\nTelefon/Contact: WhatsApp {sender}\nAnzahl Personen: 4\nReservierter Bereich: drinnen\n"
+                           f"Wichtige Hinweise fuer das Team: automatisch vom Concierge gebucht, Tisch ST3.",
+            "start": {"dateTime": st.isoformat()}, "end": {"dateTime": (st + timedelta(hours=3)).isoformat()}}
+    _SIM.cal.events().insert(calendarId=RESERVIERUNGEN_CALENDAR_ID, body=body).execute()
+    _SIM.conv.setdefault(sender, []).extend([
+        {"role": "user", "content": f"Tisch für 4 am {day.strftime('%d.%m.')} um 20 Uhr, Name Lena", "ts": time.time() - 86400},
+        {"role": "assistant", "content": f"Perfekt, dann seid ihr für 4 Leute am {_DAY_NAMES_DE[day.weekday()]} den {day.strftime('%d.%m.')} um 20 Uhr drinnen eingetragen, auf den Namen Lena.", "ts": time.time() - 86000},
+    ])
+    _SIM.disclosed.add(sender)
+
+
+# ---- invariants on every bot turn -------------------------------------------
+_WD_DE = {n.lower(): i for i, n in enumerate(_DAY_NAMES_DE)}
+_DECLINE_RE = re.compile(r"klappt.{0,30}nicht|nicht (mehr )?frei|schon (etwas|was) (fest )?geplant|ausgebucht|schon vergeben|leider (nicht )?vergeben|doesn.t work|not available|fully booked|already (planned|booked)", re.I)
+
+
+def _sim_resolve(dd, mm, yy=None):
+    now = datetime.now(BAR_TZ).date()
+    try:
+        if yy:
+            y = int(yy) + (2000 if int(yy) < 100 else 0)
+            return date(y, int(mm), int(dd))
+        c = date(now.year, int(mm), int(dd))
+        return c if c >= now else date(now.year + 1, int(mm), int(dd))
+    except ValueError:
+        return None
+
+
+def _sim_check_turn(sender, guest_text, reply, turn_no, hist):
+    issues = []
+    if not reply:
+        return issues
+    low = reply.lower()
+    # 1 weekday next to a date must be right
+    for m in re.finditer(r"(montag|dienstag|mittwoch|donnerstag|freitag|samstag|sonntag)[\s,]+(?:der |den |dem )?(\d{1,2})\.(\d{1,2})\.?(\d{2,4})?", low):
+        d = _sim_resolve(m.group(2), m.group(3), m.group(4))
+        if d and _WD_DE[m.group(1)] != d.weekday():
+            issues.append(f"wrong weekday, wrote {m.group(1)} for {d.isoformat()} which is a {_DAY_NAMES_DE[d.weekday()]}")
+    for m in re.finditer(r"(\d{1,2})\.(\d{1,2})\.?(\d{2,4})?\s+(?:ist\s+(?:ein|der)\s+)(montag|dienstag|mittwoch|donnerstag|freitag|samstag|sonntag)", low):
+        d = _sim_resolve(m.group(1), m.group(2), m.group(3))
+        if d and _WD_DE[m.group(4)] != d.weekday():
+            issues.append(f"wrong weekday claim for {d.isoformat()}")
+    # 2 house style
+    if re.search(r"[;–—]|\s-\s", reply):
+        issues.append("house style, dash or semicolon")
+    if re.search(r"\b(fuer|ueber|moechte|koennen|waere|spaeter|naechste|getraenke)\b", low):
+        issues.append("house style, ASCII umlauts")
+    # 3 early price
+    user_turns = sum(1 for h in hist if h.get("role") == "user")
+    if user_turns <= 2 and _EARLY_PRICE_RE.search(reply):
+        issues.append("price, Mindestumsatz, Miete or Trinkgeld in the first two guest messages")
+    # 4 internal process or tool talk
+    for pat in (r"von hier aus", r"jeden tag einzeln", r"\bim kalender\b", r"\bsystem\b", r"\btool\b", r"\bprompt\b", r"book_table", r"send_reply", r"keine liste"):
+        if re.search(pat, low):
+            issues.append(f"internal process talk, {pat}")
+    # 5 false decline or false free against the real calendar plus sandbox
+    dates = []
+    for m in re.finditer(r"\b(\d{1,2})\.(\d{1,2})\.?(\d{2,4})?", reply + " " + guest_text):
+        d = _sim_resolve(m.group(1), m.group(2), m.group(3))
+        if d and d not in dates:
+            dates.append(d)
+    if _DECLINE_RE.search(reply) and dates:
+        p, sp = _party_space_from_text(sender, guest_text)
+        for d in dates[:2]:
+            try:
+                st = _event_date_status(_calendar_service(), d.isoformat(), sender, p, sp)
+                closed_day = d.weekday() not in OPENING_HOURS
+                if not st["collision"] and not st["closed"] and not closed_day and d > datetime.now(BAR_TZ).date():
+                    issues.append(f"possible false decline for {d.isoformat()}, calendar shows no collision for this guest (party {p}, space {sp})")
+            except Exception as e:
+                issues.append(f"check error {e}")
+    # 6 hold or booking claims backed by the sandbox
+    if _has_hold_claim(reply) and dates:
+        backed = any(_has_hold_for(sender, d.isoformat()) for d in dates)
+        if not backed:
+            issues.append("hold or reservation claimed without a matching hold or booking")
+    if re.search(r"\beingetragen\b|\bis booked\b|you are booked", low) and not re.search(r"(nicht|noch nicht|not)\s+\w*\s*eingetragen", low):
+        if not any(e for e in _SIM.cal.items if _contact_key(sender) in json.dumps(e)):
+            issues.append("confirmation text without any calendar entry for this guest")
+    return issues
+
+
+_SIM_FACTS = (
+    "Facts of BrunnenBar Augsburg the concierge must respect. Open Thursday 18 to 24 Uhr, Friday and Saturday 18 to 2 Uhr, last round 30 minutes before closing, "
+    "closed Sunday to Wednesday for tables (private events Monday to Wednesday only after Dan decides, Sunday never). Back room (hinterer Bereich) 28 seats, about 40 to 45 standing, "
+    "Mindestumsatz 700 Euro, whole bar 51 seats and up to 65 standing, Mindestumsatz 1700 Euro, no Raummiete, voluntary 10 percent Trinkgeld, never a Servicegebühr. "
+    "No prices, Mindestumsatz or Trinkgeld in the guest's first two messages. No kitchen, own food welcome, caterer mainly Thassos im Stadtmarkt, fingerfood recommended. "
+    "Tables held 20 minutes, call the bar if more than 15 minutes late. Tonight's table while the bar is open, by phone 0821 47019035. Happy Hour until 20 Uhr, no prices quoted. "
+    "Dogs welcome, card and cash, parking City Galerie, entrance barrier free but a step to the toilets. No smoking inside, no extension past closing. "
+    "Private spaces are only confirmed after the Mindestumsatz was explained and accepted, a group below about 30 for the back or 50 for the whole bar goes to Dan. "
+    "The concierge never invents availability, dates, prices or policies, never promises a viewing time, answers every question the guest asked, asks at most one question per message, "
+    "writes warm informal German with du unless the guest uses Sie, no dashes, colons or lists, and hands off silently to Dan for complaints, discounts, staff, recaps of a talk with Dan, groups over 65 and changes to confirmed bookings. "
+    "A silent turn (no reply) is correct only for spam, a handoff to Dan, a viewing request or a pure thanks or emoji."
+)
+
+
+def _sim_judge(transcript):
+    sysm = ("You are a strict quality reviewer for a bar's WhatsApp concierge. " + _SIM_FACTS +
+            " Read the conversation and list every real problem with the concierge's replies, wrong facts, ignored questions, invented availability, "
+            "contradictions, robotic or internal wording, pushy or cold tone, wrong handling. Ignore weekday correctness, a separate check covers it. "
+            "Answer ONLY with JSON, a list of objects with keys turn (number of the concierge turn), severity (high, medium or low) and problem (short English). "
+            "Return [] if there is nothing real.")
+    txt = "\n".join(f"{i}. {r.upper()}: {t}" for i, (r, t) in enumerate(transcript))
+    try:
+        out = _sim_llm(SIM_JUDGE_MODEL, sysm, [{"role": "user", "content": txt}], max_tokens=900)
+        m = re.search(r"\[.*\]", out, re.S)
+        return json.loads(m.group(0)) if m else []
+    except Exception as e:
+        return [{"turn": -1, "severity": "low", "problem": f"judge failed {e}"}]
+
+
+def _sim_guest_system(p):
+    return ("Du spielst einen echten Gast, der der BrunnenBar in Augsburg per WhatsApp schreibt. Ziel: " + p["goal"] + " " + (p.get("style") or "") +
+            " Schreib immer nur die nächste Nachricht des Gastes, ohne Anführungszeichen und ohne Erklärung. Reagiere natürlich auf das, was die Bar zuletzt geschrieben hat. "
+            "Wenn dein Ziel erreicht ist oder nichts mehr zu sagen ist, antworte genau mit [ENDE].")
+
+
+def _sim_one(p, max_turns=6):
+    _SIM.on = True
+    _SIM.cal = _SimCal(globals()["_SIM_REAL_CAL"])
+    _SIM.conv, _SIM.holds, _SIM.paused, _SIM.disclosed = {}, {}, set(), set()
+    _SIM.alerts, _SIM.sent = [], []
+    sender = "4915000" + str(abs(hash(p["id"])) % 10 ** 6).zfill(6)
+    res = {"id": p["id"], "transcript": [], "issues": [], "judge": [], "alerts": [], "calendar": [], "error": ""}
+    try:
+        if p.get("existing"):
+            _sim_seed_existing(sender, p["existing"])
+        guest_msgs = []
+        for turn in range(max_turns):
+            convo = [{"role": "user", "content": "Schreib deine erste Nachricht an die Bar."}]
+            for r, t in res["transcript"]:
+                if r == "bar" and t.startswith("[silent"):
+                    t = "(Die Bar hat nicht geantwortet.) Schreib deine nächste Nachricht oder [ENDE]."
+                convo.append({"role": "user" if r == "bar" else "assistant", "content": t})
+            g = _sim_llm(SIM_GUEST_MODEL, _sim_guest_system(p), convo, max_tokens=300)
+            if not g or "[ENDE]" in g:
+                break
+            res["transcript"].append(("guest", g))
+            conv_append(sender, "user", g)
+            if is_human_active(sender):
+                res["transcript"].append(("bar", "[paused for Dan]"))
+                break
+            before_c, before_a = len(_SIM.conv.get(sender, [])), len(_SIM.alerts)
+            handle("whatsapp", sender, g)
+            new_turns = _SIM.conv.get(sender, [])[before_c:]
+            reply = "\n".join(t["content"] for t in new_turns if t.get("role") == "assistant" and t.get("content"))
+            if reply:
+                res["transcript"].append(("bar", reply))
+            else:
+                why = "; ".join(_SIM.alerts[before_a:])[:240] or "no alert"
+                res["transcript"].append(("bar", f"[silent, Dan pinged: {why}]"))
+            for iss in _sim_check_turn(sender, g, reply, turn, conv_history(sender)):
+                res["issues"].append({"turn": len(res["transcript"]) - 1, "problem": iss})
+            if is_human_active(sender):
+                break
+        res["judge"] = _sim_judge(res["transcript"])
+    except Exception as e:
+        res["error"] = repr(e)[:300]
+        logger.exception("sim conversation failed")
+    finally:
+        res["alerts"] = list(_SIM.alerts)[:8]
+        res["calendar"] = list(_SIM.cal.log)[:8]
+        _SIM.on = False
+    return res
+
+
+def _sim_run(n=60, workers=5):
+    _sim_install()
+    personas = _sim_personas(n)
+    _sim_state.update({"running": True, "started": time.time(), "results": [], "done": 0, "total": len(personas), "summary": {}})
+    from concurrent.futures import ThreadPoolExecutor
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for r in ex.map(_sim_one, personas):
+                _sim_state["results"].append(r)
+                _sim_state["done"] += 1
+        rs = _sim_state["results"]
+        _sim_state["summary"] = {
+            "conversations": len(rs),
+            "bot_turns": sum(sum(1 for t in r["transcript"] if t[0] == "bar") for r in rs),
+            "invariant_failures": sum(len(r["issues"]) for r in rs),
+            "judge_high": sum(1 for r in rs for j in r["judge"] if isinstance(j, dict) and j.get("severity") == "high"),
+            "judge_medium": sum(1 for r in rs for j in r["judge"] if isinstance(j, dict) and j.get("severity") == "medium"),
+            "errors": [r["id"] for r in rs if r["error"]],
+        }
+    finally:
+        _sim_state.update({"running": False, "finished": time.time()})
+
+
+@app.get("/sim/run")
+def sim_run_route(n: int = 60, workers: int = 5):
+    if _sim_state["running"]:
+        return {"status": "already running", "done": _sim_state["done"], "total": _sim_state["total"]}
+    threading.Thread(target=_sim_run, args=(min(n, 120), min(workers, 8)), daemon=True).start()
+    return {"status": "started"}
+
+
+@app.get("/sim/result")
+def sim_result_route():
+    return {k: _sim_state[k] for k in ("running", "started", "finished", "done", "total", "summary", "results")}
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
