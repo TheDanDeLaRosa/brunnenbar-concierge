@@ -938,7 +938,7 @@ def _relative_de_date(t: str, now: datetime):
     if any(m in low for m in _DE_MONTHS) or re.search(r"\b(" + _EN_MONTH_RE + r")\b", low):
         return None
     for name, wd in list(_DE_WEEKDAYS.items()) + list(_EN_WEEKDAYS.items()):
-        if re.search(r"\b" + name + r"s?\b", low):
+        if re.search(r"\b" + name + r"(?:s|abend|abends|nacht|nachts|night|evening)?\b", low):
             delta = (wd - now.weekday()) % 7
             if delta == 0 and re.search(r"n[aä]chste|\bnext\b", low):
                 delta = 7
@@ -1018,6 +1018,27 @@ def _free_nights_context(sender, text, history=None):
             "aktuell frei, ohne Garantie bis er sich entscheidet, und frag welcher passt. Sag nie, dass du keine Liste geben kannst, "
             "und beschreib nie wie du den Kalender pruefst.")
 
+_DATE_TOKEN_RE = re.compile(
+    r"\b\d{1,2}\.\s*\d{1,2}\.(?:\d{2,4})?|(?<![\d.:])\d{1,2}\.\d{1,2}(?![\d.:])(?!\s*(?:uhr|euro|€|%|h\b))"
+    r"|\b\d{1,2}\.?\s*(?:januar|februar|märz|maerz|april|mai|juni|juli|august|september|oktober|november|dezember)\b",
+    re.I)
+
+
+def _extract_all_dates(text, now):
+    """Every concrete date in a message, in order, deduplicated. Falls back to
+    _extract_de_date for English and relative dates."""
+    out = []
+    for m in _DATE_TOKEN_RE.finditer(text or ""):
+        d = _extract_de_date(m.group(0), now)
+        if d and d not in out:
+            out.append(d)
+    if not out:
+        d = _extract_de_date(text or "", now)
+        if d:
+            out.append(d)
+    return out
+
+
 def _thread_date(sender, history, now, look_back=8):
     """The most recent concrete date a guest named earlier in this thread,
     newest first, or None."""
@@ -1062,7 +1083,13 @@ def event_date_context(sender: str, text: str, history=None) -> str:
     if not (BOOKING_ENABLED and GOOGLE_REFRESH_TOKEN and RESERVIERUNGEN_CALENDAR_ID):
         return ""
     now = datetime.now(BAR_TZ)
-    date_iso = _extract_de_date(text, now)
+    # BUGFIX 13 Oct 2026, conversation simulator. "Der 23.10. ist schlecht, der
+    # 06.11. wäre gut" only ever checked the first date. Every date the guest
+    # names in this message is checked now, up to three.
+    dates = _extract_all_dates(text, now)[:3]
+    if len(dates) > 1:
+        return "\n".join(b for b in (_event_date_block(sender, text, history, d, False) for d in dates) if b)
+    date_iso = dates[0] if dates else None
     from_thread = False
     if not date_iso:
         try:
@@ -1081,6 +1108,11 @@ def event_date_context(sender: str, text: str, history=None) -> str:
         from_thread = bool(date_iso)
         if not date_iso:
             return ""
+    return _event_date_block(sender, text, history, date_iso, from_thread)
+
+
+def _event_date_block(sender, text, history, date_iso, from_thread):
+    """The EVENT DATUM CHECK text for one date, see event_date_context."""
     _p, _sp = None, None
     try:
         svc = _calendar_service()
@@ -3953,6 +3985,7 @@ Event opener, schön dass du deinen 30ten bei uns feiern willst. warst du schon 
 Owning a slip, sorry, deine nachricht ist mir durchgerutscht, das tut mir wirklich leid. wie sieht donnerstag um 18 uhr bei dir aus.
 Weather for an outside table, wir planen euch fest für draußen ein, es bleibt heute sonnig und trocken, wir freuen uns auf euch heute abend.
 
+GUEST WORDING. ADDED 13 Oct 2026 from the conversation simulator. Never talk about how you work, never write von hier aus, im Kalender, im System, laut System, ich prüfe, ich schaue nach. Say it the way a host would, bei uns steht, das passt, da ist schon was geplant.
 FREE DATES AND WEEKDAYS. ADDED 13 Oct 2026 after Nathalie was told 30.01.2027 was a Friday (it is a Saturday) and was given a list of Saturdays nobody had checked. Never work out a weekday yourself, a WOCHENTAG line tells you. When a guest asks which dates are still free, offer exactly the dates from the FREIE ABENDE line or the Freie Alternativen in an EVENT DATUM CHECK line, never invent or guess dates, never say you cannot give a list, never describe how you check the calendar. If no such line is there, ask which month or which two or three dates they have in mind.
 
 THE BOOK IS THE ONLY TRUTH. ADDED 12 Oct 2026 after Sarah (Halloween, whole bar) was told "der 31. Oktober ist noch frei und bleibt erstmal für euch blockiert" while Evy already had the Sofa that night and no hold existed for Sarah at all. The calendar is the single source of truth, see Booking_Rules.md. You only ever say a date, table or space is free when an EVENT DATUM CHECK or GAST BUCHUNGEN line in this prompt confirms it. You only ever say a date or space is held, blocked, vorgemerkt or reserviert for the guest when you set event_hold in this same turn or GAST BUCHUNGEN already shows their entry. Otherwise ask a question or answer honestly, never reassure. Every entry in the reservation calendar is a reservation, a single table like the Sofa already blocks the private hinterer Bereich and the whole bar that evening, the other tables can still be offered as normal tables. The earliest entry keeps the date, a later guest never takes it.
@@ -5382,6 +5415,11 @@ def _decide_checked(sender, text, history=None, dry_run=False, extra_system=""):
     hist = history if history is not None else conv_history(sender)
     turns = sum(1 for h in hist if h.get("role") == "user") or 1
     viol = _rule_violations(_draft_message(res, dry_run), turns)
+    # 13 Oct 2026, conversation simulator, the model sometimes chose action
+    # reply with an empty message right when the guest asked about costs,
+    # the guest got nothing. One retry with the reason, then Dan.
+    if not dry_run and res[0] == "reply" and not str(res[1] or "").strip():
+        viol = viol + ["the message was empty, the guest would get nothing, write the actual answer to every question the guest asked"]
     if not viol:
         return res
     logger.warning("draft broke a hard rule for %s, retrying once: %s", sender, viol)
@@ -5390,6 +5428,8 @@ def _decide_checked(sender, text, history=None, dry_run=False, extra_system=""):
     res2 = claude_decide(sender, text, history=history, dry_run=dry_run,
                          extra_system=(extra_system + "\n\n" + corr).strip())
     viol2 = _rule_violations(_draft_message(res2, dry_run), turns)
+    if not dry_run and res2[0] == "reply" and not str(res2[1] or "").strip():
+        viol2 = viol2 + ["the message was empty again"]
     if not viol2:
         return res2
     if dry_run:
@@ -6625,7 +6665,13 @@ def _space_promise_check(sender: str, text: str, reply: str, lang=None, history=
         return ("ok", reply)
     try:
         now = datetime.now(BAR_TZ)
-        date_iso = _extract_de_date(text, now)
+        # 13 Oct 2026, the date the reply itself talks about wins, then every
+        # date in the guest's message, a hold on the second date the guest
+        # named was blocked because only the first one was read.
+        cands = [d for d in _extract_all_dates(reply, now) if d in _extract_all_dates(text, now)] or _extract_all_dates(text, now)
+        if _has_hold_claim(reply) and any(_has_hold_for(sender, d) for d in cands + _extract_all_dates(reply, now)):
+            return ("ok", reply)
+        date_iso = cands[-1] if cands else None
         if not date_iso:
             for h in reversed((history if history is not None else conv_history(sender))[-8:]):
                 if h.get("role") == "user":
@@ -7319,6 +7365,34 @@ def _sim_personas(n=60):
         ("huge_group", f"Ihr seid 90 Leute, Hochzeitsfeier am {f(D['far_sat'])}."),
         ("outside_table", f"Tisch für 4 draußen am {f(D['sat'])} um 19 Uhr, Name Eva."),
         ("same_name_two_bookings", f"Du hast schon einen Tisch für 4 am {f(D['fri'])} um 20 Uhr und willst noch einen zweiten Tisch für 3 am selben Abend."),
+        # round 2, 13 Oct 2026, the shapes the first run showed are fragile
+        ("compound_weekday", "Du schreibst: habt ihr Samstagabend noch nen Tisch für 2 so um 21 Uhr? Name Jonas."),
+        ("two_dates_one_message", f"Feier mit 30 Leuten, du schreibst der 31.10. wäre schlecht, aber der {f(D['sat'])} oder der {f(D['far_sat'])} ginge. Du willst wissen welcher frei ist."),
+        ("date_hopper", f"Geburtstag mit 25 Leuten. Erst fragst du nach dem 31.10., dann nach dem {f(D['sat'])}, dann doch nach dem {f(D['far_sat'])}. Dein Name ist Clara."),
+        ("whole_to_back", f"Erst willst du die ganze Bar am {f(D['far_sat'])} für 30 Leute, nach dem Mindestumsatz entscheidest du dich für den hinteren Bereich."),
+        ("accept_and_book_back", f"Geburtstag am {f(D['far_sat'])}, 32 Leute, du warst schon mal da, du akzeptierst den Mindestumsatz und willst fest buchen, Start 20 Uhr, Name Sophie Maier."),
+        ("back_out", f"Du fragst nach dem hinteren Bereich am {f(D['far_sat'])} für 30 Leute, dann schreibst du, dass die Feier leider abgesagt ist."),
+        ("hold_still_there", f"Du hattest nach dem {f(D['far_sat'])} für 30 Leute gefragt. In deiner dritten Nachricht fragst du, ob der Termin noch für dich vorgemerkt ist."),
+        ("christmas_eve", "Du fragst ob ihr am 24.12. oder 31.12. offen habt und ob man da was reservieren kann, 4 Leute."),
+        ("sunday_event", f"Du willst eine private Feier an einem Sonntag im November mit 40 Leuten machen."),
+        ("today_closed", "Du willst heute Abend mit 3 Leuten vorbeikommen und fragst ob noch was frei ist."),
+        ("tomorrow_closed", "Du fragst ob ihr morgen Abend einen Tisch für 2 habt."),
+        ("cocktail_price_first", "Deine erste Nachricht ist: Was kostet bei euch ein Aperol Spritz?"),
+        ("mixed_language", f"Du schreibst halb Deutsch halb Englisch, Tisch für 5 am {f(D['sat'])} at 8pm, name Alex."),
+        ("one_word_answers", f"Du willst einen Tisch für 4 am {f(D['fri'])}. Du antwortest auf jede Frage nur mit einem Wort."),
+        ("surprise_party", f"Überraschungsparty für deinen Freund am {f(D['sat'])}, 10 Leute, Tisch um 20 Uhr, Name Lisa, er darf nichts erfahren, du fragst ob ihr Deko erlaubt."),
+        ("phone_number_given", f"Tisch für 2 am {f(D['thu'])} um 20 Uhr, Name Ben, du gibst auch deine Handynummer 0176 1234567 an."),
+        ("bar_seats", f"Du willst mit 2 Leuten am {f(D['fri'])} um 21 Uhr direkt an der Bar sitzen, Name Kim."),
+        ("big_table_14", f"14 Leute am {f(D['sat'])} um 20 Uhr, Abschiedsfeier, Name Jens, ihr wollt gern alle zusammen sitzen."),
+        ("group_20_tables", f"20 Leute am {f(D['fri'])} um 20 Uhr, einfach Tische, kein privater Bereich, Name Oli, ihr wart schon mal da."),
+        ("deposit_question", f"Hinterer Bereich am {f(D['far_sat'])}, 30 Leute, du fragst ob man eine Anzahlung leisten muss und an welches Konto."),
+        ("angry_no_reply", "Du schreibst genervt: Ich hab euch vor drei Tagen geschrieben und keiner hat geantwortet, ich will einen Tisch für 6 am Samstag."),
+        ("thank_you_after_visit", "Du schreibst: Danke für den tollen Abend gestern, die Drinks waren super!"),
+        ("lost_item", "Du hast gestern deine Jacke in der Bar vergessen und fragst ob sie gefunden wurde."),
+        ("press_influencer", "Du bist Food Bloggerin mit 20k Followern und fragst nach einer Kooperation."),
+        ("supplier", "Du bist Vertreter einer Gin Marke und willst einen Termin für eine Verkostung."),
+        ("dj_ask", "Du bist DJ und fragst ob ihr DJs bucht."),
+        ("minimum_for_tables", f"Tisch für 8 am {f(D['sat'])} um 20 Uhr, Name Hanna, du fragst ob es einen Mindestverzehr gibt."),
     ]
     existing = [
         ("existing_late", "Du hast einen Tisch heute Abend und schreibst, dass ihr 20 Minuten später kommt.", "today"),
@@ -7396,14 +7470,12 @@ def _sim_check_turn(sender, guest_text, reply, turn_no, hist):
         if re.search(pat, low):
             issues.append(f"internal process talk, {pat}")
     # 5 false decline or false free against the real calendar plus sandbox
-    dates = []
-    for m in re.finditer(r"\b(\d{1,2})\.(\d{1,2})\.?(\d{2,4})?", reply + " " + guest_text):
-        d = _sim_resolve(m.group(1), m.group(2), m.group(3))
-        if d and d not in dates:
-            dates.append(d)
-    if _DECLINE_RE.search(reply) and dates:
-        p, sp = _party_space_from_text(sender, guest_text)
-        for d in dates[:2]:
+    now = datetime.now(BAR_TZ)
+    asked = [date.fromisoformat(x) for x in _extract_all_dates(guest_text, now)]
+    dates = list(dict.fromkeys(asked + [date.fromisoformat(x) for x in _extract_all_dates(reply, now)]))
+    if _DECLINE_RE.search(reply) and asked:
+        p, sp = _party_space_from_text(sender, guest_text, hist)
+        for d in asked[:2]:
             try:
                 st = _event_date_status(_calendar_service(), d.isoformat(), sender, p, sp)
                 closed_day = d.weekday() not in OPENING_HOURS
@@ -7432,12 +7504,39 @@ _SIM_FACTS = (
     "Private spaces are only confirmed after the Mindestumsatz was explained and accepted, a group below about 30 for the back or 50 for the whole bar goes to Dan. "
     "The concierge never invents availability, dates, prices or policies, never promises a viewing time, answers every question the guest asked, asks at most one question per message, "
     "writes warm informal German with du unless the guest uses Sie, no dashes, colons or lists, and hands off silently to Dan for complaints, discounts, staff, recaps of a talk with Dan, groups over 65 and changes to confirmed bookings. "
-    "A silent turn (no reply) is correct only for spam, a handoff to Dan, a viewing request or a pure thanks or emoji."
+    "A silent turn (no reply) is correct for spam, a handoff to Dan, a viewing request or a pure thanks or emoji. Handoff to Dan by design, silent to the guest: "
+    "allergy questions, vouchers, minors, job applications, complaints, a guest asking for a human, groups over 65, changes to a confirmed booking. "
+    "By design, not errors: for groups of 7 or more the concierge places a tentative calendar hold (vorgemerkt, pencilled in) as soon as date and headcount are known; "
+    "the first reply carries Dan's own AI notice ending with the Old Fashioned line, that wording is Dan's; a cancelled bot booking is freed automatically; "
+    "for the whole bar a group below about 50 may book for privacy and the drinks shortfall below 1700 Euro is charged as Raummiete; "
+    "a first time guest may be invited to come by for a cocktail on the house; the concierge knows the guest's existing bookings from the calendar. "
+    "Flag a silent turn marked [silent, Dan pinged: NO ALERT] or an empty reply as high."
 )
 
 
-def _sim_judge(transcript):
-    sysm = ("You are a strict quality reviewer for a bar's WhatsApp concierge. " + _SIM_FACTS +
+def _sim_truth(transcript, sender):
+    """Calendar truth for every date in the conversation, so the judge does not
+    mistake a real calendar answer for an invented one."""
+    now = datetime.now(BAR_TZ)
+    seen, lines = [], []
+    for _r, t in transcript:
+        for d in _extract_all_dates(t, now):
+            if d not in seen:
+                seen.append(d)
+    for d in seen[:8]:
+        try:
+            dd = date.fromisoformat(d)
+            st = _event_date_status(_calendar_service(), d, sender, None, None)
+            lines.append(f"{d} ({_DAY_NAMES_DE[dd.weekday()]}): " + ("closed or private party" if st["closed"] else
+                         ("already taken by another booking" if st["collision"] else "free in the calendar")) +
+                         ("" if dd.weekday() in OPENING_HOURS else ", normally closed weekday"))
+        except Exception as e:
+            lines.append(f"{d}: check failed {e}")
+    return "CALENDAR TRUTH, checked by code, the concierge sees the same data: " + "; ".join(lines) if lines else ""
+
+
+def _sim_judge(transcript, sender=""):
+    sysm = ("You are a strict quality reviewer for a bar's WhatsApp concierge. " + _SIM_FACTS + " " + _sim_truth(transcript, sender) +
             " Read the conversation and list every real problem with the concierge's replies, wrong facts, ignored questions, invented availability, "
             "contradictions, robotic or internal wording, pushy or cold tone, wrong handling. Ignore weekday correctness, a separate check covers it. "
             "Answer ONLY with JSON, a list of objects with keys turn (number of the concierge turn), severity (high, medium or low) and problem (short English). "
@@ -7496,7 +7595,7 @@ def _sim_one(p, max_turns=6):
                 res["issues"].append({"turn": len(res["transcript"]) - 1, "problem": iss})
             if is_human_active(sender):
                 break
-        res["judge"] = _sim_judge(res["transcript"])
+        res["judge"] = _sim_judge(res["transcript"], sender) if res["transcript"] else []
     except Exception as e:
         res["error"] = repr(e)[:300]
         logger.exception("sim conversation failed")
@@ -7518,9 +7617,10 @@ def _sim_run(n=60, workers=5, only=""):
     _sim_state.update({"running": True, "started": time.time(), "results": [], "done": 0, "total": len(personas), "summary": {}})
     from concurrent.futures import ThreadPoolExecutor
     try:
+        from concurrent.futures import as_completed
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            for r in ex.map(_sim_one, personas):
-                _sim_state["results"].append(r)
+            for f in as_completed([ex.submit(_sim_one, p) for p in personas]):
+                _sim_state["results"].append(f.result())
                 _sim_state["done"] += 1
         rs = _sim_state["results"]
         _sim_state["summary"] = {
