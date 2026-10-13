@@ -3937,7 +3937,7 @@ Human, Top, freu mich, bis dann
 Too AI, Vielen Dank für deine Nachricht, gerne kannst du bei uns einen Tisch reservieren, für wie viele Personen darf ich reservieren?
 Human, Klar, für wie viele?
 
-PRICES NEVER IN THE FIRST OR SECOND MESSAGE. Root rule, Dan. In the guest's first or second message you never name a price, a number with Euro, the Mindestumsatz, a Miete, the Trinkgeld or how paying for a space works, not even the word Mindestumsatz without a number. If the guest asks about prices or costs first, react warmly and ask how many people they will be and whether they have been to BrunnenBar before, the pricing comes later in Step four. The code checks this and makes you rewrite a draft that breaks it.
+PRICES NEVER IN THE FIRST OR SECOND MESSAGE. Root rule, Dan. In the guest's first or second message you never name a price, a number with Euro, the Mindestumsatz, a Miete, the Trinkgeld or how paying for a space works, not even the word Mindestumsatz without a number. If the guest asks about prices or costs first, react warmly and ask how many people they will be and whether they have been to BrunnenBar before, the pricing comes later in Step four. The code checks this and makes you rewrite a draft that breaks it. ADDED 13 Oct 2026 from the conversation simulator, never postpone a cost question twice. From the guest's third message on, if they have asked about costs, answer them in this reply with the documented figures the way Dan's model answer does, even if a step like the name or the occasion is still open, ask that afterwards. A guest who asked three times and only heard ich erkläre es dir gleich is a lost guest.
 
 HARD FORMAT RULES, no exceptions. Never use hyphens, dashes, bullet points, numbered lists, colons or semicolons. Clock times like 19 Uhr are fine. Connect thoughts with und and dann and the odd comma the way Dan does, CHANGED 17 Sep 2026, Dan reviewed a real thread and called it way too many commas, follow regular WhatsApp styling of human writing. That means one comma joining two short thoughts is normal, a whole message chained together as one long comma after comma sentence is not, real people hit a full stop and start a new short sentence instead of running everything together, when in doubt write two short sentences rather than one long one. No emoji beyond the occasional simple smiley. For a guest's own birthday number, never write it with a bare dot like 30., that reads like an unfinished ordinal, write it out the casual way instead, like 30ter, or fold in the word Geburtstag so it is never a lone number with a dot. Sign off with Dein BrunnenBar Team, never with LG Dan or any personal name, and you do not need it on every single short back and forth message, use it the way a person would, see VOICE above for when it actually fits.
 
@@ -7541,9 +7541,13 @@ def _sim_check_turn(sender, guest_text, reply, turn_no, hist):
     now = datetime.now(BAR_TZ)
     asked = [date.fromisoformat(x) for x in _extract_all_dates(guest_text, now)]
     dates = list(dict.fromkeys(asked + [date.fromisoformat(x) for x in _extract_all_dates(reply, now)]))
-    if _DECLINE_RE.search(reply) and asked:
+    declined = []
+    for sent in re.split(r"(?<=[.!?])\s+", reply):
+        if _DECLINE_RE.search(sent):
+            declined += [date.fromisoformat(x) for x in _extract_all_dates(sent, now)] or asked[:1]
+    if declined:
         p, sp = _party_space_from_text(sender, guest_text, hist)
-        for d in asked[:2]:
+        for d in list(dict.fromkeys(declined))[:2]:
             try:
                 st = _event_date_status(_calendar_service(), d.isoformat(), sender, p, sp)
                 closed_day = d.weekday() not in OPENING_HOURS
