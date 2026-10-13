@@ -3268,7 +3268,7 @@ def _contact_key(sender: str) -> str:
     return _norm_phone(sender)
 
 
-def _guest_bookings(sender: str, days: int = 90):
+def _guest_bookings(sender: str, days: int = 400):  # 13 Oct 2026, was 90, events are booked up to a year ahead
     """Upcoming calendar entries that belong to this guest (their phone or
     email in the entry), oldest first, cancelled ones left out."""
     key = _contact_key(sender)
