@@ -90,6 +90,9 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 # via env var so a future bump is a Railway variable change, not a code
 # change and redeploy.
 CONCIERGE_MODEL = os.environ.get("CONCIERGE_MODEL", "claude-sonnet-5-5")
+# 13 Oct 2026, conversation simulator, long cost answers came back as an empty
+# send_reply, most likely cut off at 1500 tokens. Raised, and a cut off is logged.
+CONCIERGE_MAX_TOKENS = int(os.environ.get("CONCIERGE_MAX_TOKENS", "4000"))
 CONCIERGE_FALLBACK_MODEL = os.environ.get("CONCIERGE_FALLBACK_MODEL", "claude-sonnet-4-5")
 # Live diagnostics for /debug, no secrets, added 01 Oct 2026 so an Anthropic failure can be read without Railway logs.
 _API_DIAG = {"ok": 0, "fail": 0, "last_ok_model": "", "last_ok_ts": 0, "last_error": "", "last_error_ts": 0}
@@ -5974,7 +5977,7 @@ def claude_decide(sender: str, text: str, history=None, dry_run: bool = False, e
                     },
                     json={
                         "model": _model,
-                        "max_tokens": 1500,
+                        "max_tokens": CONCIERGE_MAX_TOKENS,
                         "system": _sys,
                         "tools": _tools,
                         "tool_choice": {"type": "any"} if _force else {"type": "auto"},
@@ -6020,6 +6023,8 @@ def claude_decide(sender: str, text: str, history=None, dry_run: bool = False, e
             _API_DIAG["last_error_ts"] = time.time()
             raise
         parts = r.json().get("content", [])
+        if r.json().get("stop_reason") == "max_tokens":
+            logger.warning("Model reply was cut off at max_tokens (%s) for %s", CONCIERGE_MAX_TOKENS, sender)
         if dry_run:
             for p in parts:
                 if p.get("type") == "tool_use":
@@ -6035,6 +6040,10 @@ def claude_decide(sender: str, text: str, history=None, dry_run: bool = False, e
                 action = (inp.get("action") or "").strip().lower()
                 message = (inp.get("message") or "").strip()
                 reason = (inp.get("reason") or "").strip()
+                if action == "reply" and not message:
+                    logger.warning("send_reply reply without message for %s, stop %s, fields %s, text %s", sender,
+                                   r.json().get("stop_reason"), sorted(inp.keys()),
+                                   " ".join(p_.get("text", "") for p_ in parts if p_.get("type") == "text")[:300])
                 if action == "reply":
                     _dt = inp.get("deposit_terms")
                     if isinstance(_dt, dict) and _dt.get("agreed"):
