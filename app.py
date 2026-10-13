@@ -7118,6 +7118,17 @@ class _SimCal:
         return _SimEvents(self)
 
 
+class _SimLogHandler(logging.Handler):
+    """Every warning or error raised while a simulated turn runs lands in that
+    conversation's result, so a silent turn always shows its cause."""
+    def emit(self, record):
+        try:
+            if _sim_on() and record.levelno >= logging.INFO:
+                _SIM.logs.append(f"{record.levelname[0]} {record.getMessage()}"[:400])
+        except Exception:
+            pass
+
+
 def _sim_install():
     """Wrap every side effecting function once, the wrapper only diverts when
     the current thread runs a simulation, live traffic is never affected."""
@@ -7160,6 +7171,7 @@ def _sim_install():
         wrap(nm, _send)
     wrap("_upstash", lambda *a, **k: None)
     wrap("_send_plain_email", lambda *a, **k: False)
+    logger.addHandler(_SimLogHandler())
     g["_SIM_INSTALLED"] = True
     g["_SIM_REAL_CAL"] = real_cal
 
@@ -7388,7 +7400,7 @@ def _sim_one(p, max_turns=6):
     _SIM.on = True
     _SIM.cal = _SimCal(globals()["_SIM_REAL_CAL"])
     _SIM.conv, _SIM.holds, _SIM.paused, _SIM.disclosed = {}, {}, set(), set()
-    _SIM.alerts, _SIM.sent = [], []
+    _SIM.alerts, _SIM.sent, _SIM.logs = [], [], []
     sender = "4915000" + str(abs(hash(p["id"])) % 10 ** 6).zfill(6)
     res = {"id": p["id"], "transcript": [], "issues": [], "judge": [], "alerts": [], "calendar": [], "error": ""}
     try:
@@ -7409,15 +7421,16 @@ def _sim_one(p, max_turns=6):
             if is_human_active(sender):
                 res["transcript"].append(("bar", "[paused for Dan]"))
                 break
-            before_c, before_a = len(_SIM.conv.get(sender, [])), len(_SIM.alerts)
+            before_c, before_a, before_l = len(_SIM.conv.get(sender, [])), len(_SIM.alerts), len(_SIM.logs)
             handle("whatsapp", sender, g)
             new_turns = _SIM.conv.get(sender, [])[before_c:]
             reply = "\n".join(t["content"] for t in new_turns if t.get("role") == "assistant" and t.get("content"))
             if reply:
                 res["transcript"].append(("bar", reply))
             else:
-                why = "; ".join(_SIM.alerts[before_a:])[:240] or "no alert"
-                res["transcript"].append(("bar", f"[silent, Dan pinged: {why}]"))
+                why = "; ".join(_SIM.alerts[before_a:])[:240] or "NO ALERT"
+                logs = " || ".join(l for l in _SIM.logs[before_l:] if not l.startswith("I "))[:600]
+                res["transcript"].append(("bar", f"[silent, Dan pinged: {why}] [log: {logs}]"))
             for iss in _sim_check_turn(sender, g, reply, turn, conv_history(sender)):
                 res["issues"].append({"turn": len(res["transcript"]) - 1, "problem": iss})
             if is_human_active(sender):
@@ -7433,9 +7446,14 @@ def _sim_one(p, max_turns=6):
     return res
 
 
-def _sim_run(n=60, workers=5):
+def _sim_run(n=60, workers=5, only=""):
     _sim_install()
-    personas = _sim_personas(n)
+    personas = _sim_personas(200)
+    if only:
+        want = {x.strip() for x in only.split(",") if x.strip()}
+        personas = [p for p in personas if p["id"] in want]
+    else:
+        personas = personas[:n]
     _sim_state.update({"running": True, "started": time.time(), "results": [], "done": 0, "total": len(personas), "summary": {}})
     from concurrent.futures import ThreadPoolExecutor
     try:
@@ -7457,10 +7475,10 @@ def _sim_run(n=60, workers=5):
 
 
 @app.get("/sim/run")
-def sim_run_route(n: int = 60, workers: int = 5):
+def sim_run_route(n: int = 60, workers: int = 5, only: str = ""):
     if _sim_state["running"]:
         return {"status": "already running", "done": _sim_state["done"], "total": _sim_state["total"]}
-    threading.Thread(target=_sim_run, args=(min(n, 120), min(workers, 8)), daemon=True).start()
+    threading.Thread(target=_sim_run, args=(min(n, 120), min(workers, 8), only), daemon=True).start()
     return {"status": "started"}
 
 
