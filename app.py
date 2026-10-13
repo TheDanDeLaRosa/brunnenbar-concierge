@@ -934,6 +934,9 @@ def _relative_de_date(t: str, now: datetime):
         return now.date().isoformat()
     if re.search(r"\btomorrow\b", low):
         return (now.date() + timedelta(days=1)).isoformat()
+    # 13 Oct 2026, "welcher Samstag im Januar" is a question about a month, not about this Saturday
+    if any(m in low for m in _DE_MONTHS) or re.search(r"\b(" + _EN_MONTH_RE + r")\b", low):
+        return None
     for name, wd in list(_DE_WEEKDAYS.items()) + list(_EN_WEEKDAYS.items()):
         if re.search(r"\b" + name + r"s?\b", low):
             delta = (wd - now.weekday()) % 7
@@ -942,6 +945,78 @@ def _relative_de_date(t: str, now: datetime):
             return (now.date() + timedelta(days=delta)).isoformat()
     return None
 
+
+
+def _retire_hold_after_booking(sender, date_iso):
+    """The real booking replaces the guest's own placeholder for that date, so
+    the calendar never shows the same group twice. 13 Oct 2026."""
+    try:
+        rec = _pending_hold_get(sender)
+        if rec and str(rec.get("date") or "") == date_iso:
+            remove_pending_hold(sender)
+    except Exception as e:
+        logger.warning("retire hold after booking failed for %s: %s", sender, e)
+
+
+def _free_event_nights(start, end, space, party, sender="", limit=4, weekdays=(4, 5), near=None):
+    """Friday and Saturday evenings between start and end where the requested
+    space really is free for this party, nearest to `near` first. Read only.
+    13 Oct 2026, after the bot listed unchecked Saturdays to Nathalie."""
+    out = []
+    d = start
+    today = datetime.now(BAR_TZ).date()
+    with _excluding(sender):
+        while d <= end:
+            if d.weekday() in weekdays and d > today:
+                try:
+                    if not _closure_on(d.isoformat()):
+                        cap, bar_free, back_free = _evening_capacity(d.isoformat())
+                        ok = bar_free if space == "ganze_bar" else (back_free if space == "hinterer_bereich" else (party or 0) <= cap)
+                        if ok:
+                            out.append(d)
+                except Exception as e:
+                    logger.warning("free night check failed for %s: %s", d, e)
+            d += timedelta(days=1)
+    if near:
+        out.sort(key=lambda x: abs((x - near).days))
+    return sorted(out[:limit])
+
+
+def _nights_text(days):
+    return ", ".join(f"{_DAY_NAMES_DE[x.weekday()]} {x.strftime('%d.%m.%Y')}" for x in days)
+
+
+_ASK_FREE_RE = re.compile(r"(welche[rsn]?|wann|was)\b.{0,90}\b(frei|verfügbar|verfuegbar|möglich|moeglich|noch was|geht)|\bfreie[nr]?\s+(termin|samstag|freitag|abend|tag)|which .{0,30}(free|available)|any (free|available)", re.I)
+
+
+def _free_nights_context(sender, text, history=None):
+    """FREIE ABENDE line when a guest asks which dates are free and names a
+    month, computed from the calendar, so the bot never guesses."""
+    if not _ASK_FREE_RE.search(text or ""):
+        return ""
+    low = (text or "").lower()
+    now = datetime.now(BAR_TZ).date()
+    months = [m for name, m in _DE_MONTHS.items() if name in low] + [m for k, m in _EN_MONTHS.items() if re.search(r"\b" + k, low)]
+    if not months:
+        return ""
+    party, space = _party_space_from_text(sender, text, history)
+    if not space and (party or 0) >= 20:
+        space = "hinterer_bereich"
+    weekdays = (5,) if re.search(r"samstag|saturday", low) else ((4,) if re.search(r"freitag|friday", low) else (4, 5))
+    days = []
+    for m in sorted(set(months)):
+        y = now.year if m >= now.month else now.year + 1
+        start = date(y, m, 1)
+        end = (date(y + (m == 12), (m % 12) + 1, 1) - timedelta(days=1))
+        if re.search(r"anfang", low) and m == max(months) and len(set(months)) > 1:
+            end = date(y, m, 10)
+        days += _free_event_nights(start, end, space, party, sender, limit=10, weekdays=weekdays)
+    what = {"hinterer_bereich": "den hinteren Bereich exklusiv", "ganze_bar": "die ganze Bar exklusiv"}.get(space, f"{party or 'die'} Personen")
+    if not days:
+        return f"FREIE ABENDE, laut Kalender ist im gefragten Zeitraum fuer {what} kein Freitag oder Samstag mehr frei. Sag das ehrlich und frag nach einem anderen Zeitraum."
+    return (f"FREIE ABENDE, frisch aus dem Kalender geprueft, fuer {what}: {_nights_text(days)}. Nenne dem Gast genau diese Termine als "
+            "aktuell frei, ohne Garantie bis er sich entscheidet, und frag welcher passt. Sag nie, dass du keine Liste geben kannst, "
+            "und beschreib nie wie du den Kalender pruefst.")
 
 def event_date_context(sender: str, text: str, history=None) -> str:
     """Ground truth for one date the guest just mentioned, injected into the
@@ -969,7 +1044,12 @@ def event_date_context(sender: str, text: str, history=None) -> str:
     now = datetime.now(BAR_TZ)
     date_iso = _extract_de_date(text, now)
     if not date_iso:
-        return ""
+        try:
+            return _free_nights_context(sender, text, history)
+        except Exception as e:
+            logger.warning("free nights context failed: %s", e)
+            return ""
+    _p, _sp = None, None
     try:
         svc = _calendar_service()
         _p, _sp = _party_space_from_text(sender, text, history)
@@ -986,9 +1066,24 @@ def event_date_context(sender: str, text: str, history=None) -> str:
             f"und warm, dass wir an diesem Tag leider geschlossen haben, und frage ob ein anderes "
             f"Datum passen wuerde."
         )
+    _wd_line = ""
+    try:
+        _d = date.fromisoformat(date_iso)
+        _wd_line = f"WOCHENTAG, der {_d.strftime('%d.%m.%Y')} ist ein {_DAY_NAMES_DE[_d.weekday()]}, verlass dich nur hierauf. "
+    except Exception:
+        pass
     if status["collision"]:
         other = (status["collision"].get("summary") or "").strip()
-        return (
+        _alts = ""
+        try:
+            _d = date.fromisoformat(date_iso)
+            _near = _free_event_nights(_d - timedelta(days=28), _d + timedelta(days=42), _sp or ("hinterer_bereich" if (_p or 0) >= 20 else None),
+                                       _p, sender, limit=4, near=_d)
+            if _near:
+                _alts = (f" Freie Alternativen in der Naehe, frisch geprueft: {_nights_text(_near)}. Biete dem Gast zwei oder drei davon an.")
+        except Exception as e:
+            logger.warning("alternative nights failed: %s", e)
+        return _wd_line + (
             f"EVENT DATUM CHECK fuer {date_iso}, verlass dich NUR hierauf, nicht auf eigene Vermutung "
             f"oder auf das Beispiel weiter unten im Prompt. Fuer diesen Tag steht bereits etwas anderes "
             f"im Kalender, bestaetigt oder noch offen: \"{other}\". Sag dem Gast NIEMALS dass dieser "
@@ -997,7 +1092,7 @@ def event_date_context(sender: str, text: str, history=None) -> str:
             f"kein Versprechen. Antworte mit send_reply action reply, kurz, warm, ohne Namen oder "
             f"Details zur anderen Reservierung, dass es an diesem Tag leider nicht klappt weil schon "
             f"etwas fest geplant ist, und frage ob ein anderes Datum passen wuerde. Keine Preise."
-        )
+        ) + _alts
     cap = status.get("back_capacity")
     cap_txt = ""
     if cap is not None and not status.get("back_exclusive_free", True):
@@ -1013,7 +1108,7 @@ def event_date_context(sender: str, text: str, history=None) -> str:
                    f"{'' if status.get('whole_bar_free') else ', die ganze Bar ist nicht komplett frei'}. "
                    "Nenne den Termin nie als frei fuer mehr Personen oder fuer die ganze Bar wenn sie nicht frei ist, "
                    "und frage zuerst nach der Personenzahl.")
-    return f"EVENT DATUM CHECK fuer {date_iso}: nichts Widersprechendes im Kalender vermerkt, so weit unauffaellig.{cap_txt}"
+    return _wd_line + f"EVENT DATUM CHECK fuer {date_iso}: nichts Widersprechendes im Kalender vermerkt, so weit unauffaellig.{cap_txt}"
 
 
 _DE_WORDS = set(
@@ -1096,6 +1191,42 @@ def parse_event(ev):
     return (area, party, datetime.fromisoformat(start))
 
 
+
+# ---- 13 Oct 2026, a guest's own hold must never block that same guest ----
+# Nathalie (30.01.2027) was told the date "klappt nicht" because the bot's own
+# tentative hold for her sat on the calendar and was read as someone else's
+# booking. Every availability check for a guest runs inside _excluding(sender),
+# which hides that guest's own entries from the calendar reads.
+_EXCL = threading.local()
+
+
+class _excluding:
+    def __init__(self, sender):
+        self.key = _contact_key(sender) if sender else ""
+    def __enter__(self):
+        self.prev = getattr(_EXCL, "key", "")
+        _EXCL.key = self.key if (self.key and len(self.key) >= 5) else ""
+        return self
+    def __exit__(self, *a):
+        _EXCL.key = self.prev
+        return False
+
+
+def _drop_own(items):
+    key = getattr(_EXCL, "key", "")
+    if not key:
+        return items
+    out = []
+    for ev in items:
+        blob = (ev.get("summary") or "") + " " + (ev.get("description") or "")
+        if "@" in key:
+            own = key in blob.lower()
+        else:
+            own = any(_norm_phone(p) == key for p in re.findall(r"\+?\d[\d\s]{6,}\d", blob))
+        if not own:
+            out.append(ev)
+    return out
+
 def reservations_on(date_iso: str):
     """Existing reservations for a date as a list of (area, party, start)."""
     svc = _calendar_service()
@@ -1107,6 +1238,7 @@ def reservations_on(date_iso: str):
         timeMin=lo.isoformat(), timeMax=hi.isoformat(),
         singleEvents=True, orderBy="startTime",
     ).execute().get("items", [])
+    items = _drop_own(items)
     out = []
     for ev in items:
         r = parse_event(ev)
@@ -1178,6 +1310,7 @@ def _tables_in_use_on(date_iso: str, start_dt: datetime, end_dt: datetime):
         timeMin=lo.isoformat(), timeMax=hi.isoformat(),
         singleEvents=True, orderBy="startTime",
     ).execute().get("items", [])
+    items = _drop_own(items)
     turn = timedelta(hours=TURN_HOURS)
     used = set()
     for ev in items:
@@ -1358,6 +1491,8 @@ def _event_date_status(svc, date_iso: str, exclude_sender: str = "", party=None,
     never again ignore an already confirmed private space booking."""
     exclude_norm = _norm_phone(exclude_sender)
     out = {"closed": False, "closed_summary": "", "collision": None}
+    _ex = _excluding(exclude_sender)
+    _ex.__enter__()
     try:
         lo = datetime.fromisoformat(date_iso).replace(tzinfo=BAR_TZ, hour=0, minute=0, second=0, microsecond=0)
         hi = lo + timedelta(days=1)
@@ -1366,6 +1501,7 @@ def _event_date_status(svc, date_iso: str, exclude_sender: str = "", party=None,
             timeMin=lo.isoformat(), timeMax=hi.isoformat(),
             singleEvents=True,
         ).execute().get("items", [])
+        items = _drop_own(items)
         for ev in items:
             if _is_cancelled(ev):
                 continue
@@ -1417,6 +1553,8 @@ def _event_date_status(svc, date_iso: str, exclude_sender: str = "", party=None,
     except Exception as e:
         logger.warning("Event date status check failed for %s: %s", date_iso, e)
         return out
+    finally:
+        _ex.__exit__()
 
 
 def _date_claims(svc, date_iso: str, exclude_sender: str = ""):
@@ -1803,6 +1941,7 @@ def _private_space_events_on(date_iso: str):
         timeMin=lo.isoformat(), timeMax=hi.isoformat(),
         singleEvents=True, orderBy="startTime",
     ).execute().get("items", [])
+    items = _drop_own(items)
     out = []
     for ev in items:
         if (ev.get("summary") or "").strip().upper().startswith("ABGESAGT"):
@@ -1896,6 +2035,7 @@ def _freeform_group_events_on(date_iso: str):
         timeMin=lo.isoformat(), timeMax=hi.isoformat(),
         singleEvents=True, orderBy="startTime",
     ).execute().get("items", [])
+    items = _drop_own(items)
     out = []
     for ev in items:
         summary = (ev.get("summary") or "")
@@ -2102,6 +2242,7 @@ def _night_ledger(date_iso, start_dt, req_end):
         timeMin=lo.isoformat(), timeMax=(lo + timedelta(days=1)).isoformat(),
         singleEvents=True, orderBy="startTime",
     ).execute().get("items", [])
+    items = _drop_own(items)
     turn = timedelta(hours=TURN_HOURS)
     occ = set()
     big_inside = False
@@ -3430,6 +3571,11 @@ def _split_question(stage: str, party: int, sie: bool, lang: str) -> str:
 
 
 def process_booking(sender: str, data: dict, lang: str = "de", channel: str = "whatsapp") -> str:
+    with _excluding(sender):
+        return _process_booking_inner(sender, data, lang, channel)
+
+
+def _process_booking_inner(sender: str, data: dict, lang: str = "de", channel: str = "whatsapp") -> str:
     """Given the details the model gave the tool, check real availability, book
     if it is free, and return the guest reply in the guest's language. Never
     overbooks, because the whole check then book sequence runs inside
@@ -3527,6 +3673,7 @@ def process_booking(sender: str, data: dict, lang: str = "de", channel: str = "w
                           channel, sender, what, str(e))
                 return _SILENT_BOOKING
         logger.info("booked %s for %s party %s %s %s", space, name, party, date_iso, hhmm)
+        _retire_hold_after_booking(sender, date_iso)
         if _deposit_active():
             try:
                 _deposit_set(sender, {"state": "awaiting_consent", "event_id": (_ev or {}).get("id", ""), "space": space,
@@ -3567,6 +3714,7 @@ def process_booking(sender: str, data: dict, lang: str = "de", channel: str = "w
             alert_dan("table was free but saving the booking to the calendar failed", channel, sender, what, str(e))
             return _SILENT_BOOKING
     logger.info("booked table %s for %s party %s %s %s", table, name, party, date_iso, hhmm)
+    _retire_hold_after_booking(sender, date_iso)
     notify_dan_booked(channel, sender, f"{what}, Tisch {table}")
     return _table_confirmation(name, party, start_dt, area, table, sie, lang)
 
@@ -3766,6 +3914,8 @@ HOW DAN REALLY WRITES, real lines from his own chats, copy this feel, these are 
 Event opener, schön dass du deinen 30ten bei uns feiern willst. warst du schon mal bei uns.
 Owning a slip, sorry, deine nachricht ist mir durchgerutscht, das tut mir wirklich leid. wie sieht donnerstag um 18 uhr bei dir aus.
 Weather for an outside table, wir planen euch fest für draußen ein, es bleibt heute sonnig und trocken, wir freuen uns auf euch heute abend.
+
+FREE DATES AND WEEKDAYS. ADDED 13 Oct 2026 after Nathalie was told 30.01.2027 was a Friday (it is a Saturday) and was given a list of Saturdays nobody had checked. Never work out a weekday yourself, a WOCHENTAG line tells you. When a guest asks which dates are still free, offer exactly the dates from the FREIE ABENDE line or the Freie Alternativen in an EVENT DATUM CHECK line, never invent or guess dates, never say you cannot give a list, never describe how you check the calendar. If no such line is there, ask which month or which two or three dates they have in mind.
 
 THE BOOK IS THE ONLY TRUTH. ADDED 12 Oct 2026 after Sarah (Halloween, whole bar) was told "der 31. Oktober ist noch frei und bleibt erstmal für euch blockiert" while Evy already had the Sofa that night and no hold existed for Sarah at all. The calendar is the single source of truth, see Booking_Rules.md. You only ever say a date, table or space is free when an EVENT DATUM CHECK or GAST BUCHUNGEN line in this prompt confirms it. You only ever say a date or space is held, blocked, vorgemerkt or reserviert for the guest when you set event_hold in this same turn or GAST BUCHUNGEN already shows their entry. Otherwise ask a question or answer honestly, never reassure. Every entry in the reservation calendar is a reservation, a single table like the Sofa already blocks the private hinterer Bereich and the whole bar that evening, the other tables can still be offered as normal tables. The earliest entry keeps the date, a later guest never takes it.
 
@@ -4573,6 +4723,11 @@ def _eval_scenarios():
          "text": "Ja 21:30 passt perfekt", "expect": ["book"], "book": {"party": 2, "time": "21:30", "date": fri.isoformat()}},
         {"id": "S48_headcount_change", "history": booked_hist, "ctx": booked_ctx, "text": "Wir sind am Freitag jetzt doch 6 statt 4, geht das?",
          "expect": ["handoff"]},
+        {"id": "S49_far_weekday", "history": [("user", "30. Geburtstag am 30.01. mit etwa 30 Leuten im hinteren Bereich")],
+         "text": "Wann ist am 30.01. eigentlich Schluss?", "expect": ["reply"], "reply_any": [r"2 Uhr"], "reply_none": [r"Freitag", r"24 Uhr"]},
+        {"id": "S50_free_saturdays_month", "history": [("user", "30. Geburtstag mit etwa 30 Gästen, hinterer Bereich")],
+         "text": "Welcher Samstag im Januar wäre denn noch frei?", "expect": ["reply"],
+         "reply_any": [r"\d{1,2}\.\s?0?1\.|\d{1,2}\. Januar"], "reply_none": [r"keine Liste", r"jeden Tag einzeln", r"von hier aus"]},
         {"id": "S42_split_tables_ok", "text": f"Hi, wir sind 18 Leute und möchten am {F} um 20 Uhr einfach Tische, Name Paul, kein Anlass, drinnen",
          "expect": ["book", "reply"], "no_price": True},
     ]
