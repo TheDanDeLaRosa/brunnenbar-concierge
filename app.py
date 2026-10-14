@@ -2897,6 +2897,9 @@ def post_visit_checkin_loop():
 # only mentions it as information. The bot never confirms payment, Dan does that by
 # removing VORGEMERKT from the calendar title.
 DEPOSIT_FLOW_ENABLED = os.environ.get("DEPOSIT_FLOW_ENABLED", "false").lower() == "true"
+# 15 Oct 2026, Dan: "lets keep the deposit off for now. i dont have a good way to take the money".
+# Hard off in code, the Railway env still says true. To switch it back on, remove this line and redeploy.
+DEPOSIT_FLOW_ENABLED = False
 BANK_HOLDER = os.environ.get("BANK_HOLDER", "")
 BANK_IBAN = os.environ.get("BANK_IBAN") or os.environ.get("Bank_IBAN", "")  # Railway var was created as Bank_IBAN, accept both
 BANK_BIC = os.environ.get("BANK_BIC", "")
@@ -5911,6 +5914,10 @@ def claude_decide(sender: str, text: str, history=None, dry_run: bool = False, e
     _mb = _menu_prompt_block()
     if _mb:
         system += "\n\n" + _mb
+    if not _deposit_active():
+        # 15 Oct 2026, Dan turned the deposit off for now
+        system += ("\n\nANZAHLUNG. Aktuell nehmen wir keine Anzahlung. Fragt ein Gast danach, sag ehrlich, dass "
+                   "es im Moment keine Anzahlung gibt, die Reservierung steht auch so. Erwähne von dir aus nie eine Anzahlung.")
     edc = event_date_context(sender, text, history)
     if edc:
         system += "\n\n" + edc
