@@ -4657,6 +4657,32 @@ def unanswered_debug(min_minutes: int = 10, max_hours: int = 72):
     return {"count": len(out), "threads": out}
 
 
+@app.get("/threads")
+def threads_debug(days: int = 45, chars: int = 400, offset: int = 0, limit: int = 60):
+    """Read only, every tracked thread with activity in the last `days`, newest
+    first, with all turns trimmed to `chars`. Added 16 Oct 2026 so a seat can
+    reconcile open guest requests against the calendar. Sends nothing."""
+    cutoff = time.time() - days * 86400
+    rows = []
+    for sender in _conv_active_senders():
+        try:
+            h = conv_history(sender)
+            if not h:
+                continue
+            last = max(float(t.get("ts") or 0) for t in h)
+            if last < cutoff:
+                continue
+            rows.append({"sender": sender, "last": datetime.fromtimestamp(last, BAR_TZ).strftime("%d.%m. %H:%M"), "_ts": last,
+                         "turns": [((t.get("role") or "")[0].upper() + " " + datetime.fromtimestamp(float(t.get("ts") or 0), BAR_TZ).strftime("%d.%m.") + " " +
+                                    str(t.get("content") or "")[:chars]) for t in h if str(t.get("content") or "").strip()]})
+        except Exception as e:
+            rows.append({"sender": sender, "error": str(e), "_ts": 0})
+    rows.sort(key=lambda r: -r["_ts"])
+    for r in rows:
+        r.pop("_ts", None)
+    return {"count": len(rows), "threads": rows[offset:offset + limit]}
+
+
 @app.get("/calendars")
 def calendars_debug():
     """List the calendars this connection can see, so we can confirm the
